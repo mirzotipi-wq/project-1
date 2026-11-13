@@ -22,9 +22,10 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Stages A and B complete — phases 1–20 of [PLAN.md](PLAN.md) boot and run on QEMU `virt`
-with four cores.** (Phase 13 is partial: IRQ-safe locks and counters exist, storm throttling
-does not. Phase 19 is deferred until block devices exist.)
+**Phases 1–22 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+Processes run at EL0 in their own address spaces and reach the kernel only through validated
+syscalls. (Phase 13 is partial: IRQ-safe locks and counters exist, storm throttling does not.
+Phase 19 is deferred until block devices exist.)
 
 | Phase | What exists | How it is verified |
 |---|---|---|
@@ -47,6 +48,8 @@ does not. Phase 19 is deferred until block devices exist.)
 | 17 | wait queues, semaphore, timed sleep | `sleep 100`; host tests for blocking |
 | 18 | PSCI SMP bring-up, per-CPU state, reschedule IPI | `cores` shows 4/4 online and switching |
 | 20 | boot self-tests, counters, switch trace ring | every boot prints a PASS verdict |
+| 21 | EL0, SVC entry, validated syscall table | `uprobe`: prints via `write`, bad pointers refused |
+| 22 | per-process TTBR0, W^X user pages, teardown | `uprobe`: two processes, same VA, own data |
 
 The remaining 88 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
@@ -69,6 +72,13 @@ console is the first PL011 UART; press Enter for a prompt and type `help`. Concu
 inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
 (contended counter), `preempt 1000` (three spinning threads, one core), `reap 8` (reaping),
 `logstorm 4` (unbroken console lines from four cores) and `svc`.
+
+User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
+1 privileged-register attempt, 2 kernel-memory read, 3 two-process isolation). `uprobe`
+runs the whole thing as one pass/fail suite: the program printing through syscalls, the two
+privilege violations caught as faults, syscall pointers refused instead of followed, two
+processes at the same virtual address each keeping their own data, and five launch/exit
+cycles leaving the page counter unchanged.
 
 The kernel is built for the ARMv8.0-A baseline (`cortex-a53` + FP/NEON), so the same binary
 runs on Cortex-A53/A55/A72/A76/A78/X-series, Neoverse N1/N2/V1, Apple silicon and Graviton.
@@ -94,8 +104,9 @@ build.zig            build graph, generated linker script, QEMU runner, host tes
 src/main.zig         boot sequence, kernel wiring, self-tests
 src/arch/aarch64/    cpu registers, MMU, exceptions/trap frames, GIC, timer
 src/devices/         PL011 UART
+src/user/            the EL0 demo program and its embedded image
 src/kernel/          logging, panic, pmm, heap, irq, sync, percpu, thread, sched,
-                     smp, syscall, machine, shell
+                     smp, addrspace, process, uaccess, syscall, machine, shell
 src/lib/             freestanding helpers (device-tree parser)
 tools/mkimage.zig    host-side Image wrapper used by the build
 src/tests.zig        host unit-test root

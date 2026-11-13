@@ -15,6 +15,7 @@ test {
     _ = @import("devices/pl011.zig");
     _ = @import("kernel/klog.zig");
     _ = @import("kernel/sync.zig");
+    _ = @import("kernel/uaccess.zig");
     _ = @import("kernel/thread.zig");
 }
 

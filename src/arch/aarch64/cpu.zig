@@ -41,6 +41,13 @@ pub inline fn nop() void {
     asm volatile ("nop");
 }
 
+/// Make freshly written instructions visible to the instruction fetcher. The
+/// user image is copied into its frames as data, so without this EL0 would
+/// execute whatever the caches happened to hold.
+pub inline fn icIallu() void {
+    asm volatile ("ic iallu\ndsb ish\nisb" ::: "memory");
+}
+
 pub inline fn tlbiVmalle1() void {
     asm volatile ("tlbi vmalle1" ::: "memory");
 }

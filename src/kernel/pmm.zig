@@ -4,8 +4,56 @@
 //! integer logic, so the whole thing is unit-tested on the host.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const page_size: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// Mutual exclusion
+//
+// The bitmap is shared by every core and is mutated from two very different
+// places: threads asking for memory, and the scheduler's reaper running in
+// interrupt context. Without a lock two cores can read the same free bit and
+// both mark it used, handing out the same physical frame twice — the symptom is
+// a thread stack that another thread is already using, which surfaces later as
+// a corrupted trap frame.
+//
+// The lock therefore also masks interrupts. A plain spinlock would deadlock
+// against itself: a core could take a tick while holding it, and the reaper it
+// runs would wait for the same lock forever. On the host (where the allocator is
+// unit-tested) interrupt masking compiles out and only the atomic remains.
+// ---------------------------------------------------------------------------
+
+var lock: u32 = 0;
+
+inline fn interruptsSave() u64 {
+    if (comptime builtin.cpu.arch == .aarch64) {
+        var flags: u64 = undefined;
+        asm volatile ("mrs %[f], daif" : [f] "=r" (flags) :: "memory");
+        asm volatile ("msr daifset, #2" ::: "memory");
+        return flags;
+    }
+    return 0;
+}
+
+inline fn interruptsRestore(flags: u64) void {
+    if (comptime builtin.cpu.arch == .aarch64) {
+        asm volatile ("msr daif, %[f]" :: [f] "r" (flags) : "memory");
+    }
+}
+
+fn acquire() u64 {
+    const flags = interruptsSave();
+    while (@atomicRmw(u32, &lock, .Xchg, 1, .acquire) != 0) {
+        while (@atomicLoad(u32, &lock, .monotonic) != 0) std.atomic.spinLoopHint();
+    }
+    return flags;
+}
+
+fn release(flags: u64) void {
+    @atomicStore(u32, &lock, 0, .release);
+    interruptsRestore(flags);
+}
 
 pub const Stats = struct {
     total_pages: usize,
@@ -74,6 +122,13 @@ pub const PageAllocator = struct {
     /// Reserve a physical range (kernel image, device tree, heap arena...).
     pub fn reserveRange(self: *PageAllocator, addr: usize, len: usize) void {
         if (len == 0) return;
+        const flags = acquire();
+        defer release(flags);
+        self.reserveRangeUnlocked(addr, len);
+    }
+
+    fn reserveRangeUnlocked(self: *PageAllocator, addr: usize, len: usize) void {
+        if (len == 0) return;
         if (addr < self.base) return;
         const off = addr - self.base;
         const first = off / page_size;
@@ -83,6 +138,12 @@ pub const PageAllocator = struct {
 
     /// Allocate one page; returns its physical address.
     pub fn alloc(self: *PageAllocator) ?usize {
+        const flags = acquire();
+        defer release(flags);
+        return self.allocUnlocked();
+    }
+
+    fn allocUnlocked(self: *PageAllocator) ?usize {
         if (self.free_pages == 0) return null;
         var scanned: usize = 0;
         var i = self.rover;
@@ -100,6 +161,12 @@ pub const PageAllocator = struct {
 
     /// Allocate `count` physically contiguous pages.
     pub fn allocContiguous(self: *PageAllocator, count: usize) ?usize {
+        const flags = acquire();
+        defer release(flags);
+        return self.allocContiguousUnlocked(count);
+    }
+
+    fn allocContiguousUnlocked(self: *PageAllocator, count: usize) ?usize {
         if (count == 0 or count > self.free_pages) return null;
         var run_start: usize = 0;
         var run_len: usize = 0;
@@ -120,6 +187,12 @@ pub const PageAllocator = struct {
     }
 
     pub fn free(self: *PageAllocator, addr: usize) void {
+        const flags = acquire();
+        defer release(flags);
+        self.freeUnlocked(addr);
+    }
+
+    fn freeUnlocked(self: *PageAllocator, addr: usize) void {
         if (addr < self.base) return;
         const index = (addr - self.base) / page_size;
         if (index >= self.pages) return;
@@ -128,6 +201,12 @@ pub const PageAllocator = struct {
     }
 
     pub fn freeRange(self: *PageAllocator, addr: usize, count: usize) void {
+        const flags = acquire();
+        defer release(flags);
+        self.freeRangeUnlocked(addr, count);
+    }
+
+    fn freeRangeUnlocked(self: *PageAllocator, addr: usize, count: usize) void {
         if (addr < self.base) return;
         const index = (addr - self.base) / page_size;
         self.markFree(index, count);
@@ -135,6 +214,8 @@ pub const PageAllocator = struct {
     }
 
     pub fn allocated(self: *const PageAllocator, addr: usize) bool {
+        const flags = acquire();
+        defer release(flags);
         if (addr < self.base) return false;
         const index = (addr - self.base) / page_size;
         if (index >= self.pages) return false;
@@ -142,6 +223,8 @@ pub const PageAllocator = struct {
     }
 
     pub fn stats(self: *const PageAllocator) Stats {
+        const flags = acquire();
+        defer release(flags);
         return .{
             .total_pages = self.pages,
             .free_pages = self.free_pages,
@@ -153,6 +236,8 @@ pub const PageAllocator = struct {
 
     /// Largest contiguous free run, in pages. Used by the OOM path later.
     pub fn largestFreeRun(self: *const PageAllocator) usize {
+        const flags = acquire();
+        defer release(flags);
         var best: usize = 0;
         var run: usize = 0;
         var i: usize = 0;
@@ -168,7 +253,9 @@ pub const PageAllocator = struct {
     /// Zero a freshly allocated page (the allocator never hands out stale data
     /// to user space without a scrub).
     pub fn allocZeroed(self: *PageAllocator) ?usize {
-        const page = self.alloc() orelse return null;
+        const flags = acquire();
+        defer release(flags);
+        const page = self.allocUnlocked() orelse return null;
         const bytes: [*]u8 = @ptrFromInt(page);
         @memset(bytes[0..page_size], 0);
         return page;

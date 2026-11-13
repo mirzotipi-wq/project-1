@@ -28,6 +28,10 @@ pub const Cpu = struct {
     need_resched: bool = false,
     /// Ticks remaining in the running thread's slice.
     slice_left: u32 = 0,
+    /// Physical address currently in TTBR0_EL1 (0 until the first switch).
+    /// Cached so a context switch between threads that share an address space
+    /// does not flush the TLB for nothing.
+    ttbr0: usize = 0,
     /// A thread that died on this core and must be reaped from another stack.
     pending_reap: ?*Thread = null,
 

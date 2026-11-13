@@ -21,6 +21,8 @@ const sched = @import("sched.zig");
 const percpu = @import("percpu.zig");
 const threads = @import("thread.zig");
 const sync = @import("sync.zig");
+const process = @import("process.zig");
+const syscall = @import("syscall.zig");
 
 pub const Context = struct {
     machine: *const machine.Machine,
@@ -68,6 +70,10 @@ fn printHelp() void {
         \\  reap [n]             spawn n short-lived threads and prove no leak
         \\  preempt              sample three CPU-bound threads (preemption proof)
         \\  logstorm [n]         concurrent logging from n threads / every core
+        \\
+        \\  --- user mode (EL0) -----------------------------------------------
+        \\  user [mode]          run the EL0 demo: 0 normal, 1 priv op, 2 kernel read, 3 isolation
+        \\  uprobe               full EL0 + address-space probe (run this)
         \\
     , .{});
 }
@@ -478,6 +484,141 @@ fn parseArg(tokens: *std.mem.TokenIterator(u8, .scalar), default: u32, min: u32,
     return @min(@max(value, min), max);
 }
 
+
+fn status(ok: bool) []const u8 {
+    return if (ok) "OK" else "FAIL";
+}
+
+/// `user [mode]` — one EL0 program, with the page accounting around it.
+fn cmdUser(ctx: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const mode = parseArg(tokens, 0, 0, 3);
+    const before = ctx.pmm.stats().free_pages;
+    const p = process.spawn(mode, 0x1234_5678, "user") orelse {
+        out("  cannot launch a user process\n", .{});
+        return;
+    };
+    const pid = p.pid;
+    const t0 = timer.uptimeMs();
+    const st = process.wait(pid, 4000);
+    const took = timer.uptimeMs() - t0;
+    _ = process.waitReaped(pid, 1000);
+    const after = ctx.pmm.stats().free_pages;
+
+    if (process.processOfPid(pid)) |proc| {
+        if (proc.fault) |f| {
+            out("  pid {d}: {s} — {s} at 0x{x} (pc 0x{x}), {d} ms\n", .{ pid, @tagName(st), f.kind, f.addr, f.pc, took });
+        } else {
+            out("  pid {d}: {s} with code {d}, {d} ms\n", .{ pid, @tagName(st), proc.exit_code, took });
+        }
+    }
+    out("  free pages {d} -> {d}\n", .{ before, after });
+}
+
+/// `uprobe` — the whole phase 21-22 contract, measured in one command:
+/// a user program that runs, two privilege violations that are caught, a
+/// pointer the kernel refuses, two processes that cannot see each other, and a
+/// launch loop that leaks nothing.
+fn cmdUprobe(ctx: Context) void {
+    var pass = true;
+    out("\n  EL0 / address-space probe\n", .{});
+    out("  ------------------------------------------------------------------\n", .{});
+
+    const base_pages = ctx.pmm.stats().free_pages;
+    const rejected_before = syscall.rejected_ptr;
+
+    // 1 -- a complete user program.
+    out("  [1] normal EL0 program: write, getpid, uptime, yield, two bad pointers\n", .{});
+    var p = process.spawn(0, 0, "user0") orelse {
+        out("      FAIL: cannot spawn a process\n", .{});
+        return;
+    };
+    var t0 = timer.uptimeMs();
+    var st = process.wait(p.pid, 4000);
+    _ = process.waitReaped(p.pid, 1000);
+    const ok1 = st == .exited and p.exit_code == 0;
+    out("      {s}, exit code {d}, {d} ms  {s}\n", .{ @tagName(st), p.exit_code, timer.uptimeMs() - t0, status(ok1) });
+    pass = pass and ok1;
+
+    // 2 -- a privileged system register read must trap.
+    out("  [2] MRS TCR_EL1 from EL0\n", .{});
+    p = process.spawn(1, 0, "user1") orelse {
+        out("      FAIL: cannot spawn a process\n", .{});
+        return;
+    };
+    t0 = timer.uptimeMs();
+    st = process.wait(p.pid, 4000);
+    _ = process.waitReaped(p.pid, 1000);
+    const ok2 = st == .killed;
+    if (process.processOfPid(p.pid)) |proc| {
+        if (proc.fault) |f| out("      caught: {s} at pc 0x{x}  {s}\n", .{ f.kind, f.pc, status(ok2) });
+    }
+    pass = pass and ok2;
+
+    // 3 -- reading kernel memory must fault, not succeed.
+    out("  [3] load from kernel text 0x40080000 at EL0\n", .{});
+    p = process.spawn(2, 0, "user2") orelse {
+        out("      FAIL: cannot spawn a process\n", .{});
+        return;
+    };
+    st = process.wait(p.pid, 4000);
+    _ = process.waitReaped(p.pid, 1000);
+    const ok3 = st == .killed;
+    if (process.processOfPid(p.pid)) |proc| {
+        if (proc.fault) |f| out("      caught: {s} addr 0x{x}  {s}\n", .{ f.kind, f.addr, status(ok3) });
+    }
+    pass = pass and ok3;
+
+    // 4 -- a syscall pointer outside the process is refused, not followed.
+    out("  [4] syscall pointers outside the process\n", .{});
+    const rejected = syscall.rejected_ptr - rejected_before;
+    const ok4 = rejected >= 2;
+    out("      kernel refused {d} pointer(s) (kernel text + unmapped)  {s}\n", .{ rejected, status(ok4) });
+    pass = pass and ok4;
+
+    // 5 -- two processes, the same virtual address, different physical pages.
+    out("  [5] two processes writing 0x81000010 with different secrets\n", .{});
+    const a = process.spawn(3, 0xAAAA, "iso-a") orelse {
+        out("      FAIL: cannot spawn the first process\n", .{});
+        return;
+    };
+    const b = process.spawn(3, 0xBBBB, "iso-b") orelse {
+        out("      FAIL: cannot spawn the second process\n", .{});
+        return;
+    };
+    const sa = process.wait(a.pid, 5000);
+    const sb = process.wait(b.pid, 5000);
+    _ = process.waitReaped(a.pid, 1000);
+    _ = process.waitReaped(b.pid, 1000);
+    const ok5 = sa == .exited and sb == .exited and a.exit_code == 0 and b.exit_code == 0;
+    out("      pids {d} and {d}: {s}/{s}, codes {d}/{d}  {s}\n", .{
+        a.pid, b.pid, @tagName(sa), @tagName(sb), a.exit_code, b.exit_code, status(ok5),
+    });
+    pass = pass and ok5;
+
+    // 6 -- launch and exit repeatedly; the page counter must come back.
+    out("  [6] five launch/exit cycles\n", .{});
+    var cycles: u32 = 0;
+    for (0..5) |_| {
+        const q = process.spawn(0, 0, "cycle") orelse break;
+        _ = process.wait(q.pid, 4000);
+        _ = process.waitReaped(q.pid, 1000);
+        cycles += 1;
+    }
+    const after_pages = ctx.pmm.stats().free_pages;
+    const leaked = if (base_pages > after_pages) base_pages - after_pages else 0;
+    const ok6 = cycles == 5 and leaked == 0;
+    out("      {d}/5 cycles, free pages {d} -> {d} ({d} leaked)  {s}\n", .{
+        cycles, base_pages, after_pages, leaked, status(ok6),
+    });
+    pass = pass and ok6;
+
+    out("  ------------------------------------------------------------------\n", .{});
+    out("  user syscalls: {d}, processes spawned: {d}, faults caught: {d}\n", .{
+        syscall.user_calls, process.spawns, process.kills,
+    });
+    out("  RESULT: {s}\n", .{if (pass) "PASS" else "FAIL"});
+}
+
 pub const build_version = "0.1.0-dev";
 
 fn execute(ctx: Context, line: []const u8) void {
@@ -528,6 +669,10 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdKill(&tokens);
     } else if (std.mem.eql(u8, command, "reap")) {
         cmdReap(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "user")) {
+        cmdUser(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "uprobe")) {
+        cmdUprobe(ctx);
     } else if (std.mem.eql(u8, command, "logstorm")) {
         cmdLogStorm(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "sleep")) {

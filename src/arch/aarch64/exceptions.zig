@@ -28,6 +28,7 @@ const panic = @import("../../kernel/panic.zig");
 const sched = @import("../../kernel/sched.zig");
 const syscall = @import("../../kernel/syscall.zig");
 const percpu = @import("../../kernel/percpu.zig");
+const process = @import("../../kernel/process.zig");
 
 pub const Frame = trap.Frame;
 
@@ -77,15 +78,19 @@ const save_asm = std.fmt.comptimePrint(
     \\mrs x0, elr_el1
     \\str x0, [sp, #248]
     \\mrs x0, spsr_el1
-    \\stp x0, xzr, [sp, #256]
+    \\str x0, [sp, #256]
+    \\mrs x0, sp_el0
+    \\str x0, [sp, #264]
     \\
 , .{trap.size}) ++ saveSimd();
 
 const restore_asm = std.fmt.comptimePrint(
     \\ldr x0, [sp, #248]
     \\msr elr_el1, x0
-    \\ldp x0, xzr, [sp, #256]
+    \\ldr x0, [sp, #256]
     \\msr spsr_el1, x0
+    \\ldr x0, [sp, #264]
+    \\msr sp_el0, x0
     \\
 , .{}) ++ restoreSimd() ++ std.fmt.comptimePrint(
     \\
@@ -263,6 +268,9 @@ export fn cassa_exception_dispatch(kind: u64, frame: *Frame) callconv(.C) *Frame
         // Synchronous exceptions.
         0, 4, 8, 12 => {
             const esr = cpu.sysRead("esr_el1");
+            // PSTATE.M[3:0] == 0 means the exception came from EL0. User code
+            // is the only thing on this machine that runs unprivileged.
+            const from_user = (frame.spsr & 0xF) == 0;
             if (exceptionClass(esr) == 0x15) {
                 // On AArch64 a supervisor call is not restartable: ELR_EL1
                 // already holds the address of the instruction after the SVC.
@@ -270,10 +278,23 @@ export fn cassa_exception_dispatch(kind: u64, frame: *Frame) callconv(.C) *Frame
                 // which silently skipped the `ldp x29, x30, [sp], #16` that
                 // restores a callee's frame, so the callee returned into
                 // whatever happened to be in x30.
-                const action = syscall.handle(esr & 0xFFFF, frame);
+                // Two calling conventions, deliberately. Kernel code encodes
+                // the number in the instruction (`svc #64`), which costs no
+                // register. EL0 needs a register because the number is chosen
+                // at runtime: x8, the same place the AArch64 Linux ABI puts it.
+                const number = if (from_user) frame.x[8] else esr & 0xFFFF;
+                const action = if (from_user)
+                    syscall.handleUser(number, frame)
+                else
+                    syscall.handle(number, frame);
                 if (action == .reschedule) return sched.reschedule(frame);
                 return frame;
             }
+            // A fault from EL0 belongs to the process, not to the kernel: log
+            // it, terminate that process and let the scheduler pick the next
+            // thread. A fault from EL1 still stops the machine, because it
+            // means the kernel itself is wrong.
+            if (from_user) return process.faultCurrent(frame, esr, cpu.sysRead("far_el1"));
             formatFault(index, frame, esr, cpu.sysRead("far_el1"));
         },
         // FIQ and SError are not expected yet, but must never be silent.

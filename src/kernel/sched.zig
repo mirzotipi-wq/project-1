@@ -19,6 +19,8 @@ const cpu = @import("../arch/aarch64/cpu.zig");
 const timer = @import("../arch/aarch64/timer.zig");
 const trap = @import("../arch/aarch64/trap.zig");
 const percpu = @import("percpu.zig");
+const mmu = @import("../arch/aarch64/mmu.zig");
+const user_space = @import("addrspace.zig");
 const thread_mod = @import("thread.zig");
 const sync = @import("sync.zig");
 const klog = @import("klog.zig");
@@ -367,14 +369,21 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
         return frame;
     }
 
-    prev.on_cpu = false;
     if (prev_runnable) pushTail(pc, prev);
 
     // A frame that does not point at kernel code can only come from a corrupted
     // stack. Detect it here, where the offending thread is still identifiable,
     // instead of letting the CPU jump into nowhere.
     const next_frame: *trap.Frame = @ptrFromInt(next.sp);
-    if (next.sp < 0x4000_0000 or next.sp >= 0x4100_0000 or next_frame.elr < 0x4008_0000 or next_frame.elr >= 0x4019_0000) {
+    // A kernel thread resumes in kernel text; a user thread resumes anywhere in
+    // its own window. Both are checked, because a frame that points outside the
+    // space the thread is allowed to run in means the stack was corrupted.
+    const elr = next_frame.elr;
+    const elr_ok = if (next.address_space != null)
+        (elr >= user_space.code_va and elr < user_space.window_end)
+    else
+        (elr >= 0x4008_0000 and elr < 0x4019_0000);
+    if (next.sp < 0x4000_0000 or next.sp >= 0x4100_0000 or !elr_ok) {
         klog.err("sched", "corrupt frame for thread {d} '{s}' on core {d}: sp=0x{x} elr=0x{x} state={s}", .{
             next.id, next.nameSlice(), pc.id, next.sp, next_frame.elr, next.state.label(),
         });
@@ -383,6 +392,12 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
         });
         @panic("scheduler: corrupt thread frame");
     }
+
+    // The tables are installed before the old thread is marked off-CPU: once
+    // `on_cpu` clears another core may reap it, and reaping frees the very
+    // tables this core would still be using.
+    installAddressSpace(pc, next);
+    prev.on_cpu = false;
 
     next.state = .running;
     next.on_cpu = true;
@@ -397,6 +412,17 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     lock.release(flags);
 
     return @ptrFromInt(next.sp);
+}
+
+/// Point this core's TTBR0 at the address space the next thread needs. A
+/// kernel thread (or the idle thread) gets the kernel's own tables back, which
+/// is what makes a user address space impossible to reach from kernel code that
+/// is not acting on that process's behalf.
+fn installAddressSpace(pc: *percpu.Cpu, next: *Thread) void {
+    const want: usize = if (next.address_space) |as| as.root else mmu.kernelRootPa();
+    if (pc.ttbr0 == want) return;
+    mmu.switchToRoot(want);
+    pc.ttbr0 = want;
 }
 
 /// Called at the end of every IRQ with the interrupted frame.
@@ -442,6 +468,18 @@ fn spawnInner(name: []const u8, entry: thread_mod.EntryFn, arg: ?*anyopaque, pin
     pc.spawned += 1;
     lock.release(flags);
     return t.id;
+}
+
+/// Put a freshly created thread on this core's run queue.
+pub fn admit(t: *Thread) void {
+    const flags = lock.acquire();
+    const pc = percpu.this();
+    t.cpu = pc.id;
+    t.on_cpu = false;
+    pushTail(pc, t);
+    pc.need_resched = true;
+    pc.spawned += 1;
+    lock.release(flags);
 }
 
 /// Give up the CPU for the rest of this thread's slice (syscall 64). Returns

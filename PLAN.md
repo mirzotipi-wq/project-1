@@ -274,19 +274,45 @@ dump.
 
 ---
 
-## Stage C — Privilege, processes and IPC
+## Stage C — Privilege, processes and IPC (21-22 complete)
 
-### Phase 21 — EL0 and syscalls `[ ]`
+### Phase 21 — EL0 and syscalls `[x]`
 **Goal:** Move code out of the kernel.
 **Build:** EL0 transition, `svc` entry path, syscall table with argument validation,
 `copy_from_user`/`copy_to_user` with range checks.
 **Done when:** A user program prints via a syscall and cannot read kernel memory.
+**Verified:** `user` runs the embedded program at EL0 and `uprobe` proves the
+contract. The program prints through `write`, receives its pid and the uptime
+from the kernel, yields and exits 0 (8 ms in a measured run). A `mrs tcr_el1`
+raises a trapped system-register exception at pc 0x80000268; a load from kernel
+text 0x40080000 raises a level-3 permission fault; both are logged with the pid,
+kill only that process, and the kernel keeps running. `write()` with kernel text
+and with an unmapped address each return -14 after the kernel refuses to follow
+the pointer (the `rejected_ptr` counter advances by 2 per run). EL0 passes the
+call number in x8, and the kernel validates every pointer twice: against the
+process's declared regions with their rights (`uaccess.check`, host-tested) and
+against its live page tables (`mmu.translateFrom`). Not done yet: a separate
+fault-tolerant `copy_from_user` (validation is followed by a direct copy) and
+capability checks — phase 23 replaces the region list with a handle table.
 
-### Phase 22 — Address spaces `[ ]`
+### Phase 22 — Address spaces `[x]`
 **Goal:** Isolated per-process memory.
 **Build:** TTBR0 per process, ASIDs, map/unmap/protect, demand-zero anonymous memory,
 user stack growth, guard regions.
 **Done when:** Two processes at the same virtual address cannot see each other's data.
+**Verified:** every process gets its own L0 (a copy of the kernel's), its own
+clone of the kernel's L1, and its own L2/L3 pages, so the kernel and its devices
+stay mapped while a process runs and no user-reachable mapping leaks in. A
+context switch installs the matching root in TTBR0_EL1 and invalidates the TLB,
+before the old thread is marked off-CPU (reaping frees those tables). Two
+processes write different secrets to 0x81000010 — same virtual address, different
+physical pages — and after 25 context switches each still reads its own value
+(`uprobe` step 5). Teardown releases every frame and table: five launch/exit
+cycles return the free-page counter exactly (128440 -> 128440). Not done yet:
+ASIDs (a full TLB invalidate per switch is the honest cost), demand paging (all
+frames are allocated at load), stack growth (a fixed four-page stack with an
+unmapped guard below it) and an ELF loader — the demo is a flat blob embedded in
+the kernel image.
 
 ### Phase 23 — Capabilities `[ ]`
 **Goal:** Authority is a first-class, transferable object.

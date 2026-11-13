@@ -15,6 +15,26 @@ const uart = @import("../devices/pl011.zig");
 const timer = @import("../arch/aarch64/timer.zig");
 const sched = @import("sched.zig");
 const percpu = @import("percpu.zig");
+const process = @import("process.zig");
+const uaccess = @import("uaccess.zig");
+const user_space = @import("addrspace.zig");
+
+/// System calls a process may make from EL0. Deliberately small: each one is a
+/// place where the kernel acts with its own authority, so the surface is the
+/// contract.
+pub const UserNr = enum(u64) {
+    write = 1,
+    exit = 2,
+    getpid = 3,
+    yield = 4,
+    sleep_ms = 5,
+    uptime_ms = 6,
+};
+
+/// Rejected user pointers, counted so the probe can prove the kernel refused to
+/// follow one rather than merely returning an error.
+pub var rejected_ptr: u64 = 0;
+pub var user_calls: u64 = 0;
 
 pub const Nr = enum(u64) {
     debug_write = 1,
@@ -117,4 +137,65 @@ pub fn handle(number: u64, frame: *trap.Frame) Action {
 test "syscall numbers stay out of the signal-handler range" {
     try std.testing.expectEqual(@as(u64, 64), Nr.yield);
     try std.testing.expectEqual(@as(u64, 65), Nr.exit);
+}
+
+/// EL0 entry point. Every argument is untrusted: numbers are matched against a
+/// fixed table, and every pointer is validated against the calling process's own
+/// regions *and* its live page tables before the kernel touches it.
+pub fn handleUser(number: u64, frame: *trap.Frame) Action {
+    user_calls += 1;
+    const t = sched.running();
+    const as = t.address_space orelse {
+        klog.warn("syscall", "EL0 call {d} from a thread with no address space", .{number});
+        frame.x[0] = errno(.invalid);
+        return .keep;
+    };
+
+    switch (number) {
+        @intFromEnum(UserNr.write) => {
+            const ptr = frame.x[0];
+            const len = frame.x[1];
+            if (len > 4096 or !user_space.checkPtr(as, ptr, len, .read)) {
+                rejected_ptr += 1;
+                klog.warn("syscall", "pid {d}: refused write({d} bytes) at 0x{x} — pointer is outside the process", .{ process.currentPid(), len, ptr });
+                frame.x[0] = errno(.fault);
+                return .keep;
+            }
+            const bytes: [*]const u8 = @ptrFromInt(ptr);
+            uart.writeAll(bytes[0..len]);
+            frame.x[0] = len;
+            return .keep;
+        },
+        @intFromEnum(UserNr.exit) => {
+            process.exitCurrent(@bitCast(frame.x[0]));
+            return .reschedule;
+        },
+        @intFromEnum(UserNr.getpid) => {
+            frame.x[0] = process.currentPid();
+            return .keep;
+        },
+        @intFromEnum(UserNr.yield) => {
+            frame.x[0] = 0;
+            return .reschedule;
+        },
+        @intFromEnum(UserNr.sleep_ms) => {
+            sched.sleepCurrent(frame.x[0]);
+            frame.x[0] = 0;
+            return .reschedule;
+        },
+        @intFromEnum(UserNr.uptime_ms) => {
+            frame.x[0] = timer.uptimeMs();
+            return .keep;
+        },
+        else => {
+            klog.warn("syscall", "pid {d}: unknown syscall {d} from pc=0x{x}", .{ process.currentPid(), number, frame.elr });
+            frame.x[0] = errno(.nosys);
+            return .keep;
+        },
+    }
+}
+
+test "user syscall numbers are the documented ones" {
+    try std.testing.expectEqual(@as(u64, 1), @intFromEnum(UserNr.write));
+    try std.testing.expectEqual(@as(u64, 6), @intFromEnum(UserNr.uptime_ms));
 }

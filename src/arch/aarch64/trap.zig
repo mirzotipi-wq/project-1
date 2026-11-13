@@ -25,8 +25,10 @@ pub const Frame = extern struct {
     elr: u64,
     /// Saved program status.
     spsr: u64,
-    /// Padding so the SIMD block lands on a 16-byte boundary.
-    _pad: u64 = 0,
+    /// SP_EL0: the user stack pointer. Meaningful only for a thread that
+    /// returns to EL0; the entry stub saves and restores it on every trap so a
+    /// preempted user thread resumes with its own stack.
+    sp_el0: u64 = 0,
     /// q0..q31, the full 128-bit SIMD register file.
     q: [32]u128,
 
@@ -46,6 +48,10 @@ pub const simd_offset: usize = 272;
 /// lower-EL return; using 0 here silently drops every new thread into user mode
 /// instead of the kernel.
 pub const el1_thread_spsr: u64 = 0x5;
+
+/// PSTATE for a thread that must run unprivileged: M[3:0] = 0 is EL0t, all
+/// interrupts open. `eret` with this SPSR drops to user mode.
+pub const el0_thread_spsr: u64 = 0x0;
 
 comptime {
     if (@sizeOf(Frame) != size) @compileError("trap frame layout drifted from the assembly stub");

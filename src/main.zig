@@ -29,6 +29,7 @@ const panicHook = @import("kernel/panic.zig");
 const percpu = @import("kernel/percpu.zig");
 const sched = @import("kernel/sched.zig");
 const smp = @import("kernel/smp.zig");
+const process = @import("kernel/process.zig");
 
 /// Global kernel state. Single-core for now; phase 18 moves these per-CPU.
 var g_machine: machine.Machine = undefined;
@@ -273,6 +274,7 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     // cores are released here too, so every core that can take a tick already
     // has an idle thread and a bound per-CPU block.
     sched.init(&g_pmm);
+    process.init(&g_pmm);
     smp.startAll(&g_machine);
 
     cpu.irqEnable();

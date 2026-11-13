@@ -13,6 +13,7 @@
 const std = @import("std");
 const pmm = @import("pmm.zig");
 const trap = @import("../arch/aarch64/trap.zig");
+const user_space = @import("addrspace.zig");
 
 pub const State = enum {
     unused,
@@ -58,6 +59,11 @@ pub const Thread = struct {
 
     entry: ?EntryFn = null,
     arg: ?*anyopaque = null,
+
+    /// Non-null for a thread that runs at EL0 in its own address space. The
+    /// scheduler installs these tables whenever the thread is selected, and the
+    /// space is released with the thread's stack when it is reaped.
+    address_space: ?*user_space.AddressSpace = null,
 
     /// Core this thread prefers; woken threads are queued there.
     cpu: u32 = 0,
@@ -168,9 +174,50 @@ pub fn create(
     return t;
 }
 
+/// Create a thread that enters user mode. The frame is built exactly like a
+/// kernel thread's, with three differences that matter: the resume address is a
+/// user virtual address, the saved PSTATE selects EL0t, and SP_EL0 points at the
+/// process's own stack. There is no bootstrap function: the exception return
+/// path drops straight into the program.
+pub fn createUser(
+    alloc: *pmm.PageAllocator,
+    name: []const u8,
+    as: *user_space.AddressSpace,
+    entry: usize,
+    stack_top: usize,
+) ?*Thread {
+    const t = allocateSlot() orelse return null;
+    const base = alloc.allocContiguous(stack_pages) orelse return null;
+
+    t.* = .{};
+    t.id = next_id;
+    next_id += 1;
+    t.state = .ready;
+    t.stack_base = base;
+    t.stack_pages = stack_pages;
+    t.owns_stack = true;
+    t.address_space = as;
+    setName(t, name);
+
+    const bytes: [*]u8 = @ptrFromInt(base);
+    @memset(bytes[0..stack_bytes], 0);
+
+    const top = base + stack_bytes;
+    const frame: *trap.Frame = @ptrFromInt(top - @sizeOf(trap.Frame));
+    frame.* = std.mem.zeroes(trap.Frame);
+    frame.elr = entry;
+    frame.spsr = trap.el0_thread_spsr; // EL0t: the return is a privilege drop
+    frame.sp_el0 = stack_top;
+    t.sp = @intFromPtr(frame);
+    return t;
+}
+
 /// Return a thread's slot and stack to the pool. Must be called with the
 /// thread's stack no longer in use (the scheduler reaps from another stack).
 pub fn destroy(alloc: *pmm.PageAllocator, t: *Thread) void {
+    // The address space goes with the thread: once `on_cpu` is false, no core
+    // is walking these tables and no queue references them.
+    if (t.address_space) |as| user_space.destroy(alloc, as);
     if (t.owns_stack and t.stack_base != 0) {
         alloc.freeRange(t.stack_base, t.stack_pages);
     }

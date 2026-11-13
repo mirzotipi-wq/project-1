@@ -13,9 +13,9 @@ const symbols = @import("../../kernel/symbols.zig");
 pub const page_size: usize = 4096;
 pub const block_size: usize = 2 * 1024 * 1024;
 
-const entries = 512;
+pub const entries = 512;
 const max_tables = 40;
-const addr_mask: u64 = 0x0000_FFFF_FFFF_F000;
+pub const addr_mask: u64 = 0x0000_FFFF_FFFF_F000;
 
 pub const Kind = enum { device, normal, normal_nc };
 
@@ -59,19 +59,19 @@ fn attrs(kind: Kind, exec: bool, read_only: bool) u64 {
     return a;
 }
 
-fn l0Index(va: usize) usize {
+pub fn l0Index(va: usize) usize {
     return (va >> 39) & (entries - 1);
 }
 
-fn tableIndex(va: usize) usize {
+pub fn tableIndex(va: usize) usize {
     return (va >> 12) & (entries - 1);
 }
 
-fn l2Index(va: usize) usize {
+pub fn l2Index(va: usize) usize {
     return (va >> 21) & (entries - 1);
 }
 
-fn l1Index(va: usize) usize {
+pub fn l1Index(va: usize) usize {
     return (va >> 30) & (entries - 1);
 }
 
@@ -267,6 +267,102 @@ pub fn enableOnThisCpu() void {
     sctlr &= ~@as(u64, 1 << 1); // no alignment checking
     cpu.sysWrite("sctlr_el1", sctlr);
     cpu.isb();
+}
+
+// ---------------------------------------------------------------------------
+// User address spaces (phase 22)
+// ---------------------------------------------------------------------------
+
+/// Physical address of the kernel's own top-level table. A process root starts
+/// as a copy of it, which is how the kernel keeps running after a switch.
+pub fn kernelRootPa() usize {
+    return @intFromPtr(root);
+}
+
+/// Physical address of the level-1 table the kernel root points at for the
+/// first 512 GiB. A process clones it so its own window can be added without
+/// affecting the kernel or any other process.
+pub fn kernelL1Pa() usize {
+    return root[0] & addr_mask;
+}
+
+/// Copy the kernel root table into a fresh 4 KiB frame.
+pub fn copyKernelRoot(dst: usize) void {
+    const to: [*]u8 = @ptrFromInt(dst);
+    const from: [*]const u8 = @ptrFromInt(@intFromPtr(root));
+    @memcpy(to[0..page_size], from[0..page_size]);
+}
+
+/// Install a top-level table on this core and drop every cached translation.
+///
+/// ASIDs are not in use yet, so the flush is global to this core's EL1&0 TLB.
+/// That also discards kernel translations, which is why it happens only on a
+/// context switch and never in the middle of one.
+pub fn switchToRoot(root_pa: usize) void {
+    cpu.sysWrite("ttbr0_el1", root_pa);
+    cpu.isb();
+    cpu.tlbiVmalle1();
+    cpu.dsbSy();
+    cpu.isb();
+}
+
+/// Walk four levels from an arbitrary root. Used to validate a user pointer
+/// against the caller's own tables: the kernel's static `root` knows nothing
+/// about a process's mappings, and using it would validate the wrong thing.
+pub fn translateFrom(root_ptr: *const [entries]u64, va: usize) ?usize {
+    const l0e = root_ptr[l0Index(va)];
+    if (l0e & 0b11 != 0b11) return null;
+    const l1e = asTable(l0e)[l1Index(va)];
+    if (l1e & 0b11 == 0) return null;
+    if (l1e & 0b11 == 0b01) return (l1e & addr_mask) | (va & 0x3FFF_FFFF);
+    const l2e = asTable(l1e)[l2Index(va)];
+    if (l2e & 0b11 == 0) return null;
+    if (l2e & 0b11 == 0b01) return (l2e & addr_mask) | (va & 0x1F_FFFF);
+    const l3e = asTable(l2e)[tableIndex(va)];
+    if (l3e & 0b11 == 0) return null;
+    return (l3e & addr_mask) | (va & 0xFFF);
+}
+
+/// Descriptor attributes for a page a user process may name.
+///
+/// AP[2:1] is the whole story, and it is easy to get wrong:
+///
+///   00  EL1 read/write, EL0 no access
+///   01  EL1 read/write, EL0 read/write
+///   10  EL1 read-only,  EL0 no access      <- not "read-only for both"
+///   11  EL1 read-only,  EL0 read-only
+///
+/// Code therefore needs 0b11: read-only at every level *and* readable from EL0,
+/// with UXN=0 so EL0 may execute it and PXN=1 so the kernel never executes user
+/// bytes. Data needs 0b01 with PXN+UXN. That is W^X in the page tables rather
+/// than in the loader.
+pub fn userAttrs(exec: bool, writable: bool) u64 {
+    var a: u64 = attrIndex(.normal) << 2;
+    a |= AF | SH_INNER;
+    if (writable) {
+        a |= 1 << 6; // AP = 0b01: EL0 may read and write
+    } else {
+        a |= AP_RO | (1 << 6); // AP = 0b11: read-only, still readable at EL0
+    }
+    if (!exec) {
+        a |= PXN | UXN;
+    } else {
+        a |= PXN; // user code is executable from EL0 only
+    }
+    return a;
+}
+
+test "user attributes express W^X" {
+    const code = userAttrs(true, false);
+    try std.testing.expect((code & AP_RO) != 0); // not writable
+    try std.testing.expect((code & (1 << 6)) != 0); // EL0 may read it
+    try std.testing.expect((code & UXN) == 0); // executable at EL0
+    try std.testing.expect((code & PXN) != 0); // never executable at EL1
+
+    const data = userAttrs(false, true);
+    try std.testing.expect((data & AP_RO) == 0); // writable
+    try std.testing.expect((data & (1 << 6)) != 0); // accessible at EL0
+    try std.testing.expect((data & UXN) != 0); // never executable
 }
 
 test "descriptor attributes set the execute-never bits" {
