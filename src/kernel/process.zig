@@ -14,6 +14,7 @@ const trap = @import("../arch/aarch64/trap.zig");
 const pmm = @import("pmm.zig");
 const klog = @import("klog.zig");
 const cap = @import("cap.zig");
+const ipc = @import("ipc.zig");
 
 pub const State = enum { free, running, exited, killed };
 
@@ -81,14 +82,20 @@ pub const Profile = enum { full, read_only };
 
 /// Launch the demo image at EL0 in a brand new address space.
 pub fn spawn(mode: u64, secret: u64, name: []const u8) ?*Process {
-    return spawnWith(mode, secret, name, .full);
+    return spawnWith(mode, secret, name, .full, false);
 }
 
 pub fn spawnReadOnly(mode: u64, secret: u64, name: []const u8) ?*Process {
-    return spawnWith(mode, secret, name, .read_only);
+    return spawnWith(mode, secret, name, .read_only, false);
 }
 
-fn spawnWith(mode: u64, secret: u64, name: []const u8, profile: Profile) ?*Process {
+/// A process that is also born holding the bootstrap IPC endpoint. Only the
+/// processes that are meant to talk to each other get it: an outsider does not.
+pub fn spawnIpc(mode: u64, secret: u64, name: []const u8) ?*Process {
+    return spawnWith(mode, secret, name, .full, true);
+}
+
+fn spawnWith(mode: u64, secret: u64, name: []const u8, profile: Profile, endpoint: bool) ?*Process {
     const a = alloc orelse return null;
     const slot = freeSlot() orelse return null;
     const image = @import("../user/image.zig").bytes;
@@ -110,6 +117,13 @@ fn spawnWith(mode: u64, secret: u64, name: []const u8, profile: Profile) ?*Proce
     };
     if (caps) |c| {
         user_space.setHandles(as, c.console, c.ledger, c.supervisor, c.page);
+        if (endpoint) {
+            const object = ipc.bootstrapObjectId();
+            if (object != 0) {
+                const h = cap.grant(slot.pid, object, cap.R_READ | cap.R_WRITE) catch 0;
+                user_space.setEndpointHandle(as, h);
+            }
+        }
     } else {
         klog.warn("proc", "pid {d}: could not build a capability table", .{slot.pid});
     }

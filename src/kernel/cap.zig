@@ -26,7 +26,7 @@ const std = @import("std");
 const pmm = @import("pmm.zig");
 
 pub const max_handles: usize = 16;
-pub const max_objects: usize = 8;
+pub const max_objects: usize = 16;
 pub const max_tables: usize = 8;
 
 pub const R_READ: u32 = 1 << 0;
@@ -48,6 +48,8 @@ pub const Kind = enum {
     ledger,
     supervisor,
     page,
+    /// A rendezvous object two processes meet on (phase 24).
+    endpoint,
 
     pub fn label(self: Kind) []const u8 {
         return switch (self) {
@@ -55,6 +57,7 @@ pub const Kind = enum {
             .ledger => "ledger",
             .supervisor => "supervisor",
             .page => "page",
+            .endpoint => "endpoint",
         };
     }
 };
@@ -88,8 +91,11 @@ const Handle = struct {
     /// Slot generation. Bumped whenever the slot is released, which is what
     /// makes an old handle number stale rather than reusable.
     generation: u32 = 0,
-    /// Slot this handle was derived from, or no_parent.
+    /// Slot this handle was derived from, and the process that owns that slot.
+    /// Transfers set these across tables, which is what lets revocation reach a
+    /// copy another process is holding.
     parent: u8 = no_parent,
+    parent_pid: u32 = 0,
 };
 
 const no_parent: u8 = 0xFF;
@@ -105,6 +111,7 @@ var tables: [max_tables]Table = [_]Table{.{}} ** max_tables;
 var next_object_id: u32 = 1;
 
 pub var derivations: u64 = 0;
+pub var transfers: u64 = 0;
 pub var revocations: u64 = 0;
 pub var refusals: u64 = 0;
 
@@ -212,12 +219,13 @@ fn createTable(pid: u32) ?*Table {
     return null;
 }
 
-fn allocateSlot(table: *Table, object_id: u32, rights: u32, parent: u8) ?u64 {
+fn allocateSlot(table: *Table, object_id: u32, rights: u32, parent: u8, parent_pid: u32) ?u64 {
     for (&table.handles, 0..) |*h, slot| {
         if (h.used) continue;
         h.object = object_id;
         h.rights = rights;
         h.parent = parent;
+        h.parent_pid = parent_pid;
         h.used = true;
         if (find(object_id)) |o| o.refs += 1;
         return encodeHandle(slot, h.generation);
@@ -256,7 +264,40 @@ pub fn query(pid: u32, handle: u64) Error!u32 {
 /// Grant a handle. Used at process creation and by derivation.
 pub fn grant(pid: u32, object_id: u32, rights: u32) Error!u64 {
     const table = tableFor(pid) orelse return Error.BadHandle;
-    return allocateSlot(table, object_id, rights, no_parent) orelse Error.TableFull;
+    return allocateSlot(table, object_id, rights, no_parent, 0) orelse Error.TableFull;
+}
+
+/// Refuse now if a handle could never be handed over: only a CONTROL holder may
+/// grant authority away, exactly as with derivation.
+pub fn checkTransferable(pid: u32, handle: u64) Error!void {
+    const h = try lookup(pid, handle);
+    if (!isSubset(R_CONTROL, h.rights)) {
+        refusals += 1;
+        return Error.Permission;
+    }
+}
+
+/// Install a copy of `handle` in another process's table. The receiving mask
+/// loses CONTROL: a transfer hands over use, not the power to grant further.
+pub fn transfer(src_pid: u32, dst_pid: u32, handle: u64) Error!u64 {
+    const h = try lookup(src_pid, handle);
+    if (!isSubset(R_CONTROL, h.rights)) {
+        refusals += 1;
+        return Error.Permission;
+    }
+    const rights = h.rights & ~R_CONTROL;
+    if (rights == 0) {
+        refusals += 1;
+        return Error.Invalid;
+    }
+    const dst = tableFor(dst_pid) orelse return Error.BadHandle;
+    const src_slot: u8 = @intCast((handle & 0xFF) - 1);
+    const installed = allocateSlot(dst, h.object, rights, src_slot, src_pid) orelse {
+        refusals += 1;
+        return Error.TableFull;
+    };
+    transfers += 1;
+    return installed;
 }
 
 pub fn derive(pid: u32, parent_handle: u64, rights: u32) Error!u64 {
@@ -273,7 +314,7 @@ pub fn derive(pid: u32, parent_handle: u64, rights: u32) Error!u64 {
     }
     const table = tableFor(pid) orelse return Error.BadHandle;
     const slot = @as(u8, @intCast((parent_handle & 0xFF) - 1));
-    const handle = allocateSlot(table, parent.object, rights, slot) orelse return Error.TableFull;
+    const handle = allocateSlot(table, parent.object, rights, slot, pid) orelse return Error.TableFull;
     derivations += 1;
     return handle;
 }
@@ -289,6 +330,7 @@ fn releaseSlot(table: *Table, slot: usize) void {
     h.object = 0;
     h.rights = 0;
     h.parent = no_parent;
+    h.parent_pid = 0;
 }
 
 /// Drop authority. Always allowed: giving up rights never needs permission.
@@ -300,45 +342,63 @@ pub fn close(pid: u32, handle: u64) Error!void {
     releaseSlot(table, slot);
 }
 
-/// Invalidate a handle and every handle derived from it.
+/// Invalidate a handle and every handle derived from it, in this process and in
+/// any process that received a copy through IPC.
 ///
-/// Only a CONTROL holder may revoke. The walk is over one process's table, so it
-/// is bounded by `max_handles` and cannot be made expensive by a user.
+/// Only a CONTROL holder may revoke. The walk is bounded: at most `max_tables`
+/// tables of `max_handles` slots each, and every pass either marks something new
+/// or stops.
 pub fn revoke(pid: u32, handle: u64) Error!void {
     const h = try lookup(pid, handle);
     if (!isSubset(R_CONTROL, h.rights)) {
         refusals += 1;
         return Error.Permission;
     }
-    const table = tableFor(pid) orelse return Error.BadHandle;
-    const root_slot = (@as(usize, handle & 0xFF)) - 1;
+    const root_table = tableIndex(pid) orelse return Error.BadHandle;
+    const root_slot: usize = (@as(usize, handle & 0xFF)) - 1;
 
-    // Mark the root first, then repeatedly sweep for handles whose parent chain
-    // reaches an already-revoked slot. The table is tiny; a fixed number of
-    // passes (bounded by its size) always reaches a fixpoint.
-    var revoked: [max_handles]bool = [_]bool{false} ** max_handles;
-    revoked[root_slot] = true;
-    var pass: usize = 0;
-    while (pass <= max_handles) : (pass += 1) {
-        var changed = false;
-        var slot: usize = 0;
-        while (slot < max_handles) : (slot += 1) {
-            if (!table.handles[slot].used or revoked[slot]) continue;
-            const parent = table.handles[slot].parent;
-            if (parent != no_parent and revoked[parent]) {
-                revoked[slot] = true;
-                changed = true;
+    var revoked: [max_tables]u16 = [_]u16{0} ** max_tables;
+    revoked[root_table] |= @as(u16, 1) << @intCast(root_slot);
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (&tables, 0..) |*t, ti| {
+            if (!t.used) continue;
+            var slot: usize = 0;
+            while (slot < max_handles) : (slot += 1) {
+                const bit = @as(u16, 1) << @intCast(slot);
+                if (revoked[ti] & bit != 0) continue;
+                const entry = &t.handles[slot];
+                if (!entry.used or entry.parent == no_parent) continue;
+                const parent_table = tableIndex(entry.parent_pid) orelse continue;
+                const parent_bit = @as(u16, 1) << @intCast(entry.parent);
+                if (revoked[parent_table] & parent_bit != 0) {
+                    revoked[ti] |= bit;
+                    changed = true;
+                }
             }
         }
-        if (!changed) break;
     }
 
-    for (revoked, 0..) |mark, slot| {
-        if (mark and table.handles[slot].used) {
-            releaseSlot(table, slot);
-            revocations += 1;
+    for (&tables, 0..) |*t, ti| {
+        if (!t.used or revoked[ti] == 0) continue;
+        var slot: usize = 0;
+        while (slot < max_handles) : (slot += 1) {
+            if (revoked[ti] & (@as(u16, 1) << @intCast(slot)) == 0) continue;
+            if (t.handles[slot].used) {
+                releaseSlot(t, slot);
+                revocations += 1;
+            }
         }
     }
+}
+
+fn tableIndex(pid: u32) ?usize {
+    for (&tables, 0..) |*t, i| {
+        if (t.used and t.pid == pid) return i;
+    }
+    return null;
 }
 
 /// The handles a freshly spawned process receives.

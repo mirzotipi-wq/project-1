@@ -31,6 +31,7 @@ const sched = @import("kernel/sched.zig");
 const smp = @import("kernel/smp.zig");
 const process = @import("kernel/process.zig");
 const cap = @import("kernel/cap.zig");
+const ipc = @import("kernel/ipc.zig");
 
 /// Global kernel state. Single-core for now; phase 18 moves these per-CPU.
 var g_machine: machine.Machine = undefined;
@@ -277,6 +278,7 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     sched.init(&g_pmm);
     process.init(&g_pmm);
     cap.boot(&g_pmm);
+    ipc.init();
     smp.startAll(&g_machine);
 
     cpu.irqEnable();

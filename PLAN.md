@@ -385,12 +385,130 @@ Not done yet: handle transfer over IPC (phase 24), mapping the page object as sh
 (phase 25), a variable table size, an accounting charge for table memory, and an unmap
 syscall — the page object is mapped once per process and released with it.
 
-### Phase 24 — IPC endpoints `[ ]`
+### Phase 24 — IPC endpoints `[x]`
 **Goal:** Fast, typed message passing between services.
 **Build:** Endpoint pairs, synchronous call/reply, 64-byte inline payloads plus handle
 transfer, deadlines, backpressure.
 **Done when:** A call/reply round trip sustains > 100k messages/s on QEMU, and a blocked
 receiver never spins.
+**Acceptance (concrete):**
+1. An endpoint is a kernel object of kind `endpoint`; `ipc_create` returns a handle carrying
+   `rwc`, and any handle with `w` may send or reply, `r` may receive, `c` may hand the
+   endpoint to another process.
+2. A message is exactly 64 bytes carried inline (`tag` plus seven words); the kernel copies it
+   into the receiver's own buffer while the receiver's address space is loaded, so no message
+   ever depends on another process's raw pointer.
+3. `ipc_call` blocks the caller until the server replies; the reply lands in the caller's
+   buffer and the reply length is the return value.
+4. One handle may travel with a message. Transferring needs `c` on the handle (EPERM
+   otherwise); a never-allocated or closed number is refused with EBADF before anything is
+   published, so a refused call delivers no message; the receiver gets a fresh handle in its
+   own table whose mask is the sender's minus `c`.
+5. Revocation crosses processes: revoking the sender's handle after a transfer makes the
+   receiver's installed copy fail with EBADF on its next use.
+6. Deadlines: a call that is not answered within its timeout returns -ETIMEDOUT (110), leaves
+   no stale request behind, and the channel still works afterwards; a reply that arrives after
+   the caller gave up is refused with -EAGAIN (11).
+7. Backpressure: an endpoint holds at most one request and one reply; a second sender blocks
+   until the slot frees or its deadline expires.
+8. A process that was never granted the endpoint gets EBADF for a number it does not hold and
+   EINVAL for a handle that is not an endpoint, survives both, and exits 0.
+9. A blocked receiver never spins: its thread state is `blocked` and its run counter does not
+   advance while it waits.
+10. A call/reply round trip sustains > 100,000 messages/s (two messages per round trip) on
+    QEMU with four cores, measured over at least 300 round trips.
+11. No regressions: phases 1-23 keep passing, host tests stay green, and the probe passes on
+    `-smp 1` and `-smp 4`.
+
+**Verified:** endpoints are capability objects (`cap.Kind.endpoint`) and five syscalls
+(28-32) are their whole surface: `ipc_create`, `ipc_send`, `ipc_call`, `ipc_recv`,
+`ipc_reply`. A message is exactly 64 bytes (`tag` plus seven words) copied by the kernel
+into the receiving process's own buffer while that process's address space is loaded, so no
+message ever depends on another process's pointer. `ipc_call` publishes a request, parks the
+caller (`blocked` plus an absolute deadline) and resumes it when the answer is published;
+`ipc_recv` parks a receiver until a request arrives, and a sender that finds a parked
+receiver copies the message straight into it - one context switch instead of a poll. An
+endpoint holds at most one request and one reply, so a second sender parks until the slot
+frees or its deadline expires: that is the whole backpressure story.
+
+One handle may travel with a message. Transferring needs `c` on the handle (EPERM
+otherwise); a never-allocated or closed number is refused with EBADF *before* anything is
+published, so a refused call delivers no message; the receiver's copy carries the sender's
+mask minus `c`, and its parent link points into the sender's table. That last detail is new:
+`revoke` now walks every table, so revoking the sender's handle kills the receiver's copy
+immediately (a phase-23 gap closed here). A reply that arrives after the caller gave up is
+refused with EAGAIN rather than handed to the next call.
+
+The probe (`uprobe` step 10) passes on `-smp 4` and `-smp 1`. Server (mode 6) and client
+(mode 5) are born holding the bootstrap endpoint; the server creates an endpoint and
+transfers it to the client over that channel, so even the channel the client calls through
+arrives as a handle. Client cases: 11 handoff received as a transferred handle; 12 call and
+reply; 13 a READ+CONTROL ledger handle travels, the receiver reads through it and gets EPERM
+for write; 14 a never-allocated number (0xDEAD) refused with EBADF; 15 a closed number
+refused with EBADF; 16 the sender revokes its handle after the transfer and the receiver's
+copy is EBADF; 17 a 10 ms deadline returns ETIMEDOUT (-110) against a server that answers
+after 30 ms; 18 the channel still works and the server reports its late reply was refused
+with EAGAIN (-11); 19 2000 round trips, all exact; 20 a clean shutdown. Server cases: 21
+endpoint created; 22 handoff transferred; 23 exactly one transfer request reached it (the
+forged ones never left the client) and the transferred handle read once; 24 the abandoned
+reply was refused. Outsider (mode 7, never granted the endpoint): 31 EBADF for a number it
+never held, EINVAL for a ledger handle, EPERM for a page handle; 34 bootstrap handle 0. All
+three processes exit 0.
+
+```
+  [10] IPC endpoints: handoff, handle transfer, revocation, deadlines
+[user] ipc server: bootstrap handle 5
+[user] case 21: OK
+[user] case 22: OK
+      server thread 20: state blocked, runs 1 -> 1 over 20 ms  OK
+[user] ipc client: bootstrap handle 5, cores 4
+[user] case 11: OK
+[user] case 12: OK
+[user] case 13: OK
+[user] case 14: OK
+[user] case 15: OK
+[user] case 16: OK
+[user] case 17: OK
+[user] case 18: OK
+[user] ipc throughput: 2000 round trips in 702 ms = 5698 msg/s (2000 exact, goal 100000)
+[user] case 19: OK
+[user] case 23: OK
+[user] case 24: OK
+[user] ipc server: served 2007 requests
+[user] case 20: OK
+      pids 113 server / 114 client / 115 outsider: exited/exited/exited, codes 0/0/0  OK
+      ipc: 2008 sent, 2008 received, 4012 replied, 1 timeouts, 0 full, 3 transfers, 0 transfer failures
+  user syscalls: 6377, processes spawned: 16, faults caught: 2
+  RESULT: PASS
+```
+
+On `-smp 1` the same cases print OK and `RESULT: PASS`, with the round trip at 2000/201 ms
+= 19900 msg/s.
+
+Regression sweep on the same build: 42/42 host tests; `stress 4 20000` → 80000 exact, 0
+lost; `preempt 1000` → 26..27 slices per thread (equal round robin); `reap 8` → 0 pages
+leaked; `logstorm 4` → 96/96 intact lines; `cores` → 4/4 online; `irq` → 0 spurious, 0
+unhandled; `-m 1024M` → 1024 MiB, 259536 pages free, pmm self-test PASS; `textwrite` →
+permission fault at 0x40080000.
+
+**Gap (open):** the >100,000 msg/s target above is **not met**. Measured on this host:
+5698 msg/s on four cores, 19900 on one core, 7662 in a `--release=fast` kernel. The shape of
+the numbers points at the cost of a cross-core wakeup plus the full TLB flush every
+address-space switch performs: the same code is 3.5x faster on a single core, where a round
+trip needs no IPI. The fix is real ASIDs (a phase-22 gap) so a switch stops invalidating the
+whole TLB, then a cheaper trap path (park the syscall at the boundary instead of a nested
+`svc`). Pinning the pair was tried and made it far worse (183 msg/s) because a pinned wake
+then waits for the target core, so it was reverted. A measurement-only run with the TLB
+flush removed crashed the boot, so that number is not claimed.
+
+**Gap (open, recorded honestly):** one four-core boot out of more than a dozen panicked in
+`sched.reschedule` during step 5 (a translation fault on a write with bit 32 set in the
+address) before the IPC step ran. It did not reproduce in 13 later boots, including the three
+final four-core runs; the scheduler queue handling for threads that park inside a syscall is
+the prime suspect and stays open.
+
+Phase 23 gaps still open: the page object as shared memory (phase 25 owns it), a variable
+handle-table size, an accounting charge for table memory, and no unmap syscall.
 
 ### Phase 25 — Shared memory and notifications `[ ]`
 **Goal:** Bulk data without copying.

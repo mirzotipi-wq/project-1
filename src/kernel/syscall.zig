@@ -19,6 +19,7 @@ const process = @import("process.zig");
 const uaccess = @import("uaccess.zig");
 const user_space = @import("addrspace.zig");
 const cap = @import("cap.zig");
+const ipc = @import("ipc.zig");
 
 /// System calls a process may make from EL0. Deliberately small: each one is a
 /// place where the kernel acts with its own authority, so the surface is the
@@ -41,6 +42,14 @@ pub const UserNr = enum(u64) {
     cap_write = 25,
     cap_control = 26,
     cap_map = 27,
+
+    // IPC endpoints (phase 24). A process reaches an endpoint only through a
+    // handle; none of these takes an object identifier.
+    ipc_create = 28,
+    ipc_send = 29,
+    ipc_call = 30,
+    ipc_recv = 31,
+    ipc_reply = 32,
 };
 
 /// Rejected user pointers, counted so the probe can prove the kernel refused to
@@ -48,6 +57,7 @@ pub const UserNr = enum(u64) {
 pub var rejected_ptr: u64 = 0;
 pub var user_calls: u64 = 0;
 pub var cap_calls: u64 = 0;
+pub var ipc_calls: u64 = 0;
 
 pub const Nr = enum(u64) {
     debug_write = 1,
@@ -64,6 +74,8 @@ pub const Nr = enum(u64) {
 
 pub const Errno = enum(i64) {
     perm = -1,
+    again = -11,
+    timeout = -110,
     badf = -9,
     nomem = -12,
     fault = -14,
@@ -71,6 +83,37 @@ pub const Errno = enum(i64) {
     mfile = -24,
     nosys = -38,
 };
+
+fn errnoIpc(e: ipc.Error) u64 {
+    return switch (e) {
+        error.BadHandle => errno(.badf),
+        error.Permission => errno(.perm),
+        error.Invalid => errno(.invalid),
+        error.Fault => errno(.fault),
+        error.Timeout => errno(.timeout),
+        error.Again => errno(.again),
+        error.NoMemory => errno(.nomem),
+        error.TableFull => errno(.mfile),
+    };
+}
+
+/// Run one IPC operation: a result becomes the syscall's two return registers,
+/// a parked caller reschedules instead of returning.
+fn ipcFinish(r: ipc.Error!ipc.Outcome, frame: *trap.Frame) Action {
+    const outcome = r catch |e| {
+        frame.x[0] = errnoIpc(e);
+        frame.x[1] = 0;
+        return .keep;
+    };
+    return switch (outcome) {
+        .done => |d| blk: {
+            frame.x[0] = d.value;
+            frame.x[1] = d.extra;
+            break :blk .keep;
+        },
+        .block => .reschedule,
+    };
+}
 
 fn errnoOf(e: cap.Error) u64 {
     return switch (e) {
@@ -288,6 +331,54 @@ pub fn handleUser(number: u64, frame: *trap.Frame) Action {
             frame.x[0] = user_space.mapped_va;
             return .keep;
         },
+
+        @intFromEnum(UserNr.ipc_create) => {
+            ipc_calls += 1;
+            frame.x[0] = ipc.create(process.currentPid()) catch |e| errnoIpc(e);
+            return .keep;
+        },
+        @intFromEnum(UserNr.ipc_send) => {
+            ipc_calls += 1;
+            return ipcFinish(ipc.send(
+                process.currentPid(),
+                as,
+                frame.x[0],
+                frame.x[1],
+                frame.x[2],
+                frame.x[3],
+            ), frame);
+        },
+        @intFromEnum(UserNr.ipc_call) => {
+            ipc_calls += 1;
+            return ipcFinish(ipc.call(
+                process.currentPid(),
+                as,
+                frame.x[0],
+                frame.x[1],
+                frame.x[2],
+                frame.x[3],
+                frame.x[4],
+            ), frame);
+        },
+        @intFromEnum(UserNr.ipc_recv) => {
+            ipc_calls += 1;
+            return ipcFinish(ipc.recv(
+                process.currentPid(),
+                as,
+                frame.x[0],
+                frame.x[1],
+                frame.x[2],
+            ), frame);
+        },
+        @intFromEnum(UserNr.ipc_reply) => {
+            ipc_calls += 1;
+            return ipcFinish(ipc.reply(
+                process.currentPid(),
+                as,
+                frame.x[0],
+                frame.x[1],
+            ), frame);
+        },
         else => {
             klog.warn("syscall", "pid {d}: unknown syscall {d} from pc=0x{x}", .{ process.currentPid(), number, frame.elr });
             frame.x[0] = errno(.nosys);
@@ -337,7 +428,12 @@ fn capRead(as: *user_space.AddressSpace, frame: *trap.Frame) Action {
             const dst: [*]u64 = @ptrFromInt(ptr);
             dst[0] = 1; // the supervisor (the shell) is process slot 1
             dst[1] = sched.threadCount();
-            frame.x[0] = 16;
+            var copied: usize = 16;
+            if (len >= 24) {
+                dst[2] = percpu.cpu_count;
+                copied = 24;
+            }
+            frame.x[0] = copied;
         },
         else => frame.x[0] = errno(.invalid),
     }

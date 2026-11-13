@@ -22,7 +22,9 @@ const percpu = @import("percpu.zig");
 const threads = @import("thread.zig");
 const sync = @import("sync.zig");
 const process = @import("process.zig");
+const thread_mod = @import("thread.zig");
 const cap = @import("cap.zig");
+const ipc = @import("ipc.zig");
 const syscall = @import("syscall.zig");
 
 pub const Context = struct {
@@ -76,6 +78,7 @@ fn printHelp() void {
         \\  user [mode]          run the EL0 demo: 0 normal, 1 priv op, 2 kernel read, 3 isolation
         \\  uprobe               full EL0 + address-space probe (run this)
         \\  caps                 capability objects and their reference counts
+        \\  ipc                  IPC endpoint counters
         \\
     , .{});
 }
@@ -503,6 +506,17 @@ fn cmdCaps(_: Context) void {
     });
 }
 
+/// `ipc` — endpoint counters.
+fn cmdIpc(_: Context) void {
+    out("  endpoints {d} of {d}, objects {d}\n", .{ ipc.liveEndpoints(), ipc.endpointSlots(), cap.objectSlots() });
+    out("  sent {d}, received {d}, replied {d}, timeouts {d}, full {d}\n", .{
+        ipc.sends, ipc.receives, ipc.replies, ipc.timeouts, ipc.full_events,
+    });
+    out("  transfers {d}, transfer failures {d}, handle transfers in cap {d}\n", .{
+        ipc.transfers, ipc.transfer_failures, cap.transfers,
+    });
+}
+
 fn status(ok: bool) []const u8 {
     return if (ok) "OK" else "FAIL";
 }
@@ -683,6 +697,67 @@ fn cmdUprobe(ctx: Context) void {
         cap.derivations, cap.revocations, cap.refusals, cap.liveTables(),
     });
 
+    // 10 -- IPC endpoints: handoff, handle transfer, revocation, deadlines.
+    out("  [10] IPC endpoints: handoff, handle transfer, revocation, deadlines\n", .{});
+    const srv = process.spawnIpc(6, 0, "ipc-srv") orelse {
+        out("      FAIL: cannot spawn the IPC server\n", .{});
+        return;
+    };
+    const srv_pid = srv.pid;
+    const srv_tid = srv.thread_id;
+    // Wait for it to enter its receive, then watch it for 20 ms: a parked
+    // thread must not be scheduled at all.
+    var park_state: thread_mod.State = .unused;
+    var waited: u64 = 0;
+    while (waited < 400) : (waited += 5) {
+        sched.sleepMsBlocking(5);
+        if (sched.find(srv_tid)) |t| {
+            park_state = t.state;
+            if (park_state == .blocked) break;
+        }
+    }
+    var runs_before: u64 = 0;
+    var runs_after: u64 = 0;
+    if (sched.find(srv_tid)) |t| runs_before = t.runs;
+    sched.sleepMsBlocking(20);
+    if (sched.find(srv_tid)) |t| runs_after = t.runs;
+    const parked_ok = park_state == .blocked and runs_before == runs_after;
+    out("      server thread {d}: state {s}, runs {d} -> {d} over 20 ms  {s}\n", .{
+        srv_tid, park_state.label(), runs_before, runs_after, status(parked_ok),
+    });
+    pass = pass and parked_ok;
+
+    const cli = process.spawnIpc(5, 0, "ipc-cli") orelse {
+        out("      FAIL: cannot spawn the IPC client\n", .{});
+        return;
+    };
+    const outsider = process.spawn(7, 0, "ipc-out") orelse {
+        out("      FAIL: cannot spawn the outsider\n", .{});
+        return;
+    };
+    const cli_pid = cli.pid;
+    const out_pid = outsider.pid;
+    const s_cli = process.wait(cli_pid, 8000);
+    const c_cli = cli.exit_code;
+    _ = process.waitReaped(cli_pid, 1000);
+    const s_out = process.wait(out_pid, 8000);
+    const c_out = outsider.exit_code;
+    _ = process.waitReaped(out_pid, 1000);
+    const s_srv = process.wait(srv_pid, 8000);
+    const c_srv = srv.exit_code;
+    _ = process.waitReaped(srv_pid, 1000);
+    const ipc_ok = s_cli == .exited and s_out == .exited and s_srv == .exited and
+        c_cli == 0 and c_out == 0 and c_srv == 0;
+    out("      pids {d} server / {d} client / {d} outsider: {s}/{s}/{s}, codes {d}/{d}/{d}  {s}\n", .{
+        srv_pid, cli_pid, out_pid,
+        @tagName(s_cli), @tagName(s_out), @tagName(s_srv),
+        c_srv, c_cli, c_out, status(ipc_ok),
+    });
+    out("      ipc: {d} sent, {d} received, {d} replied, {d} timeouts, {d} full, {d} transfers, {d} transfer failures\n", .{
+        ipc.sends, ipc.receives, ipc.replies, ipc.timeouts, ipc.full_events, ipc.transfers, ipc.transfer_failures,
+    });
+    pass = pass and ipc_ok;
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  user syscalls: {d}, processes spawned: {d}, faults caught: {d}\n", .{
         syscall.user_calls, process.spawns, process.kills,
@@ -746,6 +821,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdUprobe(ctx);
     } else if (std.mem.eql(u8, command, "caps")) {
         cmdCaps(ctx);
+    } else if (std.mem.eql(u8, command, "ipc")) {
+        cmdIpc(ctx);
     } else if (std.mem.eql(u8, command, "logstorm")) {
         cmdLogStorm(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "sleep")) {

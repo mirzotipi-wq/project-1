@@ -248,6 +248,13 @@ pub fn setHandles(as: *AddressSpace, console: u64, ledger: u64, supervisor: u64,
     words[7] = page_handle;
 }
 
+/// The bootstrap IPC endpoint, handed to processes that ask for a channel.
+pub fn setEndpointHandle(as: *AddressSpace, handle: u64) void {
+    if (as.args_pa == 0) return;
+    const words: [*]u64 = @ptrFromInt(as.args_pa);
+    words[8] = handle;
+}
+
 /// Where a mapped capability page appears in the user window. Between the data
 /// region (0x81000000) and the stack (0x82000000), so it collides with neither.
 pub const mapped_va: usize = 0x8150_0000;

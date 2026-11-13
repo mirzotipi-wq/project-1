@@ -378,11 +378,18 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     // A kernel thread resumes in kernel text; a user thread resumes anywhere in
     // its own window. Both are checked, because a frame that points outside the
     // space the thread is allowed to run in means the stack was corrupted.
+    // A user thread is normally parked in its own code, but a blocking syscall
+    // parks it *inside the kernel*: the frame then records an EL1 return
+    // address and the syscall resumes when the thread is next scheduled. Both
+    // are legitimate; anything else is a corrupted stack.
     const elr = next_frame.elr;
+    const kernel_frame = (next_frame.spsr & 0xF) != 0;
+    const in_kernel_text = elr >= 0x4008_0000 and elr < 0x401b_0000;
     const elr_ok = if (next.address_space != null)
-        (elr >= user_space.code_va and elr < user_space.window_end)
+        (in_kernel_text and kernel_frame) or
+            (elr >= user_space.code_va and elr < user_space.window_end)
     else
-        (elr >= 0x4008_0000 and elr < 0x4019_0000);
+        in_kernel_text;
     if (next.sp < 0x4000_0000 or next.sp >= 0x4100_0000 or !elr_ok) {
         klog.err("sched", "corrupt frame for thread {d} '{s}' on core {d}: sp=0x{x} elr=0x{x} state={s}", .{
             next.id, next.nameSlice(), pc.id, next.sp, next_frame.elr, next.state.label(),
