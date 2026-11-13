@@ -23,6 +23,10 @@ const threads = @import("thread.zig");
 const sync = @import("sync.zig");
 const process = @import("process.zig");
 const thread_mod = @import("thread.zig");
+const service = @import("service.zig");
+const dump = @import("dump.zig");
+const restart = @import("restart.zig");
+const user_space = @import("addrspace.zig");
 const cap = @import("cap.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
@@ -84,6 +88,8 @@ fn printHelp() void {
         \\  ipc                  IPC endpoint counters
         \\  shm                  shared-memory objects and event counters
         \\  exec <image> [args]  load an ELF from the image store and run it
+        \\  service [start|kill|stop <name>]  supervised services
+        \\  dumps                crash records from faulting programs
         \\  images               list the image store
         \\  elf                  ELF loader state and the last load plan
         \\
@@ -654,6 +660,67 @@ fn elfRefusals() ElfRefusals {
     return r;
 }
 
+/// `service` — list supervised services, or start / kill / stop one by name.
+/// The point of the command is that a name survives the pid: killing a service
+/// asks the supervisor to deal with it, exactly as a hardware fault would.
+fn cmdService(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "";
+    if (sub.len == 0) {
+        out("  name       state       pid    restarts  failures  policy  last\n", .{});
+        var i: usize = 0;
+        while (i < service.max_services) : (i += 1) {
+            const s = service.at(i) orelse continue;
+            const last = if (s.last_kind.len != 0) s.last_kind else "-";
+            out("  {s:<9}  {s:<10}  {d:>4}   {d:>8}  {d:>8}  {d}/{d}   {s}\n", .{
+                s.name, service.stateLabel(s.state), s.pid, s.restarts, s.failures,
+                s.policy.max_restarts, s.policy.base_ms, last,
+            });
+        }
+        out("  {d} registered, {d} starts, {d} restarts, {d} failures, {d} crash loops, {d} reaps\n", .{
+            service.count(), service.starts, service.restarts_total, service.failures_total,
+            service.crash_loops, service.reaps,
+        });
+        return;
+    }
+    const name = tokens.next() orelse {
+        out("usage: service start|kill|stop <name>\n", .{});
+        return;
+    };
+    if (std.mem.eql(u8, sub, "start")) {
+        if (service.start(name)) {
+            const s = service.find(name).?;
+            out("  started '{s}', pid {d}, state {s}\n", .{ name, s.pid, service.stateLabel(s.state) });
+        } else {
+            out("  cannot start '{s}'\n", .{name});
+        }
+    } else if (std.mem.eql(u8, sub, "kill")) {
+        if (service.kill(name)) {
+            out("  killed '{s}'; the supervisor will restart it with backoff\n", .{name});
+        } else {
+            out("  '{s}' is not running\n", .{name});
+        }
+    } else if (std.mem.eql(u8, sub, "stop")) {
+        if (service.stop(name)) out("  stopped '{s}', no restart\n", .{name});
+    } else {
+        out("usage: service start|kill|stop <name>\n", .{});
+    }
+}
+
+/// `dumps` — the crash records kept for the last few faults.
+fn cmdDumps(_: Context) void {
+    out("  {d} crash record(s), {d} fault(s) since boot\n", .{ dump.stored(), dump.total });
+    var i: usize = 0;
+    while (i < dump.stored()) : (i += 1) {
+        const d = dump.at(i) orelse continue;
+        out("  pid {d} at {d} ms: {s}, addr 0x{x}, pc 0x{x}, esr 0x{x}\n", .{
+            d.pid, d.ms, d.kind, d.addr, d.pc, d.esr,
+        });
+        out("    x0..x3 0x{x} 0x{x} 0x{x} 0x{x}\n", .{ d.regs[0], d.regs[1], d.regs[2], d.regs[3] });
+        out("    x4..x7 0x{x} 0x{x} 0x{x} 0x{x}\n", .{ d.regs[4], d.regs[5], d.regs[6], d.regs[7] });
+        out("    stack  0x{x} 0x{x} 0x{x} 0x{x}\n", .{ d.stack[0], d.stack[1], d.stack[2], d.stack[3] });
+    }
+}
+
 fn status(ok: bool) []const u8 {
     return if (ok) "OK" else "FAIL";
 }
@@ -1001,6 +1068,137 @@ fn cmdUprobe(ctx: Context) void {
     });
     pass = pass and ipc_ok;
 
+    // 13 -- lifecycle: one service is killed in a loop while another keeps
+    // serving, a fault is captured as a crash record, and nothing is orphaned.
+    out("  [13] lifecycle: a crashing service is restarted, checkout keeps working\n", .{});
+    const live_before = process.liveCount();
+    const spaces_before = user_space.liveCount();
+    var lc_ok = true;
+    const printer_cfg = service.register("printer", "pos.elf", &[_][]const u8{ "pos.elf", "loop" });
+    if (printer_cfg == null or
+        service.register("checkout", "pos.elf", &[_][]const u8{ "pos.elf", "loop" }) == null)
+    {
+        out("      FAIL: the service table is full\n", .{});
+        lc_ok = false;
+    } else {
+        // One extra tolerated failure than the default policy, so the probe can
+        // show every rung of the backoff ladder and then the crash-loop stop. The
+        // stability window is widened because this test is about consecutive
+        // failures; a probe preempted for a few hundred milliseconds between two
+        // kills must not look like a service that recovered.
+        printer_cfg.?.policy.max_restarts = 7;
+        printer_cfg.?.policy.stable_ms = 60_000;
+        const both = service.start("printer") and service.start("checkout");
+        sched.sleepMsBlocking(30);
+        const pr = service.find("printer").?;
+        const co = service.find("checkout").?;
+        const up_ok = both and pr.state == .running and co.state == .running and pr.pid != 0 and co.pid != 0;
+        out("      registered printer pid {d} and checkout pid {d}, both {s}  {s}\n", .{
+            pr.pid, co.pid, service.stateLabel(pr.state), status(up_ok),
+        });
+        lc_ok = lc_ok and up_ok;
+
+        var killed: u32 = 0;
+        var delays: [7]u64 = [_]u64{0} ** 7;
+        var i: usize = 0;
+        while (i < 7) : (i += 1) {
+            // Wait for the previous restart to finish before killing again, so
+            // every kill lands on a live service rather than on a timer.
+            var wait_ms: u64 = 0;
+            while (wait_ms < 800) : (wait_ms += 5) {
+                if (service.find("printer").?.state == .running) break;
+                sched.sleepMsBlocking(5);
+            }
+            if (service.kill("printer")) killed += 1;
+            // Wait for the supervisor to notice the death and record the policy
+            // decision: the backoff it chose is the observable evidence.
+            wait_ms = 0;
+            while (wait_ms < 800) : (wait_ms += 5) {
+                if (service.find("printer").?.state != .running) break;
+                sched.sleepMsBlocking(5);
+            }
+            delays[i] = service.find("printer").?.last_delay_ms;
+        }
+        const printer = service.find("printer").?;
+        const kills_ok = killed == 7 and printer.restarts == 6 and
+            printer.state == .failed and service.crash_loops == 1 and
+            delays[0] == 5 and delays[1] == 10 and delays[2] == 20 and delays[3] == 40 and
+            delays[4] == 80 and delays[5] == 160 and delays[6] == 0;
+        out("      killed {d}x: {d} restarts, backoff {d}/{d}/{d}/{d}/{d}/{d} ms, then parked {s}  {s}\n", .{
+            killed, printer.restarts, delays[0], delays[1], delays[2], delays[3], delays[4], delays[5],
+            service.stateLabel(printer.state), status(kills_ok),
+        });
+        out("      printer: {d} restarts, {d} failures, crash loop {d}  {s}\n", .{
+            printer.restarts, printer.failures, service.crash_loops, status(kills_ok),
+        });
+        lc_ok = lc_ok and kills_ok;
+
+        // The till keeps working through all of that: three checkout requests.
+        var served: u32 = 0;
+        const serve_argv = [_][]const u8{ "pos.elf", "serve" };
+        const serve_env = [_][]const u8{"POS_TERM=cassa-1"};
+        var req: usize = 0;
+        while (req < 3) : (req += 1) {
+            if (process.spawnElf("pos.elf", &serve_argv, &serve_env)) |req_proc| {
+                const req_state = process.wait(req_proc.pid, 3000);
+                if (req_state == .exited and req_proc.exit_code == 0) served += 1;
+                _ = process.waitReaped(req_proc.pid, 1000);
+            }
+        }
+        const co2 = service.find("checkout").?;
+        const checkout_ok = served == 3 and co2.state == .running and co2.restarts == 0;
+        out("      checkout: {d}/3 requests served, service {s}, {d} restarts during the kills  {s}\n", .{
+            served, service.stateLabel(co2.state), co2.restarts, status(checkout_ok),
+        });
+        lc_ok = lc_ok and checkout_ok;
+
+        // A fault, not a kill: it must leave a crash record and still be contained.
+        const dumps_before = dump.total;
+        const crash_argv = [_][]const u8{ "pos.elf", "crash" };
+        var fault_ok = false;
+        if (process.spawnElf("pos.elf", &crash_argv, &serve_env)) |crash_proc| {
+            const crash_state = process.wait(crash_proc.pid, 3000);
+            const crash_fault = if (process.processOfPid(crash_proc.pid)) |rec| rec.fault else null;
+            _ = process.waitReaped(crash_proc.pid, 1000);
+            fault_ok = crash_state == .killed and crash_fault != null and dump.total == dumps_before + 1;
+            if (crash_fault) |cf| {
+                out("      fault: pid {d} killed by {s} at 0x{x}, crash record {d}  {s}\n", .{
+                    crash_proc.pid, cf.kind, cf.addr, dump.total - dumps_before, status(fault_ok),
+                });
+            } else {
+                out("      fault: no fault was recorded  FAIL\n", .{});
+            }
+        }
+        if (dump.at(0)) |d| {
+            var nonzero: usize = 0;
+            for (d.regs) |r| {
+                if (r != 0) nonzero += 1;
+            }
+            out("      dump: pc 0x{x}, esr 0x{x}, {d}/8 registers and {d} stack words captured\n", .{
+                d.pc, d.esr, nonzero, d.stack.len,
+            });
+        }
+        lc_ok = lc_ok and fault_ok;
+
+        _ = service.stop("checkout");
+        _ = service.stop("printer");
+        sched.sleepMsBlocking(50);
+        const live_after = process.liveCount();
+        const spaces_after = user_space.liveCount();
+        const orphan_ok = live_after == live_before and spaces_after == spaces_before and
+            service.find("checkout").?.state == .stopped;
+        out("      stop: services {s}, live processes {d} -> {d}, spaces {d} -> {d}  {s}\n", .{
+            service.stateLabel(service.find("checkout").?.state),
+            live_before, live_after, spaces_before, spaces_after, status(orphan_ok),
+        });
+        lc_ok = lc_ok and orphan_ok;
+        out("      services: {d} starts, {d} restarts, {d} failures, {d} crash loops, {d} dumps, {d} reaps\n", .{
+            service.starts, service.restarts_total, service.failures_total,
+            service.crash_loops, dump.total, service.reaps,
+        });
+    }
+    pass = pass and lc_ok;
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  user syscalls: {d}, processes spawned: {d}, faults caught: {d}\n", .{
         syscall.user_calls, process.spawns, process.kills,
@@ -1074,6 +1272,10 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdImages(ctx);
     } else if (std.mem.eql(u8, command, "elf")) {
         cmdElf(ctx);
+    } else if (std.mem.eql(u8, command, "service")) {
+        cmdService(&tokens);
+    } else if (std.mem.eql(u8, command, "dumps")) {
+        cmdDumps(ctx);
     } else if (std.mem.eql(u8, command, "logstorm")) {
         cmdLogStorm(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "sleep")) {

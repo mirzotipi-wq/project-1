@@ -21,6 +21,7 @@ const SYS_WRITE = 1;
 const SYS_EXIT = 2;
 const SYS_GETPID = 3;
 const SYS_UPTIME_MS = 6;
+const SYS_SLEEP_MS = 5;
 
 fn syscall3(n: u64, a: u64, b: u64, c: u64) u64 {
     @setRuntimeSafety(false);
@@ -116,10 +117,13 @@ export fn _start(argc: usize, argv: [*][*:0]u8, envp: [*][*:0]u8) callconv(.C) n
         write(sliceOf(argv[i]));
         write("\n");
     }
-    if (argc != 3) ok = false;
-    if (argc == 3) {
-        if (!equal(sliceOf(argv[1]), "alpha")) ok = false;
-        if (!equal(sliceOf(argv[2]), "beta")) ok = false;
+    const mode: []const u8 = if (argc > 1) sliceOf(argv[1]) else "";
+    if (equal(mode, "alpha")) {
+        if (argc != 3) ok = false;
+        if (argc == 3) {
+            if (!equal(sliceOf(argv[1]), "alpha")) ok = false;
+            if (!equal(sliceOf(argv[2]), "beta")) ok = false;
+        }
     }
 
     // 4. envp arrived, and it is a separate vector from argv.
@@ -144,5 +148,26 @@ export fn _start(argc: usize, argv: [*][*:0]u8, envp: [*][*:0]u8) callconv(.C) n
     write(" ms\n");
 
     write(if (ok) "[user] pos: loaded from ELF, argv and envp intact\n" else "[user] pos: checks FAILED\n");
+
+    // Behaviours the lifecycle probe drives. They are ordinary program choices,
+    // not kernel modes: the supervisor only sees a pid, an exit status or a
+    // fault, exactly as it would for any real service.
+    if (equal(mode, "crash")) {
+        write("[user] pos: crashing on purpose\n");
+        const bad: *volatile u64 = @ptrFromInt(0x10);
+        bad.* = 0xDEAD;
+        exit(9);
+    }
+    if (equal(mode, "serve")) {
+        write("[user] pos: serve ok\n");
+        exit(0);
+    }
+    if (equal(mode, "loop")) {
+        write("[user] pos: looping until killed\n");
+        while (true) {
+            _ = syscall3(SYS_SLEEP_MS, 20, 0, 0);
+        }
+    }
+
     exit(if (ok) 42 else 9);
 }

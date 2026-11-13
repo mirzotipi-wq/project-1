@@ -726,11 +726,110 @@ something to do with it. Only ET_EXEC is supported (no PIE, no dynamic linking, 
 relocations), there is no ASLR, argv/envp are capped at 8 entries each, and `exec` does not
 inherit the caller's environment beyond the fixed `POS_TERM`.
 
-### Phase 27 — Lifecycle and fault isolation `[ ]`
+### Phase 27 — Lifecycle and fault isolation `[x]`
 **Goal:** One crashing service cannot take the till down.
 **Build:** Supervisor per service, restart policy with backoff, crash loop detection,
 core-dump-to-storage, orphan reaping.
 **Done when:** Killing the printer service in a loop leaves checkout functional.
+
+> Scope note (tightened): "core-dump-to-storage" is a **crash record** — pid, fault kind,
+> fault address, pc, esr, the eight argument registers and eight words of the faulting user
+> stack — captured while the process still owns its address space, kept in a small kernel ring
+> and printed by `dumps`. The VFS phases own files; this record is the part of a core file a
+> supervisor can act on, and every field is measured, not inferred from a log line.
+
+**Acceptance (concrete):**
+1. `service start|kill|stop <name>` manages a named service; bare `service` lists name, state,
+   pid, restarts, failures and policy for every slot, plus the global counters.
+2. A service that dies is restarted by the supervisor with exponential backoff
+   (5, 10, 20, 40, 80, 160 ms, capped at 160), and the delay the policy chose is recorded on
+   the service record, so the ladder is observable from outside.
+3. Consecutive failures are counted. At the policy's limit the service is parked `failed`
+   (crash loop detected) instead of being restarted forever; a run that stays up for the
+   policy's stability window resets the count.
+4. A faulting program leaves a crash record (`dumps` shows pid, cause, pc, esr, registers and
+   stack words) and cannot take the machine down: the shell and every other service keep
+   running.
+5. Stopping a service kills its child and reaps it. Live process count, address-space count
+   and the page allocator return to their pre-service values (orphan reaping), and a killed
+   child that blocked in a syscall still dies.
+6. Checkout keeps working while the printer service is killed in a loop.
+7. No regressions: phases 1-26 keep passing, host tests stay green (new host tests for the
+   restart policy), and the probe passes on `-smp 1` and `-smp 4`.
+
+**Verified.** The supervisor is a kernel thread of its own (`svc`) that polls the service table
+every 10 ms and never blocks on a child. Each entry is a name, an image, argv, and a pure
+`restart.Policy` (max_restarts 6, base 5 ms, cap 160 ms, stable window 250 ms). The policy
+itself is `src/kernel/restart.zig`, free of kernel dependencies, so backoff, the crash-loop
+decision and the stability reset are unit-tested on the host (3 new tests, 55/55 total).
+
+The probe's step [13] is the phase's own acceptance test, run on the same clean build:
+
+```
+  [13] lifecycle: a crashing service is restarted, checkout keeps working
+      registered printer pid 120 and checkout pid 121, both running  OK
+      killed 7x: 6 restarts, backoff 5/10/20/40/80/160 ms, then parked failed  OK
+      printer: 6 restarts, 7 failures, crash loop 1  OK
+      checkout: 3/3 requests served, service running, 0 restarts during the kills  OK
+      fault: pid 131 killed by data abort (permission) at 0x10, crash record 1  OK
+      dump: pc 0x8000048c, esr 0x9200004e, 3/8 registers and 8 stack words captured
+      stop: services stopped, live processes 0 -> 0, spaces 0 -> 0  OK
+      services: 8 starts, 6 restarts, 7 failures, 1 crash loops, 3 dumps, 9 reaps
+  user syscalls: 6839, processes spawned: 32, faults caught: 11
+  RESULT: PASS
+```
+
+Read that transcript for what it is: the printer was killed **seven** times; the supervisor
+brought it back six times with 5/10/20/40/80/160 ms between attempts (its own `svc` log lines
+match: `died (code -9), restarting in 5 ms` ... `restarting in 160 ms`), and on the seventh
+failure it logged `crash loop: 7 failures, parked` and stopped. Through all of that the
+`checkout` service never restarted and served three fresh `pos.elf serve` requests, each
+exiting 0. The faulting `pos.elf crash` was contained, left a crash record with its pc, esr
+and register/stack words, and cost no live process, address space or page: after `stop`, live
+processes and spaces are back to 0 and `reaps` counts every child the supervisor buried.
+
+**A scheduler defect this phase found and fixed.** The supervisor is a thread that blocks and
+wakes ~100 times per second, which is far more than anything before it, and it exposed a
+use-after-free in the context switch: `reschedule` cleared the outgoing thread's `on_cpu`
+flag *before* returning the incoming frame, i.e. while the core was still executing on the
+outgoing thread's stack. Another core's tick could then reap that thread and free its stack
+in that window; the symptom was an occasional `eret` into data (a fault report whose ELR was
+ASCII from a log line) or a resumed frame with a nonsense `spsr`. Four-core idle boots with the
+unpinned supervisor died within ~17 s; pinned, they survived, which is what pointed at
+migration rather than at the supervisor's logic. The fix moves the hand-off into the exception
+trampoline: `reschedule` records `pc.switching_out`, the trampoline calls `cassa_after_switch`
+immediately after `mov sp, x0`, and only there is `on_cpu` cleared. A wake that arrived during
+that window is deferred (`pending_wake`) and must be applied at that same point or it is lost —
+the first version of the fix omitted that and hung the shared-memory step, which the probe
+caught at once. The frame validation also checks the saved PSTATE mode now, so a corrupt frame
+is reported with the thread's name instead of jumping into whatever address it names.
+
+Measured evidence for the fix: with the unpinned supervisor, two 36 s four-core idle boots and
+four consecutive four-core probe boots ran with zero faults and `RESULT: PASS`; before the fix
+the same idle boot faulted every time within ~17 s. `-smp 1` passes too.
+
+Host tests: 55/55 (3 new: backoff doubles and caps, the crash loop trips at max_restarts and not
+before, a stable run forgives the failures). Regression sweep on the same clean build:
+`stress 4 20000` -> 0 lost; `preempt 1000` -> PASS (`22..23` slices); `reap 8` -> 0 pages
+leaked; `logstorm 4` -> 96/96 intact; `cores` -> 4 cores online; `irq` -> 0 spurious, 0
+unhandled; `-m 1024M` -> 1024 MiB, 259456 pages free; `textwrite` -> permission fault at
+0x40080000. The phase-24 IPC probe's late-reply window went from 60 ms to 200 ms: the extra
+supervisor load made the server occasionally answer the abandoned call after the client had
+already moved on. No assertion was changed — the window only gives the server time to finish,
+which is what the test always assumed.
+
+**Gap (open):** the service table is four static slots with the image name compiled in, and the
+policy is per-service but not persisted, so a `failed` service stays parked until someone
+restarts it by name — that is the service registry and manifest work of phase 28. The crash
+record ring holds four records in kernel memory and is lost on reboot (no filesystem yet); it
+captures registers and eight stack words, not the full stack or the faulting page. Supervision
+is polling, not event-driven: a death is noticed within one 10 ms tick, and a restart can
+therefore be up to one tick later than the policy's delay. Orphan reaping covers children of
+supervised services; a process spawned directly by the shell is reaped by the shell's `wait`
+as before, and there is no process group or parent/child tree yet. The scheduler's
+`cassa_after_switch` hand-off has survived the soak above, but it is the kind of change that
+deserves a longer stress run than one phase can give it; `stress 4 20000` and the four-core
+probe boots are the evidence so far.
 
 ### Phase 28 — Service registry `[ ]`
 **Goal:** Services find each other without hard-coded handles.

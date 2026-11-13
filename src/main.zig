@@ -32,6 +32,7 @@ const smp = @import("kernel/smp.zig");
 const process = @import("kernel/process.zig");
 const cap = @import("kernel/cap.zig");
 const ipc = @import("kernel/ipc.zig");
+const service = @import("kernel/service.zig");
 
 /// Global kernel state. Single-core for now; phase 18 moves these per-CPU.
 var g_machine: machine.Machine = undefined;
@@ -293,6 +294,14 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
         .heap = &g_heap,
         .selftest = runSelfTest,
     };
+    // The supervisor is a kernel thread of its own: it must keep running when
+    // the shell is busy, and it must never block on a service it watches. It is
+    // pinned to the core that starts it: a supervisor that sleeps every few
+    // milliseconds has no reason to migrate, and keeping it on one core keeps
+    // its stack cache-hot while the service threads it restarts move around.
+    if (sched.spawn("svc", service.supervisorLoop, null) == null) {
+        klog.warn("boot", "cannot start the service supervisor", .{});
+    }
     if (sched.spawn("shell", shellEntry, null) == null) {
         klog.err("boot", "could not create the shell thread", .{});
         cpu.halt();

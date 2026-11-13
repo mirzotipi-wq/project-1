@@ -692,8 +692,10 @@ fn ipcClient(secret: u64) u32 {
     report(17, ok17);
 
     // Give the server time to answer the call we abandoned, so its reply is
-    // refused rather than handed to the next caller.
-    sleepMs(60);
+    // refused rather than handed to the next caller. The window is generous
+    // because the machine now runs a supervisor and the server may be scheduled
+    // late; what is being tested is the refusal, not the latency.
+    sleepMs(200);
 
     // 18 -- the next call still works, and the server confirms its late reply
     // was refused with EAGAIN.

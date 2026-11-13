@@ -17,6 +17,7 @@ const cap = @import("cap.zig");
 const ipc = @import("ipc.zig");
 const store = @import("image.zig");
 const elf = @import("elf.zig");
+const dump = @import("dump.zig");
 
 pub const State = enum { free, running, exited, killed };
 
@@ -247,8 +248,25 @@ pub fn faultCurrent(frame: *trap.Frame, esr: u64, far: u64) *trap.Frame {
     });
     if (slotForThread(t.id)) |p| {
         p.state = .killed;
+        p.exit_code = -9;
         p.fault = .{ .kind = kind, .addr = far, .pc = frame.elr };
     }
+    // The core-dump record is taken while the faulting address space is still
+    // the one installed, so the user stack can be read through the kernel's
+    // identity map instead of a copy that no longer exists later.
+    var regs: [8]u64 = undefined;
+    for (0..8) |i| regs[i] = frame.x[i];
+    var stack: [8]u64 = [_]u64{0} ** 8;
+    if (t.address_space) |as| {
+        var i: usize = 0;
+        while (i < stack.len) : (i += 1) {
+            const va = frame.sp_el0 + i * 8;
+            if (!user_space.checkPtr(as, va, 8, .read)) break;
+            const pa = user_space.translate(as, va) orelse break;
+            stack[i] = @as(*const u64, @ptrFromInt(pa)).*;
+        }
+    }
+    dump.record(pid, kind, far, frame.elr, esr, regs, stack);
     sched.markDead();
     return sched.reschedule(frame);
 }
@@ -270,9 +288,44 @@ fn faultKind(esr: u64) []const u8 {
     };
 }
 
+/// A killed thread disappears without ever running again: the scheduler turns
+/// `kill_requested` into `.dead` at the next switch, so the process record has
+/// to notice the thread is gone and give the death a state.
+fn adoptDeath(p: *Process) void {
+    if (p.state == .running and thread_mod.find(p.thread_id) == null) {
+        p.state = .killed;
+        p.exit_code = -9;
+    }
+}
+
+pub fn refresh() void {
+    for (&table) |*p| {
+        if (p.state == .running) adoptDeath(p);
+    }
+}
+
 pub fn stateOf(pid: u32) State {
-    if (slotForPid(pid)) |p| return p.state;
+    if (slotForPid(pid)) |p| {
+        adoptDeath(p);
+        return p.state;
+    }
     return .free;
+}
+
+/// Ask a process to die. The thread is made ready if it was blocked, so a
+/// service cannot sleep through its own termination.
+pub fn kill(pid: u32) bool {
+    const p = slotForPid(pid) orelse return false;
+    if (p.state != .running) return false;
+    const t = thread_mod.find(p.thread_id) orelse {
+        klog.warn("kill", "pid {d}: no thread {d} in the table", .{ pid, p.thread_id });
+        return false;
+    };
+    klog.debug("kill", "pid {d}: thread {d} state {s}, marking", .{ pid, t.id, t.state.label() });
+    t.kill_requested = true;
+    sched.makeReady(t);
+    kills += 1;
+    return true;
 }
 
 pub fn processOfPid(pid: u32) ?*Process {

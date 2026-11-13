@@ -129,6 +129,7 @@ fn vectorAsm() []const u8 {
             \\mov x1, sp
             \\bl cassa_exception_dispatch
             \\mov sp, x0
+            \\bl cassa_after_switch
             \\
         , .{i});
         text = text ++ restore_asm;

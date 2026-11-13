@@ -34,6 +34,10 @@ pub const Cpu = struct {
     ttbr0: usize = 0,
     /// A thread that died on this core and must be reaped from another stack.
     pending_reap: ?*Thread = null,
+    /// The thread this core has just switched away from. Set by `reschedule` and
+    /// cleared by `cassa_after_switch` once the core is genuinely running on the
+    /// incoming stack, which is the first moment its stack may be reaped.
+    switching_out: ?*Thread = null,
 
     runq_head: ?*Thread = null,
     runq_tail: ?*Thread = null,

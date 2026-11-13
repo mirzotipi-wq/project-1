@@ -344,7 +344,7 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     // A requested kill takes effect here and nowhere else: the thread has a
     // valid frame, is not holding any of its own data mid-update, and will
     // never be resumed.
-    if (prev.kill_requested and prev.state == .running) prev.state = .dead;
+    if (prev.kill_requested and prev.state != .dead and prev.state != .unused) prev.state = .dead;
 
     // Apply any wake that arrived while this thread was still running. From
     // here on it is genuinely off the CPU, so it is safe to queue.
@@ -409,9 +409,15 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
             (elr >= user_space.code_va and elr < user_space.window_end)
     else
         in_kernel_text;
-    if (next.sp < 0x4000_0000 or next.sp >= 0x4100_0000 or !elr_ok) {
-        klog.err("sched", "corrupt frame for thread {d} '{s}' on core {d}: sp=0x{x} elr=0x{x} state={s}", .{
-            next.id, next.nameSlice(), pc.id, next.sp, next_frame.elr, next.state.label(),
+    // A frame whose saved PSTATE is not one of the two states a thread can be in
+    // (EL0t for user code, EL1h for kernel code) is not a frame any more. Without
+    // this check `eret` would restore a nonsense mode and the core would jump
+    // into whatever address the garbage names.
+    const spsr_mode = next_frame.spsr & 0xF;
+    const spsr_ok = spsr_mode == 0 or spsr_mode == 5;
+    if (next.sp < 0x4000_0000 or next.sp >= 0x4100_0000 or !elr_ok or !spsr_ok) {
+        klog.err("sched", "corrupt frame for thread {d} '{s}' on core {d}: sp=0x{x} elr=0x{x} spsr=0x{x} state={s}", .{
+            next.id, next.nameSlice(), pc.id, next.sp, next_frame.elr, next_frame.spsr, next.state.label(),
         });
         klog.err("sched", "previous thread {d} '{s}' elr=0x{x} state={s}", .{
             prev.id, prev.nameSlice(), frame.elr, prev.state.label(),
@@ -423,7 +429,12 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     // `on_cpu` clears another core may reap it, and reaping frees the very
     // tables this core would still be using.
     installAddressSpace(pc, next);
-    prev.on_cpu = false;
+    // `prev` is still the stack this core is executing on: the switch happens in
+    // the trampoline, after this function returns. Clearing `on_cpu` here would
+    // let another core reap the stack while this core is still using it, which
+    // shows up as a thread resuming on a freed, recycled stack. The trampoline
+    // calls `cassa_after_switch` once `mov sp, x0` has happened.
+    pc.switching_out = prev;
 
     next.state = .running;
     next.on_cpu = true;
@@ -438,6 +449,26 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     lock.release(flags);
 
     return @ptrFromInt(next.sp);
+}
+
+/// Called by the exception trampoline right after the stack pointer has been
+/// switched, so the outgoing thread can finally be marked off-CPU.
+export fn cassa_after_switch() callconv(.C) void {
+    const pc = percpu.this();
+    const prev = pc.switching_out orelse return;
+    pc.switching_out = null;
+    const flags = lock.acquire();
+    prev.on_cpu = false;
+    // A wake that arrived during the switch was deferred because the thread was
+    // still on this core. Now that it is off, the wake has to be applied here or
+    // it would be lost: `reschedule` has already run its pending-wake check.
+    if (prev.pending_wake and prev.state != .dead and prev.state != .unused) {
+        prev.pending_wake = false;
+        prev.state = .ready;
+        pushTail(pc, prev);
+        pc.need_resched = true;
+    }
+    lock.release(flags);
 }
 
 /// Point this core's TTBR0 at the address space the next thread needs. A

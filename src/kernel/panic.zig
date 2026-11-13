@@ -23,9 +23,11 @@ fn hexLine(label: []const u8, value: u64) void {
     uart.print("  {s: <12} 0x{x:0>16}\n", .{ label, value });
 }
 
+var log_buf: [4096]u8 = undefined;
+var trace_buf: [8192]u8 = undefined;
+
 fn dumpCapturedLog() void {
-    var buf: [4096]u8 = undefined;
-    const captured = klog.ringDump(&buf);
+    const captured = klog.ringDump(&log_buf);
     if (captured.len == 0) return;
     uart.writeAll("--- captured kernel log ---\n");
     uart.writeAll(captured);
@@ -33,8 +35,7 @@ fn dumpCapturedLog() void {
 }
 
 fn dumpSchedulerTrace() void {
-    var buf: [8192]u8 = undefined;
-    const text = sched.traceDump(&buf);
+    const text = sched.traceDump(&trace_buf);
     if (text.len == 0) return;
     uart.writeAllRaw("--- ");
     uart.writeAllRaw(text);
