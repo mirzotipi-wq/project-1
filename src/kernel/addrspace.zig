@@ -35,7 +35,11 @@ pub const code_va: usize = 0x8000_0000;
 pub const data_va: usize = 0x8100_0000;
 pub const stack_va: usize = 0x8200_0000;
 /// One past the highest address a process may name.
-pub const window_end: usize = 0x8300_0000;
+/// Shared-memory window: four 4 MiB slots per process, above the stack.
+pub const shm_va: usize = 0x8400_0000;
+pub const shm_slot_bytes: usize = 4 * 1024 * 1024;
+pub const shm_slots: usize = 4;
+pub const window_end: usize = shm_va + shm_slots * shm_slot_bytes;
 
 pub const data_pages: usize = 2;
 pub const stack_pages: usize = 4;
@@ -253,6 +257,61 @@ pub fn setEndpointHandle(as: *AddressSpace, handle: u64) void {
     if (as.args_pa == 0) return;
     const words: [*]u64 = @ptrFromInt(as.args_pa);
     words[8] = handle;
+}
+
+/// Base address of shared-memory slot `slot` in every process.
+pub fn shmBase(slot: usize) usize {
+    return shm_va + slot * shm_slot_bytes;
+}
+
+/// Map a shared object's frames into this address space. The frames are owned by
+/// the object, not by the space, so teardown must not free them: only the page
+/// tables that point at them belong here.
+pub fn mapShared(as: *AddressSpace, alloc: *pmm.PageAllocator, va: usize, frames: []const usize, writable: bool) bool {
+    if (frames.len == 0) return false;
+    if (va < shm_va or va + frames.len * page > window_end) return false;
+    if (as.region_count >= uaccess.max_regions) return false;
+    for (frames, 0..) |pa, i| {
+        if (!mapPage(as, alloc, va + i * page, pa, false, writable)) return false;
+    }
+    as.regions[as.region_count] = .{
+        .base = va,
+        .len = frames.len * page,
+        .user_write = writable,
+        .name = "shm",
+    };
+    as.region_count += 1;
+    cpu.tlbiVmalle1();
+    cpu.dsbSy();
+    cpu.isb();
+    return true;
+}
+
+/// Remove a shared mapping. The frames stay alive with their object; only the
+/// translations and the region record go away.
+pub fn unmapShared(as: *AddressSpace, va: usize, len: usize) bool {
+    var found: ?usize = null;
+    var i: usize = 0;
+    while (i < as.region_count) : (i += 1) {
+        if (as.regions[i].base == va and as.regions[i].len == len) found = i;
+    }
+    const slot = found orelse return false;
+    const l2: *[512]u64 = @ptrFromInt(as.l2);
+    var off: usize = 0;
+    while (off < len) : (off += page) {
+        const v = va + off;
+        const entry = &l2[mmu.l2Index(v)];
+        if (entry.* & 0b11 != 0b11) continue;
+        const l3: *[512]u64 = @ptrFromInt(entry.* & mmu.addr_mask);
+        l3[mmu.tableIndex(v)] = 0;
+    }
+    var j = slot;
+    while (j + 1 < as.region_count) : (j += 1) as.regions[j] = as.regions[j + 1];
+    as.region_count -= 1;
+    cpu.tlbiVmalle1();
+    cpu.dsbSy();
+    cpu.isb();
+    return true;
 }
 
 /// Where a mapped capability page appears in the user window. Between the data

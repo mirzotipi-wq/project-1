@@ -39,7 +39,7 @@ pub const Region = struct {
     }
 };
 
-pub const max_regions = 4;
+pub const max_regions = 8;
 
 /// A single copy never spans more than this; the limit exists so that a bogus
 /// length cannot turn a validation into a table walk of the whole space.

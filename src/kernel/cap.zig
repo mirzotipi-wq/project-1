@@ -50,6 +50,8 @@ pub const Kind = enum {
     page,
     /// A rendezvous object two processes meet on (phase 24).
     endpoint,
+    /// A shared-memory object two processes map into their own spaces (phase 25).
+    shm,
 
     pub fn label(self: Kind) []const u8 {
         return switch (self) {
@@ -58,6 +60,7 @@ pub const Kind = enum {
             .supervisor => "supervisor",
             .page => "page",
             .endpoint => "endpoint",
+            .shm => "shm",
         };
     }
 };

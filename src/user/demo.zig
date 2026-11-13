@@ -17,6 +17,9 @@
 //!   5  IPC client: receives an endpoint by handle transfer, calls it, measures
 //!   6  IPC server: creates an endpoint, hands it over, serves requests
 //!   7  IPC outsider: a process that was never granted the endpoint
+//!   8  shared-memory owner: 4 MiB object, handle transfer, futex handoff
+//!   9  shared-memory peer: maps the same frames read-write and read-only
+//!  10  shared-memory outsider: no handle, every path refused by errno
 //!
 //! Nothing here links against std or the kernel; the whole program is this file
 //! plus the syscall instruction.
@@ -777,6 +780,268 @@ fn ipcOutsider() u32 {
     return failures;
 }
 
+
+// -- shared memory (phase 25) ------------------------------------------------
+
+const SYS_SHM_CREATE = 33;
+const SYS_SHM_MAP = 34;
+const SYS_SHM_UNMAP = 35;
+const SYS_SHM_WAIT = 36;
+const SYS_SHM_WAKE = 37;
+
+const TAG_SHM = 60;
+const TAG_SHM_RO = 61;
+
+const shm_bytes: usize = 4 * 1024 * 1024;
+const shm_words: usize = shm_bytes / 8;
+const shm_pages: u64 = shm_bytes / 4096;
+const pattern: u64 = 0xA5A5_0000_0000_0000;
+
+fn shmCreate(pages: u64) u64 {
+    const r = ipcSys(SYS_SHM_CREATE, pages, 0, 0, 0, 0);
+    return if (r.r <= 0) 0 else @intCast(r.r);
+}
+fn shmMap(h: u64) i64 {
+    return ipcSys(SYS_SHM_MAP, h, 0, 0, 0, 0).r;
+}
+fn shmUnmap(h: u64) i64 {
+    return ipcSys(SYS_SHM_UNMAP, h, 0, 0, 0, 0).r;
+}
+fn shmWait(h: u64, off: u64, expect: u64, ms: u64) i64 {
+    return ipcSys(SYS_SHM_WAIT, h, off, expect, ms, 0).r;
+}
+fn shmWake(h: u64, off: u64, n: u64) i64 {
+    return ipcSys(SYS_SHM_WAKE, h, off, n, 0, 0).r;
+}
+
+/// Owner side: create a 4 MiB object, hand it to the peer with a read-only
+/// sibling handle, fill it, then use two futex words to hand control back and
+/// forth. Nothing here ever copies the buffer.
+fn shmOwner() u32 {
+    const h_boot = peek(64);
+    var failures: u32 = 0;
+
+    var hdr: [96]u8 = undefined;
+    var at: usize = 0;
+    appendStr(&hdr, &at, "[user] shm owner: bootstrap handle ");
+    appendNum(&hdr, &at, h_boot);
+    appendStr(&hdr, &at, ", creating 4 MiB\n");
+    _ = writePtr(@intFromPtr(&hdr), at);
+
+    // 41 -- the object itself.
+    const h = shmCreate(shm_pages);
+    const ok41 = h != 0;
+    if (!ok41) failures += 1;
+    report(41, ok41);
+    if (!ok41) return failures;
+
+    // 43 -- map it read-write; the kernel chooses the base.
+    const va = shmMap(h);
+    const ok43 = va == 0x8400_0000;
+    if (!ok43) failures += 1;
+    report(43, ok43);
+    if (!ok43) return failures;
+
+    // 45 -- 4 MiB through the mapping. Words 0..2 are the futex words. The
+    // buffer is filled *before* the handles are sent, so the peer can never
+    // observe a half-written page.
+    const w: [*]u64 = @ptrFromInt(@as(usize, @intCast(va)));
+    var i: usize = 3;
+    while (i < shm_words) : (i += 1) w[i] = pattern | @as(u64, i & 0xFFFF);
+    w[0] = 1;
+    w[1] = 7; // the deadline word: nobody will ever wake it
+    const ok45 = w[1] == 7 and w[shm_words - 1] == (pattern | @as(u64, (shm_words - 1) & 0xFFFF));
+    if (!ok45) failures += 1;
+    report(45, ok45);
+
+    // 42 -- the object travels to the peer as a transferred handle, now that
+    // its contents are ready.
+    var m = zeros();
+    m[0] = TAG_SHM;
+    m[1] = shm_pages;
+    var sent = ipcSys(SYS_IPC_SEND, h_boot, @intFromPtr(&m), 3000, h, 0);
+    const ok42 = sent.r == 0;
+    if (!ok42) failures += 1;
+    report(42, ok42);
+
+    // 44 -- a derived R-only handle travels too, so the peer can map the same
+    // frames read-only. READ plus CONTROL: CONTROL is what lets the handle be
+    // transferred, and the receiver's copy loses exactly that bit.
+    const h_ro = capDerive(h, 9);
+    m[0] = TAG_SHM_RO;
+    sent = ipcSys(SYS_IPC_SEND, h_boot, @intFromPtr(&m), 3000, if (h_ro > 0) @intCast(h_ro) else 0, 0);
+    const ok44 = h_ro > 0 and sent.r == 0;
+    if (!ok44) failures += 1;
+    report(44, ok44);
+
+    // 46 -- park on the futex word until the peer changes it and wakes us.
+    const woken = shmWait(h, 0, 1, 3000);
+    const ok46 = (woken == 0 or woken == E_AGAIN) and w[0] == 2;
+    if (!ok46) failures += 1;
+    report(46, ok46);
+
+    // 47 -- a stale expectation returns EAGAIN instead of sleeping.
+    const again = shmWait(h, 0, 42, 50);
+    const ok47 = again == E_AGAIN;
+    if (!ok47) failures += 1;
+    report(47, ok47);
+
+    // 48 -- nobody wakes the deadline word: ETIMEDOUT.
+    const timed = shmWait(h, 8, 7, 30);
+    const ok48 = timed == E_TIMEOUT;
+    if (!ok48) failures += 1;
+    report(48, ok48);
+
+    // 49 -- rights live on the handle: no `r` cannot map, no `w` cannot wake,
+    // another object kind is EINVAL, a forged number is EBADF.
+    const h_wo = capDerive(h, 2);
+    const no_read = shmMap(if (h_wo > 0) @intCast(h_wo) else 0);
+    const no_write = shmWake(if (h_ro > 0) @intCast(h_ro) else 0, 0, 1);
+    const wrong_kind = shmMap(peek(40));
+    const forged = shmMap(0x0EFF);
+    const ok49 = no_read == E_PERM and no_write == E_PERM and wrong_kind == E_INVAL and forged == E_BADF;
+    if (!ok49) failures += 1;
+    report(49, ok49);
+
+    // 50 -- wait for the peer's acknowledgement, then read back what it wrote:
+    // one buffer, two address spaces, no copy anywhere. Word 5 is the "about to
+    // park" flag, so the peer only wakes a sleeper that is really there.
+    w[5] = 1;
+    const acked = shmWait(h, 16, 0, 3000);
+    const ok50 = acked == 0 and w[2] == 2 and
+        w[shm_words - 1] == 0xBBBB_1234 and w[0] == 2 and w[1] == 7 and
+        w[1000] == (pattern | 1000);
+    if (!ok50) failures += 1;
+    report(50, ok50);
+
+    // 51 -- unmap drops this mapping only: a second unmap is EINVAL, and the
+    // frames are still there when the object is mapped again.
+    const gone = shmUnmap(h);
+    const twice = shmUnmap(h);
+    const back = shmMap(h);
+    const ok51 = gone == 0 and twice == E_INVAL and back == 0x8400_0000;
+    if (!ok51) failures += 1;
+    report(51, ok51);
+
+    return failures;
+}
+
+/// Peer side: receive the object, map it read-write and read-only, verify the
+/// owner's 4 MiB by reading, then wake the owner through the futex word.
+fn shmPeer() u32 {
+    const h_boot = peek(64);
+    var failures: u32 = 0;
+    var m = zeros();
+
+    // 61 -- the object arrives as a transferred handle.
+    var got = ipcSys(SYS_IPC_RECV, h_boot, @intFromPtr(&m), 5000, 0, 0);
+    const h = got.h;
+    const ok61 = got.r == 64 and h != 0 and m[0] == TAG_SHM and m[1] == shm_pages;
+    if (!ok61) failures += 1;
+    report(61, ok61);
+    if (!ok61) return failures;
+
+    // 62 -- plus a read-only handle to the same object.
+    got = ipcSys(SYS_IPC_RECV, h_boot, @intFromPtr(&m), 5000, 0, 0);
+    const h_ro = got.h;
+    const ok62 = got.r == 64 and h_ro != 0 and m[0] == TAG_SHM_RO;
+    if (!ok62) failures += 1;
+    report(62, ok62);
+    if (!ok62) return failures;
+
+    // 63 -- read-write mapping.
+    const va = shmMap(h);
+    const ok63 = va == 0x8400_0000;
+    if (!ok63) failures += 1;
+    report(63, ok63);
+
+    // 64 -- the R-only handle maps the same frames read-only at the next slot.
+    const va_ro = shmMap(h_ro);
+    const ok64 = va_ro == 0x8440_0000;
+    if (!ok64) failures += 1;
+    report(64, ok64);
+    if (!ok63 or !ok64) return failures;
+
+    // 65 -- read all 4 MiB through the read-only mapping: it is the owner's
+    // data, not a copy of it.
+    const ro: [*]const u64 = @ptrFromInt(@as(usize, @intCast(va_ro)));
+    var bad: u64 = 0;
+    var i: usize = 3;
+    while (i < shm_words) : (i += 1) {
+        if (ro[i] != (pattern | @as(u64, i & 0xFFFF))) bad += 1;
+    }
+    const ok65 = bad == 0;
+    if (!ok65) failures += 1;
+    report(65, ok65);
+
+    // 66 -- wait for the owner to publish the futex word, then give it time to
+    // park inside its wait.
+    var waited: u64 = 0;
+    while (ro[0] != 1 and waited < 3000) : (waited += 2) sleepMs(2);
+    sleepMs(40);
+    const ok66 = ro[0] == 1;
+    if (!ok66) failures += 1;
+    report(66, ok66);
+
+    // 67 -- change the word and wake exactly one sleeper; the count comes back
+    // from the kernel, so a wake that hit nobody would show up here.
+    const rw: [*]u64 = @ptrFromInt(@as(usize, @intCast(va)));
+    rw[0] = 2;
+    const woken = shmWake(h, 0, 1);
+    const ok67 = woken == 1;
+    if (!ok67) failures += 1;
+    report(67, ok67);
+
+    // 68 -- write the last word through the read-write mapping and read it back
+    // through both mappings.
+    rw[shm_words - 1] = 0xBBBB_1234;
+    const ok68 = rw[shm_words - 1] == 0xBBBB_1234 and ro[shm_words - 1] == 0xBBBB_1234;
+    if (!ok68) failures += 1;
+    report(68, ok68);
+
+    // 69 -- the owner's own writes are visible here unchanged.
+    const ok69 = ro[1] == 7 and ro[2] == 0;
+    if (!ok69) failures += 1;
+    report(69, ok69);
+
+    // 70 -- acknowledge on the second futex word, once the owner has parked on
+    // it. Word 5 is its "about to sleep" flag; the sleep below turns the flag
+    // into an actual parked thread before the wake is sent.
+    var flag: u64 = 0;
+    while (ro[5] != 1 and flag < 3000) : (flag += 2) sleepMs(2);
+    sleepMs(30);
+    rw[2] = 2;
+    const ack = shmWake(h, 16, 1);
+    const ok70 = ro[5] == 1 and ack == 1;
+    if (!ok70) failures += 1;
+    report(70, ok70);
+
+    return failures;
+}
+
+/// A process that was never granted the object: every handle path is refused
+/// with a specific errno and nothing faults.
+fn shmOutsider() u32 {
+    const h_ledger = peek(40);
+    const h_page = peek(56);
+    var failures: u32 = 0;
+
+    const never = ipcSys(SYS_SHM_MAP, 0x0EFF, 0, 0, 0, 0);
+    const wrong_kind = ipcSys(SYS_SHM_MAP, h_ledger, 0, 0, 0, 0);
+    const wrong_kind2 = ipcSys(SYS_SHM_WAIT, h_page, 0, 0, 10, 0);
+    const ok71 = never.r == E_BADF and wrong_kind.r == E_INVAL and wrong_kind2.r == E_INVAL;
+    if (!ok71) failures += 1;
+    report(71, ok71);
+
+    // 72 -- it has nothing mapped and no handle, so unmapping is EBADF too.
+    const unmap = ipcSys(SYS_SHM_UNMAP, 0x0EFF, 0, 0, 0, 0);
+    const ok72 = unmap.r == E_BADF;
+    if (!ok72) failures += 1;
+    report(72, ok72);
+
+    return failures;
+}
+
 export fn _start() callconv(.C) noreturn {
     const mode = peek(0);
     const secret = peek(8);
@@ -798,6 +1063,18 @@ export fn _start() callconv(.C) noreturn {
         },
         7 => {
             const failures = ipcOutsider();
+            if (failures != 0) exit(9);
+        },
+        8 => {
+            const failures = shmOwner();
+            if (failures != 0) exit(9);
+        },
+        9 => {
+            const failures = shmPeer();
+            if (failures != 0) exit(9);
+        },
+        10 => {
+            const failures = shmOutsider();
             if (failures != 0) exit(9);
         },
         else => normal(),

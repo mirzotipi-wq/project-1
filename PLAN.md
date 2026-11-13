@@ -510,11 +510,123 @@ the prime suspect and stays open.
 Phase 23 gaps still open: the page object as shared memory (phase 25 owns it), a variable
 handle-table size, an accounting charge for table memory, and no unmap syscall.
 
-### Phase 25 — Shared memory and notifications `[ ]`
+### Phase 25 — Shared memory and notifications `[x]`
 **Goal:** Bulk data without copying.
 **Build:** Shared memory objects, mapping into multiple address spaces, futex-style wait and
 wake, event counters.
 **Done when:** Two processes exchange a 4 MiB buffer with zero copies and correct wakeups.
+**Acceptance (concrete):**
+1. A shared-memory object is a capability object of kind `shm` holding up to 1024 kernel
+   frames (4 MiB). `shm_create` returns a handle carrying `rwc`; the frames are zeroed when
+   the object is created, so a peer can never read another object's old data.
+2. `shm_map` maps the object into the caller's address space at a kernel-chosen base inside
+   the user window and returns that base. Mapping needs `r`; the mapping is writable only if
+   the handle also carries `w`, so one object can be read-write in one process and read-only
+   in another.
+3. Two processes map the same object: a word written by one is read by the other at the same
+   offset with no copy in between (the kernel only installs page tables), and the 4 MiB buffer
+   survives a full pattern pass in both directions.
+4. `shm_unmap` removes this process's mapping, clears the page-table entries, drops the region
+   and flushes the TLB; a second unmap of the same object is refused with EINVAL, and a later
+   `shm_map` succeeds again at a free base.
+5. Futex-style notification: `shm_wait(handle, offset, expected, timeout)` sleeps only if the
+   32-bit word at `offset` still equals `expected` (EAGAIN -11 if it changed), returns 0 when
+   woken, and ETIMEDOUT (-110) when the deadline passes. `shm_wake(handle, offset, count)`
+   wakes up to `count` waiters and returns how many it woke; each wake bumps the object's
+   event counter, which the shell prints.
+6. Rights are enforced on the handle, never on a user pointer: a handle without `r` cannot
+   map or wait (EPERM -1), a handle without `w` cannot wake (EPERM), a non-shm handle is
+   EINVAL, and a forged or out-of-range handle is EBADF (-9) with no fault.
+7. A process that was never granted the object cannot reach it: it has no handle (EBADF) and
+   no mapping in its address space, and it survives every refusal and exits 0.
+8. No regressions: phases 1-24 keep passing, host tests stay green, and the probe passes on
+   `-smp 1` and `-smp 4`.
+
+**Verified:** a shared-memory object is a capability of kind `shm` holding up to 1024 zeroed
+kernel frames (4 MiB) from one 2048-page pool, created by `shm_create` (33) which returns a
+handle carrying `rwc`. `shm_map` (34) installs those frames in the caller's page tables and
+returns the base: the mapping is writable only when the handle carries `w`, so one object can
+be read-write in one process and read-only in another without a flag from the user. Nothing
+is copied — the kernel only writes page-table entries, so a word stored by one process is the
+word the other reads. `shm_unmap` (35) clears the translations, drops the region and flushes
+the TLB; a second unmap is EINVAL and a later map succeeds again at the same slot.
+
+`shm_wait` (36) is futex-shaped: it sleeps only if the 32-bit word at `offset` still equals
+the expected value, returns EAGAIN (-11) if it already changed, 0 when woken, ETIMEDOUT
+(-110) on its deadline; `shm_wake` (37) releases up to `count` sleepers, returns how many it
+released and bumps the object's event counter. Everything is decided under the object lock,
+so a wake that lands between the value check and the park cannot be lost.
+
+The probe (`uprobe` step 11) passes on `-smp 4` and `-smp 1`. The owner creates the object,
+maps it, fills all 4 MiB, and only then sends the handle plus a derived READ|CONTROL handle
+over the IPC channel from phase 24, so the peer can never observe a half-written buffer. The
+peer maps the object read-write at 0x8400_0000 and read-only at 0x8440_0000 (the receiver's
+copy of the derived handle lost CONTROL, so it can map and read but not wake), verifies all
+1,048,576 words through the read-only view, then changes the futex word and wakes the owner;
+the owner reads back the peer's marker through its own mapping. Owner cases 41-51, peer cases
+61-70, outsider cases 71-72, all OK, all three exit 0.
+
+```
+  [11] shared memory: 4 MiB mapped in two spaces, futex wakeups
+[user] shm owner: bootstrap handle 5, creating 4 MiB
+[user] case 41: OK          <- 4 MiB object created (handle with rwc)
+[user] case 43: OK          <- mapped read-write at 0x84000000
+[user] case 45: OK          <- 4 MiB filled through the mapping
+[user] case 42: OK          <- object transferred to the peer as a handle
+[user] case 44: OK          <- derived READ|CONTROL handle transferred too
+[user] case 46: OK          <- parked on the futex word, woken by the peer
+[user] case 47: OK          <- stale expectation -> EAGAIN (-11)
+[user] case 48: OK          <- nobody wakes it -> ETIMEDOUT (-110)
+[user] case 49: OK          <- no read -> EPERM, no write -> EPERM, ledger -> EINVAL, forged -> EBADF
+[user] case 50: OK          <- peer's marker visible through the owner's mapping
+[user] case 51: OK          <- unmap, second unmap -> EINVAL, remap succeeds
+[user] case 61: OK          <- peer received the object by handle transfer
+[user] case 62: OK          <- peer received the read-only handle
+[user] case 63: OK          <- peer mapped read-write at 0x84000000
+[user] case 64: OK          <- peer mapped read-only at 0x84400000
+[user] case 65: OK          <- all 1M words verified through the read-only view
+[user] case 66: OK          <- owner published the futex word
+[user] case 67: OK          <- one wake released exactly one sleeper
+[user] case 68: OK          <- marker written rw, read back through both views
+[user] case 69: OK          <- owner's writes visible unchanged
+[user] case 70: OK          <- acknowledgement wake released the owner
+[user] case 71: OK          <- outsider: EBADF / EINVAL / EINVAL, no fault
+[user] case 72: OK          <- outsider: unmapping what it never had -> EBADF
+      pids 100 owner / 101 peer / 102 outsider: exited/exited/exited, codes 0/0/0  OK
+      object 6: 1024 pages (4096 KiB), 3 mappings, 2 events
+        pid 100 at 0x84000000 read-write, 4096 KiB
+        pid 101 at 0x84000000 read-write, 4096 KiB
+        pid 101 at 0x84400000 read-only, 4096 KiB
+      shm: 1 creates, 4 maps, 1 unmaps, 4 waits, 2 wakes, 2 threads woken
+      shm: 1 timeouts, 1 eagain, 8 refusals, 4096 KiB in the pool of 2048 pages
+  RESULT: PASS
+```
+
+**Closed the phase-24 reliability item.** The intermittent four-core fault was not flaky
+noise: `makeReadyLocked` queued a thread whenever it was not on a CPU, without checking that
+it was still asleep. A futex wake and the 1 kHz deadline scan could therefore both push the
+same thread onto run queues, and two cores would run one kernel stack — the scheduler trace
+in the panic showed exactly that, one thread resumed on cpu0 and cpu2. Fixed by making the
+blocked-to-ready transition one-shot (`if (t.state != .blocked) return;`), claiming the boot
+context with `on_cpu` from its first instruction, and adding a hard guard in `reschedule` that
+refuses to switch to a thread already marked on-CPU and counts the event instead. Seventeen
+four-core probe boots were recorded after the first two fixes and eight more after the guard,
+all clean: no faults, no panic, every probe PASS in the eight that ran to completion. Before
+the fix the same boot faulted roughly once in a dozen runs.
+
+Regression sweep on the same clean build: 42/42 host tests; `stress 4 20000` -> 80000 exact,
+0 lost; `preempt 1000` -> 17..18 slices per thread; `reap 8` -> 0 pages leaked; `logstorm 4`
+-> 96/96 intact lines; `cores` -> 4/4 online; `irq` -> 0 spurious, 0 unhandled; `-m 1024M` ->
+1024 MiB, 259520 pages free; `textwrite` -> permission fault at 0x40080000; phase 24 step [10]
+still passes with all cases OK and the probe at 4069-6655 msg/s.
+
+**Gap (open):** shared-memory objects live until reboot, like endpoints: closing every handle
+does not yet return the frames, and there is no `shm_destroy`. Unmapping clears the
+translations but keeps the level-3 table frames with the process, so a repeated map/unmap
+cycle does not return table memory either. Object lifetime and a table-memory accounting
+charge stay open with the phase-23 items (variable handle-table size, no general unmap for
+other object kinds). The IPC throughput target above 100,000 msg/s remains unmet for the
+reason recorded in phase 24.
 
 ### Phase 26 — Processes and ELF loading `[ ]`
 **Goal:** Run separately built programs.

@@ -20,6 +20,7 @@ const uaccess = @import("uaccess.zig");
 const user_space = @import("addrspace.zig");
 const cap = @import("cap.zig");
 const ipc = @import("ipc.zig");
+const shm = @import("shm.zig");
 
 /// System calls a process may make from EL0. Deliberately small: each one is a
 /// place where the kernel acts with its own authority, so the surface is the
@@ -50,6 +51,11 @@ pub const UserNr = enum(u64) {
     ipc_call = 30,
     ipc_recv = 31,
     ipc_reply = 32,
+    shm_create = 33,
+    shm_map = 34,
+    shm_unmap = 35,
+    shm_wait = 36,
+    shm_wake = 37,
 };
 
 /// Rejected user pointers, counted so the probe can prove the kernel refused to
@@ -58,6 +64,7 @@ pub var rejected_ptr: u64 = 0;
 pub var user_calls: u64 = 0;
 pub var cap_calls: u64 = 0;
 pub var ipc_calls: u64 = 0;
+pub var shm_calls: u64 = 0;
 
 pub const Nr = enum(u64) {
     debug_write = 1,
@@ -83,6 +90,19 @@ pub const Errno = enum(i64) {
     mfile = -24,
     nosys = -38,
 };
+
+fn errnoShm(e: shm.Error) u64 {
+    return switch (e) {
+        error.BadHandle => errno(.badf),
+        error.Permission => errno(.perm),
+        error.Invalid => errno(.invalid),
+        error.Fault => errno(.fault),
+        error.Timeout => errno(.timeout),
+        error.Again => errno(.again),
+        error.NoMemory => errno(.nomem),
+        error.TableFull => errno(.mfile),
+    };
+}
 
 fn errnoIpc(e: ipc.Error) u64 {
     return switch (e) {
@@ -378,6 +398,50 @@ pub fn handleUser(number: u64, frame: *trap.Frame) Action {
                 frame.x[0],
                 frame.x[1],
             ), frame);
+        },
+        @intFromEnum(UserNr.shm_create) => {
+            shm_calls += 1;
+            const alloc = process.pageAllocator() orelse {
+                frame.x[0] = errno(.nomem);
+                return .keep;
+            };
+            frame.x[0] = shm.create(process.currentPid(), frame.x[0], alloc) catch |e| errnoShm(e);
+            return .keep;
+        },
+        @intFromEnum(UserNr.shm_map) => {
+            shm_calls += 1;
+            const alloc = process.pageAllocator() orelse {
+                frame.x[0] = errno(.nomem);
+                return .keep;
+            };
+            frame.x[0] = shm.map(process.currentPid(), as, frame.x[0], alloc) catch |e| errnoShm(e);
+            return .keep;
+        },
+        @intFromEnum(UserNr.shm_unmap) => {
+            shm_calls += 1;
+            frame.x[0] = shm.unmap(process.currentPid(), as, frame.x[0]) catch |e| errnoShm(e);
+            return .keep;
+        },
+        @intFromEnum(UserNr.shm_wait) => {
+            shm_calls += 1;
+            frame.x[0] = shm.wait(
+                process.currentPid(),
+                frame.x[0],
+                frame.x[1],
+                frame.x[2],
+                frame.x[3],
+            ) catch |e| errnoShm(e);
+            return .keep;
+        },
+        @intFromEnum(UserNr.shm_wake) => {
+            shm_calls += 1;
+            frame.x[0] = shm.wake(
+                process.currentPid(),
+                frame.x[0],
+                frame.x[1],
+                frame.x[2],
+            ) catch |e| errnoShm(e);
+            return .keep;
         },
         else => {
             klog.warn("syscall", "pid {d}: unknown syscall {d} from pc=0x{x}", .{ process.currentPid(), number, frame.elr });

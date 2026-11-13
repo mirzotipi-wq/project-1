@@ -125,6 +125,11 @@ pub fn init(p: *pmm.PageAllocator) void {
     const boot = thread_mod.allocateBare("boot") orelse @panic("sched: no thread slot for the boot thread");
     boot.cpu = 0;
     boot.runs = 1;
+    // The boot context runs on this core from the first instruction, so it is
+    // on a CPU before any scheduler transition says so. Without this a wakeup
+    // from another core would queue it while it is still running here.
+    boot.on_cpu = true;
+    boot.state = .running;
     percpu.cpus[0].current = boot;
 
     createIdle(0);
@@ -231,6 +236,11 @@ fn makeReadyLocked(pc: *percpu.Cpu, t: *Thread) void {
         pc.need_resched = true;
         return;
     }
+    // A thread that is already runnable is already on some core's run queue.
+    // Queueing it a second time (two cores waking the same sleeper, or a wake
+    // and the deadline scan racing) would let two cores run one kernel stack,
+    // which is exactly how a thread ends up jumping into its own stack.
+    if (t.state != .blocked) return;
     t.state = .ready;
     t.pending_wake = false;
     if (!t.pinned or t.cpu >= percpu.cpu_count) {
@@ -353,7 +363,16 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
         pc.pending_reap = prev;
     }
 
-    const next: *Thread = popHead(pc) orelse stealLocked(pc) orelse pc.idle.?;
+    var next: *Thread = popHead(pc) orelse stealLocked(pc) orelse pc.idle.?;
+    // A thread that is already marked on-CPU is running somewhere else. Two
+    // cores must never share one kernel stack, so a queue entry that names such
+    // a thread is dropped here (and counted) instead of being resumed: that is
+    // a split brain, and running it would corrupt the stack of whichever core
+    // is currently executing it.
+    if (next.on_cpu) {
+        double_run_events += 1;
+        next = pc.idle.?;
+    }
     if (next.state == .dead or next.state == .unused) {
         klog.err("sched", "core {d} selected thread {d} in state {s} (sp=0x{x})", .{ pc.id, next.id, next.state.label(), next.sp });
         @panic("scheduler: selected a non-runnable thread");
@@ -488,6 +507,11 @@ pub fn admit(t: *Thread) void {
     pc.spawned += 1;
     lock.release(flags);
 }
+
+/// How many times a run-queue entry named a thread that was already on a CPU.
+/// Always zero in a healthy system; the shell prints it so a regression in the
+/// wake path shows up as a number instead of a mystery fault.
+pub var double_run_events: u64 = 0;
 
 /// Give up the CPU for the rest of this thread's slice (syscall 64). Returns
 /// only once the thread is scheduled again.

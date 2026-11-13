@@ -25,6 +25,7 @@ const process = @import("process.zig");
 const thread_mod = @import("thread.zig");
 const cap = @import("cap.zig");
 const ipc = @import("ipc.zig");
+const shm = @import("shm.zig");
 const syscall = @import("syscall.zig");
 
 pub const Context = struct {
@@ -79,6 +80,7 @@ fn printHelp() void {
         \\  uprobe               full EL0 + address-space probe (run this)
         \\  caps                 capability objects and their reference counts
         \\  ipc                  IPC endpoint counters
+        \\  shm                  shared-memory objects and event counters
         \\
     , .{});
 }
@@ -517,6 +519,25 @@ fn cmdIpc(_: Context) void {
     });
 }
 
+fn cmdShm(_: Context) void {
+    out("  objects {d} of {d}, pool {d} of {d} pages ({d} KiB)\n", .{
+        shm.objectCount(), shm.max_objects, shm.poolUsed(), shm.pool_pages, shm.poolUsed() * 4,
+    });
+    out("  creates {d}, maps {d}, unmaps {d}, waits {d}, wakes {d} ({d} threads woken)\n", .{
+        shm.creates, shm.maps, shm.unmaps, shm.waits, shm.wake_calls, shm.woken_threads,
+    });
+    out("  timeouts {d}, eagain {d}, refusals {d}\n", .{
+        shm.timeouts, shm.agains, shm.refusals,
+    });
+    var i: usize = 0;
+    while (i < shm.max_objects) : (i += 1) {
+        const info = shm.infoAt(i) orelse continue;
+        out("  object {d}: {d} pages, {d} mappings, {d} events\n", .{
+            info.id, info.pages, info.mappings, info.events,
+        });
+    }
+}
+
 fn status(ok: bool) []const u8 {
     return if (ok) "OK" else "FAIL";
 }
@@ -553,6 +574,83 @@ fn cmdUser(ctx: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
 fn cmdUprobe(ctx: Context) void {
     var pass = true;
     out("\n  EL0 / address-space probe\n", .{});
+    out("  [11] shared memory: 4 MiB mapped in two spaces, futex wakeups\n", .{});
+    const own = process.spawnIpc(8, 0, "shm-a") orelse {
+        out("      FAIL: cannot spawn the shared-memory owner\n", .{});
+        return;
+    };
+    const peer = process.spawnIpc(9, 0, "shm-b") orelse {
+        out("      FAIL: cannot spawn the shared-memory peer\n", .{});
+        return;
+    };
+    const stranger = process.spawn(10, 0, "shm-out") orelse {
+        out("      FAIL: cannot spawn the shared-memory outsider\n", .{});
+        return;
+    };
+    const own_pid = own.pid;
+    const peer_pid = peer.pid;
+    const str_pid = stranger.pid;
+    const s_own = process.wait(own_pid, 20000);
+    const c_own = own.exit_code;
+    _ = process.waitReaped(own_pid, 1000);
+    const s_peer = process.wait(peer_pid, 20000);
+    const c_peer = peer.exit_code;
+    _ = process.waitReaped(peer_pid, 1000);
+    const s_str = process.wait(str_pid, 8000);
+    const c_str = stranger.exit_code;
+    _ = process.waitReaped(str_pid, 1000);
+    const procs_ok = s_own == .exited and s_peer == .exited and s_str == .exited and
+        c_own == 0 and c_peer == 0 and c_str == 0;
+    out("      pids {d} owner / {d} peer / {d} outsider: {s}/{s}/{s}, codes {d}/{d}/{d}  {s}\n", .{
+        own_pid, peer_pid, str_pid,
+        @tagName(s_own), @tagName(s_peer), @tagName(s_str),
+        c_own, c_peer, c_str, status(procs_ok),
+    });
+
+    var objects: u32 = 0;
+    var mappings: u32 = 0;
+    var si: usize = 0;
+    while (si < shm.max_objects) : (si += 1) {
+        const info = shm.infoAt(si) orelse continue;
+        objects += 1;
+        mappings += info.mappings;
+        out("      object {d}: {d} pages ({d} KiB), {d} mappings, {d} events\n", .{
+            info.id, info.pages, info.pages * 4, info.mappings, info.events,
+        });
+        var mi: usize = 0;
+        while (mi < info.mappings) : (mi += 1) {
+            const m = shm.mappingAt(si, mi) orelse continue;
+            out("        pid {d} at 0x{x} {s}, {d} KiB\n", .{
+                m.pid, m.va, if (m.writable) "read-write" else "read-only", m.len / 1024,
+            });
+        }
+    }
+    // Three live mappings over one set of frames: the owner's read-write view,
+    // the peer's read-write view at the same address in its own space, and the
+    // peer's read-only view through the derived handle at the next slot.
+    var shared_ok = false;
+    var owner_rw = false;
+    var peer_rw = false;
+    var peer_ro = false;
+    var mi: usize = 0;
+    while (mi < mappings) : (mi += 1) {
+        const m = shm.mappingAt(0, mi) orelse break;
+        if (m.len != 4 * 1024 * 1024) continue;
+        if (m.pid == own_pid and m.writable and m.va == 0x8400_0000) owner_rw = true;
+        if (m.pid == peer_pid and m.writable and m.va == 0x8400_0000) peer_rw = true;
+        if (m.pid == peer_pid and !m.writable and m.va == 0x8440_0000) peer_ro = true;
+    }
+    shared_ok = mappings == 3 and owner_rw and peer_rw and peer_ro;
+    out("      shm: {d} creates, {d} maps, {d} unmaps, {d} waits, {d} wakes, {d} threads woken\n", .{
+        shm.creates, shm.maps, shm.unmaps, shm.waits, shm.wake_calls, shm.woken_threads,
+    });
+    out("      shm: {d} timeouts, {d} eagain, {d} refusals, {d} KiB in the pool of {d} pages\n", .{
+        shm.timeouts, shm.agains, shm.refusals, shm.poolUsed() * 4, shm.pool_pages,
+    });
+    const shm_ok = procs_ok and shared_ok and objects == 1 and mappings == 3 and
+        shm.creates >= 1 and shm.woken_threads >= 2 and shm.timeouts >= 1 and shm.unmaps >= 1;
+    pass = pass and shm_ok;
+
     out("  ------------------------------------------------------------------\n", .{});
 
     const base_pages = ctx.pmm.stats().free_pages;
@@ -823,6 +921,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdCaps(ctx);
     } else if (std.mem.eql(u8, command, "ipc")) {
         cmdIpc(ctx);
+    } else if (std.mem.eql(u8, command, "shm")) {
+        cmdShm(ctx);
     } else if (std.mem.eql(u8, command, "logstorm")) {
         cmdLogStorm(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "sleep")) {
