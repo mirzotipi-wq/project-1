@@ -609,10 +609,12 @@ same thread onto run queues, and two cores would run one kernel stack — the sc
 in the panic showed exactly that, one thread resumed on cpu0 and cpu2. Fixed by making the
 blocked-to-ready transition one-shot (`if (t.state != .blocked) return;`), claiming the boot
 context with `on_cpu` from its first instruction, and adding a hard guard in `reschedule` that
-refuses to switch to a thread already marked on-CPU and counts the event instead. Seventeen
-four-core probe boots were recorded after the first two fixes and eight more after the guard,
-all clean: no faults, no panic, every probe PASS in the eight that ran to completion. Before
-the fix the same boot faulted roughly once in a dozen runs.
+refuses to switch to a thread already marked on-CPU and counts the event instead. After the
+first two fixes, nine four-core probe boots were recorded and one of them still faulted, which
+is what pointed at a stray queue entry rather than a lost wake; after the guard, eight more
+four-core boots ran with no fault at all, seven of them a full `RESULT: PASS` and one cut short
+by the harness rather than by the kernel. Before any of this the same boot faulted roughly
+once in a dozen runs.
 
 Regression sweep on the same clean build: 42/42 host tests; `stress 4 20000` -> 80000 exact,
 0 lost; `preempt 1000` -> 17..18 slices per thread; `reap 8` -> 0 pages leaked; `logstorm 4`
