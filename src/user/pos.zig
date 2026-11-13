@@ -23,6 +23,9 @@ const SYS_GETPID = 3;
 const SYS_UPTIME_MS = 6;
 const SYS_SLEEP_MS = 5;
 const SYS_RESOLVE = 38;
+const SYS_CAP_QUERY = 20;
+const SYS_CAP_DERIVE = 21;
+const SYS_ACCOUNT = 39;
 
 fn syscall3(n: u64, a: u64, b: u64, c: u64) u64 {
     @setRuntimeSafety(false);
@@ -177,6 +180,68 @@ export fn _start(argc: usize, argv: [*][*:0]u8, envp: [*][*:0]u8) callconv(.C) n
     if (equal(mode, "serve")) {
         write("[user] pos: serve ok\n");
         exit(0);
+    }
+    if (equal(mode, "leak")) {
+        // A service that leaks on purpose. The four bootstrap handles are granted
+        // in a fixed order (console, ledger, supervisor, page), so the ledger —
+        // the one carrying CONTROL — is handle 2 in a fresh table. Deriving from
+        // it until the kernel refuses is a capability leak the quota must stop,
+        // and it needs no shared-memory pool to be available.
+        write("[user] pos: leak mode\n");
+        // Find the handle that carries CONTROL by asking the kernel, instead of
+        // assuming a slot order: the answer is this process's own table, and a
+        // program that does not know its numbers cannot leak what it cannot name.
+        var control: u64 = 0;
+        var held: u64 = 0;
+        var scan: u64 = 1;
+        while (scan <= 16) : (scan += 1) {
+            const rights = syscall3(SYS_CAP_QUERY, scan, 0, 0);
+            if (rights < 0x8000_0000_0000_0000) {
+                held += 1;
+                if (rights & 0x8 != 0 and control == 0) control = scan;
+            }
+        }
+        var derived: u64 = 0;
+        var last_error: u64 = 0;
+        while (control != 0 and derived < 64) {
+            // The ledger carries r, w and c — not x — so narrowing to rw is the
+            // subset a derivation may ask for.
+            const h = syscall3(SYS_CAP_DERIVE, control, 0x3, 0);
+            if (h >= 0x8000_0000_0000_0000) {
+                last_error = h;
+                break;
+            }
+            derived += 1;
+        }
+        var acct: [6]u64 = [_]u64{0} ** 6;
+        _ = syscall3(SYS_ACCOUNT, @intFromPtr(&acct), 48, 0);
+        write("[user] pos: leak: ");
+        printNum(held);
+        write(" bootstrap handle(s), derived ");
+        printNum(derived);
+        write(", refusal ");
+        printNum(last_error & 0xFF);
+        write("\n");
+        write("[user] pos: account: pages ");
+        printNum(acct[0]);
+        write(", handles ");
+        printNum(acct[1]);
+        write(", cpu ");
+        printNum(acct[2]);
+        write(" ms, level ");
+        printNum(acct[3]);
+        write(", score ");
+        printNum(acct[4]);
+        write(", flags ");
+        printNum(acct[5]);
+        write("\n");
+        // Burn CPU so the watchdog's escalation ladder has something to slow: an
+        // EL0 loop is preempted like any other thread, so this cannot wedge the
+        // machine, and the quota is what stops it.
+        while (true) {
+            var spin: u64 = 0;
+            while (spin < 2_000_000) : (spin += 1) {}
+        }
     }
     if (equal(mode, "loop")) {
         write("[user] pos: looping until killed\n");

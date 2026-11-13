@@ -439,6 +439,15 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     };
     prev.sp = @intFromPtr(frame);
 
+    // CPU accounting (phase 29): charge the slice the outgoing thread just used.
+    // Two stores on a real switch, nothing on a path that keeps running; the
+    // watchdog reads the total and derives a per-window share from it.
+    const switch_now = timer.uptimeMs();
+    if (prev.switch_in_ms != 0 and switch_now > prev.switch_in_ms) {
+        prev.cpu_ms += switch_now - prev.switch_in_ms;
+    }
+    prev.switch_in_ms = 0;
+
     // A requested kill takes effect here and nowhere else: the thread has a
     // valid frame, is not holding any of its own data mid-update, and will
     // never be resumed.
@@ -466,17 +475,34 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
 
     var next: *Thread = undefined;
     var from_queue = false;
-    if (popHead(pc)) |t| {
-        next = t;
-        from_queue = true;
-    } else if (stealLocked(pc)) |t| {
-        next = t;
-        from_queue = true;
-    } else {
+    var scanned: u32 = 0;
+    while (true) {
+        if (popHead(pc)) |t| {
+            next = t;
+            from_queue = true;
+        } else if (stealLocked(pc)) |t| {
+            next = t;
+            from_queue = true;
+        } else {
         // This core's own idle thread: it is not in any queue and it is
         // legitimately `on_cpu` while it runs, so it must not be judged by the
         // queue-entry rules below.
         next = pc.idle.?;
+            break;
+        }
+        // A throttled thread keeps its readiness and its single queue entry; it
+        // is moved to the tail and not picked until its window reopens. Running
+        // it here would let a process that already burned its whole CPU share
+        // run again, which is exactly what the quota exists to prevent.
+        if (next.throttled_until_ms != 0) {
+            if (switch_now < next.throttled_until_ms and scanned < thread_mod.max_threads) {
+                scanned += 1;
+                pushTail(pc, next, "throttle");
+                continue;
+            }
+            next.throttled_until_ms = 0;
+        }
+        break;
     }
     // A thread that is already marked on-CPU is running somewhere else. Two
     // cores must never share one kernel stack, so a queue entry that names such
@@ -500,6 +526,7 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
         // Nothing else to run: keep going, do not queue ourselves.
         prev.state = .running;
         prev.on_cpu = true;
+        prev.switch_in_ms = switch_now;
         pc.slice_left = slice_ticks;
         pc.need_resched = false;
         lock.release(flags);
@@ -555,6 +582,7 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     next.state = .running;
     next.on_cpu = true;
     next.pending_wake = false;
+    next.switch_in_ms = switch_now;
     next.runs += 1;
     pc.current = next;
     pc.switches += 1;

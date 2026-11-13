@@ -18,6 +18,7 @@ const ipc = @import("ipc.zig");
 const store = @import("image.zig");
 const elf = @import("elf.zig");
 const dump = @import("dump.zig");
+const account = @import("account.zig");
 
 pub const State = enum { free, running, exited, killed };
 
@@ -56,8 +57,9 @@ fn freeSlot() ?*Process {
         // have been reaped. The exit record survives as long as anyone can
         // still ask about it, which is what the probes rely on.
         if (p.state != .running and thread_mod.find(p.thread_id) == null) {
-            // A dead process leaves no authority behind.
+            // A dead process leaves no authority and no accounting behind.
             cap.releaseProcess(p.pid);
+            account.detach(p.pid);
             p.* = .{};
             return p;
         }
@@ -81,6 +83,19 @@ fn slotForPid(pid: u32) ?*Process {
 
 /// Which authority a new process is born with. The read-only profile exists so
 /// the probe can show two holders of one object each bounded by their own mask.
+/// The probe harness drives every capability and endpoint path on purpose, so it
+/// is accounted for but not constrained: phase 29's limits are for services.
+pub const harness_quota = account.Quota{
+    // Above the whole shared-memory pool: the harness maps a 4 MiB object on
+    // purpose, and a permissive ledger must not turn that into a refusal.
+    .pages = 4096,
+    .handles = cap.max_handles,
+    // The throughput and preemption probes deliberately saturate a core for
+    // seconds, so the harness is not CPU-capped at all.
+    .cpu_ms = 100_000,
+    .window_ms = 1000,
+};
+
 pub const Profile = enum { full, read_only };
 
 /// Launch the demo image at EL0 in a brand new address space.
@@ -111,6 +126,11 @@ fn spawnWith(mode: u64, secret: u64, name: []const u8, profile: Profile, endpoin
     slot.* = .{ .pid = next_pid, .thread_id = t.id, .state = .running };
     next_pid += 1;
     spawns += 1;
+    // Every EL0 process has a ledger and a page budget before it is runnable.
+    // The demo image is the probe harness: it deliberately exercises the whole
+    // capability table, so its ledger is permissive (the table's own 16 slots are
+    // its limit) rather than the service default that phase 29 introduced.
+    _ = account.attach(slot.pid, harness_quota);
 
     // Authority is granted here and nowhere else: a process is born with
     // exactly these handles and can only ever narrow them.
@@ -201,6 +221,17 @@ pub fn spawnElf(name: []const u8, argv: []const []const u8, envp: []const []cons
     const pid = next_pid;
     next_pid += 1;
     slot.* = .{ .pid = pid, .thread_id = t.id, .state = .running };
+    // An ELF process is a process: it is born with the same four bootstrap
+    // handles as the demo image, so capability-mediated facilities (shared
+    // memory, endpoints) work without inventing ambient authority. Grants happen
+    // before the ledger is attached, so the birth handles are the floor a quota
+    // is measured against rather than a surprise charge.
+    if (cap.grantForProcess(slot.pid)) |c| {
+        user_space.setHandles(as, c.console, c.ledger, c.supervisor, c.page);
+    } else {
+        klog.warn("proc", "pid {d}: could not build a capability table", .{slot.pid});
+    }
+    _ = account.attach(slot.pid, .{});
     sched.admit(t);
     spawns += 1;
     execs += 1;

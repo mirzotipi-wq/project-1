@@ -1010,11 +1010,66 @@ liveness-as-a-reason, not a request/response probe: a service that is running bu
 ok. The pid a lookup returns can be stale by the time the caller uses it — it is an identity at
 resolution time, and the generation counter is what lets a caller notice the service was replaced.
 
-### Phase 29 — Resource accounting `[ ]`
+### Phase 29 — Resource accounting `[x]`
 **Goal:** No single service can starve the till.
 **Build:** Per-process memory/CPU/handle quotas, OOM scoring, memory pressure notifications,
 watchdog escalation ladder.
 **Done when:** A leaking service is capped and reported while checkout stays responsive.
+
+**Shipped.** `quota.zig` is the policy as pure arithmetic over three counters — pages, handles and
+CPU milliseconds in a rolling window — with the 80 % "near" band, an OOM score weighted 600/250/150
+towards memory, and a three-rung ladder (`warn` → `throttle` → `kill`) driven by strikes. It is
+host-tested: levels at the boundary, a zero quota, score ordering, the ladder, and saturation when a
+runaway reports absurd numbers.
+
+`account.zig` is the ledger and the watchdog. Every EL0 process gets an entry at creation (`attach`
+from `process.spawnWith`/`spawnElf`), a service's quota is applied on every launch so a restart
+cannot escape it, and the entry is dropped when the process slot is reused. Enforcement sits at the
+three funnels where a resource is actually handed out, not in a periodic scan:
+
+  * **Frames** — `AddressSpace.page_budget` is set from the quota; `allocFrameInto` and `mapShared`
+    refuse past it and count the refusal. Shared pages are charged to the process that maps them.
+  * **Handles** — `cap.allocateSlot` asks the ledger before installing a slot, so a leak of authority
+    is bounded exactly like a leak of memory (`cap.quota_refusals`).
+  * **CPU** — the scheduler charges `cpu_ms` at each switch and will not pick a thread whose
+    `throttled_until_ms` is in the future. A throttled thread stays `ready` and keeps its single
+    queue entry — invariant R is untouched — it simply gets no CPU for one window.
+
+One kernel watchdog thread samples every 100 ms and never blocks on a process it watches, so a
+spinning service cannot delay the accounting meant to catch it. Memory pressure is a real comparison
+of free pages against a watermark with a critical mark below it: the highest-scoring process is
+named, every live entry records the pressure, and past the critical mark a process well over its
+quota is killed. `SYS_ACCOUNT` lets a process ask about *itself* — usage, level, score, pressure
+flag — which is the notification a service can act on; `accounting` prints the same table from the
+shell.
+
+Two probe facts are stated rather than hidden. The harness image (`spawnWith`) gets a permissive
+ledger: it exists to exercise every capability and to saturate cores on purpose, so it is accounted
+for but not constrained — phase 29's limits are for services. And the `leak` program finds its
+CONTROL handle by asking the kernel instead of assuming a slot order, then derives until refused.
+
+**Measured (final build).** Step [15] prints on every probe boot:
+`pressure: 127271 pages free, watermark 127272 -> 1 event(s), 0 victims  OK`,
+`leaker: 1 handle refusal(s), 3 page-quota breach(es), then parked by policy  OK`,
+`watchdog: warn 1, throttle 1, kill 1 (quota 8 pages, 6 handles, 40 ms/500 ms)` and
+`till: 3/3 checkouts served while the leaker was capped  OK`. On the same build: 20/20 consecutive
+four-core probe boots `RESULT: PASS` with zero panics, zero hangs and
+`0 double-run, 0 queue violation(s), 0 stray ready`; 5/5 single-core boots; `killoop 150` twice at
+150/150 with zero anomalies; `stress 4 20000` 0 lost updates; `preempt 1000` PASS; `reap 8` 0 pages
+leaked; 65/65 host tests.
+
+The IPC probe needed one more kernel fix to stay deterministic under the new load: an answer is now
+tied to the *call* it belongs to by a request sequence (`req_seq`/`recv_seq`/`rep_seq`), so a late
+reply that crosses a newer call is never delivered as that call's answer, and the caller is woken
+only for the answer to the call it is waiting on. Deadline refusal stays as the second line of
+defence.
+
+**Deferred:** quotas are per-process, not per service group, and there is no runtime UI to change
+one (the service record's `quota` is the knob). CPU accounting is wall-clock scheduled milliseconds,
+not a hard real-time reservation. Pressure is reported and scored but there is no reclaim — pages
+return only when their owner dies, and the shared-memory pool is still monotonic (`shm.create` never
+gives pages back), which is why the leak probe exercises its cap through authority. `SYS_ACCOUNT` is
+a poll, not a push: no process is interrupted by a notification.
 
 ### Phase 30 — Sandbox policy `[ ]`
 **Goal:** Least privilege by construction.

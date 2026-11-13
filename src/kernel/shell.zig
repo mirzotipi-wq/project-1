@@ -30,6 +30,7 @@ const registry = @import("registry.zig");
 const names = @import("names.zig");
 const user_space = @import("addrspace.zig");
 const cap = @import("cap.zig");
+const account = @import("account.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
 const elf = @import("elf.zig");
@@ -62,6 +63,7 @@ fn printHelp() void {
         \\  irq                  interrupt controller state
         \\  map <addr>           translate a virtual address
         \\  selftest             run the boot self-tests
+        \\  accounting           per-process quotas, usage, OOM scores, watchdog
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -1472,6 +1474,107 @@ fn cmdUprobe(ctx: Context) void {
     }
     pass = pass and reg_ok;
 
+    // [15] resource accounting: a leaking service is capped and reported, and
+    // the till keeps serving while the watchdog escalates.
+    out("  [15] accounting: quotas, memory pressure, watchdog escalation\n", .{});
+    var acct_ok = true;
+    const acct_live_before = process.liveCount();
+
+    // Pressure is a real comparison against free pages. A 512 MiB host is not
+    // short of memory, so the watermark is lifted just above the current free
+    // count for one sample: the path, the victim choice and the report are real,
+    // only the threshold is moved to where this machine can reach it.
+    const free_now = ctx.pmm.stats().free_pages;
+    const saved_watermark = account.watermark_pages;
+    const saved_critical = account.critical_pages;
+    const pressures_before = account.pressures;
+    account.watermark_pages = free_now + 1;
+    account.critical_pages = 0;
+    account.tick();
+    const pressure_ok = account.pressures > pressures_before;
+    account.watermark_pages = saved_watermark;
+    account.critical_pages = saved_critical;
+    out("      pressure: {d} pages free, watermark {d} -> {d} event(s), 0 victims  {s}\n", .{
+        free_now, free_now + 1, account.pressures - pressures_before, status(pressure_ok),
+    });
+    acct_ok = acct_ok and pressure_ok;
+
+    // The page quota is deliberately below the image's own footprint: the ledger
+    // reports the breach and escalates, which is the cap being enforced. The
+    // handle cap is exercised at the funnel: derivation is refused once the quota
+    // is reached.
+    const leaker_quota = account.Quota{ .pages = 8, .handles = 6, .cpu_ms = 40, .window_ms = 500 };
+    const leaker_cfg = service.register("leaker", "pos.elf", &[_][]const u8{ "pos.elf", "leak" });
+    if (leaker_cfg) |s| {
+        // One death is final: the watchdog's kill must park the service, not feed
+        // it into the restart loop the quota exists to stop.
+        s.policy.max_restarts = 1;
+        s.quota = leaker_quota;
+    }
+    const warns_before = account.warnings_total;
+    const throttles_before = account.throttles_total;
+    const kills_before = account.kills_total;
+    const handles_refused_before = cap.quota_refusals;
+    const page_breaches_before = account.page_breaches;
+    const leaker_started = service.start("leaker");
+    sched.sleepMsBlocking(120);
+
+    // The till keeps serving while the leaker is being slowed.
+    var acct_served: u32 = 0;
+    const acct_env = [_][]const u8{"POS_TERM=cassa-1"};
+    var ar: usize = 0;
+    while (ar < 3) : (ar += 1) {
+        const sargv = [_][]const u8{ "pos.elf", "serve" };
+        if (process.spawnElf("pos.elf", &sargv, &acct_env)) |ap| {
+            const ast = process.wait(ap.pid, 3000);
+            if (ast == .exited and ap.exit_code == 0) acct_served += 1;
+            _ = process.waitReaped(ap.pid, 1000);
+        }
+    }
+
+    var lw: u64 = 0;
+    while (lw < 5000 and service.find("leaker").?.state == .running) : (lw += 5) {
+        sched.sleepMsBlocking(5);
+    }
+    const leaker_parked = service.find("leaker").?.state == .failed;
+    const acct_warned = account.warnings_total > warns_before;
+    const acct_throttled = account.throttles_total > throttles_before;
+    const acct_killed = account.kills_total > kills_before;
+    const handle_stop = cap.quota_refusals > handles_refused_before;
+    const page_stop = account.page_breaches > page_breaches_before;
+    const ladder_ok = leaker_started and acct_warned and acct_throttled and acct_killed and leaker_parked;
+    out("      leaker: {d} handle refusal(s), {d} page-quota breach(es), then {s}  {s}\n", .{
+        cap.quota_refusals - handles_refused_before,
+        account.page_breaches - page_breaches_before,
+        if (leaker_parked) "parked by policy" else "still running",
+        status(ladder_ok and handle_stop and page_stop),
+    });
+    out("      watchdog: warn {d}, throttle {d}, kill {d} (quota {d} pages, {d} handles, {d} ms/{d} ms)\n", .{
+        account.warnings_total - warns_before, account.throttles_total - throttles_before,
+        account.kills_total - kills_before, leaker_quota.pages, leaker_quota.handles,
+        leaker_quota.cpu_ms, leaker_quota.window_ms,
+    });
+    out("      till: {d}/3 checkouts served while the leaker was capped  {s}\n", .{
+        acct_served, status(acct_served == 3),
+    });
+    acct_ok = acct_ok and ladder_ok and handle_stop and page_stop and acct_served == 3;
+
+    _ = service.stop("leaker");
+    var acct_settle: u64 = 0;
+    while (acct_settle < 500 and process.liveCount() != acct_live_before) : (acct_settle += 10) {
+        sched.sleepMsBlocking(10);
+    }
+    const acct_clean = process.liveCount() == acct_live_before;
+    out("      stop: live processes {d} -> {d}  {s}\n", .{
+        acct_live_before, process.liveCount(), status(acct_clean),
+    });
+    out("      accounting: {d} samples, {d} warnings, {d} throttles, {d} kills, {d} pressure event(s), {d} victim(s)\n", .{
+        account.samples, account.warnings_total, account.throttles_total, account.kills_total,
+        account.pressures, account.pressure_victims,
+    });
+    acct_ok = acct_ok and acct_clean;
+    pass = pass and acct_ok;
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
         sched.double_run_events, sched.queue_violations, sched.stray_ready,
@@ -1480,6 +1583,32 @@ fn cmdUprobe(ctx: Context) void {
         syscall.user_calls, process.spawns, process.kills,
     });
     out("  RESULT: {s}\n", .{if (pass) "PASS" else "FAIL"});
+}
+
+/// `accounting` — the per-process ledger, as the watchdog sees it. One sample is
+/// forced first, so the numbers are current even between watchdog ticks.
+fn cmdAccounting() void {
+    account.tick();
+    out("  pid    pages      handles    cpu ms       level  score  strikes  w/t/k\n", .{});
+    var shown: usize = 0;
+    for (0..account.max_entries) |i| {
+        const e = account.entryAt(i) orelse continue;
+        shown += 1;
+        out("  {d:<5}  {d:>3}/{d:<3}  {d:>3}/{d:<3}  {d:>4}/{d:<4}  {s:<5}  {d:>4}  {d:>3}    {d}/{d}/{d}\n", .{
+            e.pid, e.pages, e.quota.pages, e.handles, e.quota.handles,
+            e.cpu_window, e.quota.cpu_ms, account.levelLabel(e.level), e.score, e.strikes,
+            e.warnings, e.throttles, e.kills,
+        });
+    }
+    out("  {d} tracked process(es), {d} samples: {d} warning(s), {d} throttle(s), {d} kill(s)\n", .{
+        shown, account.samples, account.warnings_total, account.throttles_total, account.kills_total,
+    });
+    out("  pressure: {d} event(s), {d} victim(s); watermark {d} pages, critical {d}\n", .{
+        account.pressures, account.pressure_victims, account.watermark_pages, account.critical_pages,
+    });
+    out("  refusals: {d} frame(s) over a page budget, {d} handle(s) over a handle quota\n", .{
+        user_space.budget_refusals, cap.quota_refusals,
+    });
 }
 
 pub const build_version = "0.1.0-dev";
@@ -1534,6 +1663,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdReap(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "killoop")) {
         cmdKillLoop(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "accounting")) {
+        cmdAccounting();
     } else if (std.mem.eql(u8, command, "user")) {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {

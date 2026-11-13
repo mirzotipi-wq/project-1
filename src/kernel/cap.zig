@@ -222,7 +222,28 @@ fn createTable(pid: u32) ?*Table {
     return null;
 }
 
+/// Refused grants because the process reached its handle quota (phase 29).
+pub var quota_refusals: u64 = 0;
+
+/// Who answers "how many handles may this pid hold". Set by the accounting
+/// module at boot; without it there is no per-process handle ceiling.
+var handle_limit_hook: ?*const fn (u32) u32 = null;
+
+pub fn setHandleLimitHook(hook: *const fn (u32) u32) void {
+    handle_limit_hook = hook;
+}
+
 fn allocateSlot(table: *Table, object_id: u32, rights: u32, parent: u8, parent_pid: u32) ?u64 {
+    if (handle_limit_hook) |limit| {
+        var held: u32 = 0;
+        for (&table.handles) |*h| {
+            if (h.used) held += 1;
+        }
+        if (held >= limit(table.pid)) {
+            quota_refusals += 1;
+            return null;
+        }
+    }
     for (&table.handles, 0..) |*h, slot| {
         if (h.used) continue;
         h.object = object_id;

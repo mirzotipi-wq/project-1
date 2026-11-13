@@ -30,6 +30,7 @@ const percpu = @import("kernel/percpu.zig");
 const sched = @import("kernel/sched.zig");
 const smp = @import("kernel/smp.zig");
 const process = @import("kernel/process.zig");
+const account = @import("kernel/account.zig");
 const cap = @import("kernel/cap.zig");
 const ipc = @import("kernel/ipc.zig");
 const service = @import("kernel/service.zig");
@@ -279,6 +280,7 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     sched.init(&g_pmm);
     process.init(&g_pmm);
     cap.boot(&g_pmm);
+    account.init();
     ipc.init();
     smp.startAll(&g_machine);
 
@@ -301,6 +303,11 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     // its stack cache-hot while the service threads it restarts move around.
     if (sched.spawn("svc", service.supervisorLoop, null) == null) {
         klog.warn("boot", "cannot start the service supervisor", .{});
+    }
+    // The watchdog samples quotas every 100 ms on its own thread: a service that
+    // spins must not be able to delay the accounting that catches it.
+    if (sched.spawn("wd", account.watchdogLoop, null) == null) {
+        klog.warn("boot", "cannot start the resource watchdog", .{});
     }
     if (sched.spawn("shell", shellEntry, null) == null) {
         klog.err("boot", "could not create the shell thread", .{});

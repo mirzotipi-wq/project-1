@@ -75,6 +75,15 @@ const Endpoint = struct {
     /// Caller waiting for the answer, while the request is still queued.
     req_thread: ?*thread_mod.Thread = null,
 
+    /// Request sequence. Bumped for every call, and copied into `recv_seq` when
+    /// the receiver takes that call, so an answer can be tied to the exact call
+    /// it belongs to. A thread identity cannot do that: the same thread makes the
+    /// next call, and an answer that arrives late would otherwise be delivered
+    /// to it as if it were the answer to the newer request.
+    req_seq: u32 = 0,
+    recv_seq: u32 = 0,
+    rep_seq: u32 = 0,
+
     /// Reply in flight: receiver back to the caller.
     rep_valid: bool = false,
     rep: Message = .{},
@@ -275,13 +284,16 @@ pub fn call(
     const ep = try resolve(pid, handle, cap.R_WRITE);
     const t = sched.running();
     const deadline = deadlineOf(timeout_ms);
+    var call_seq: u32 = 0;
 
     // Publish the request. A second caller waits here for the slot.
     while (true) {
         const flags = lock.acquire();
         sweep(ep);
         if (!ep.req_valid) {
-            if (ep.rep_valid and ep.rep_to != t) {
+            // A new call cannot have an answer yet: anything in the reply slot
+            // belongs to an older call and must not be delivered to this one.
+            if (ep.rep_valid) {
                 ep.rep_valid = false;
                 ep.rep_to = null;
             }
@@ -294,6 +306,8 @@ pub fn call(
             // Record the caller's deadline now: the server may answer after the
             // caller has already given up, and that answer must be refused.
             ep.reply_deadline = deadline;
+            ep.req_seq +%= 1;
+            call_seq = ep.req_seq;
             const waiter = ep.recv_thread;
             ep.recv_thread = null;
             ep.recv_deadline = 0;
@@ -320,7 +334,7 @@ pub fn call(
     // arrived during the publish impossible to lose.
     while (true) {
         const flags = lock.acquire();
-        if (ep.rep_valid and ep.rep_to == t) {
+        if (ep.rep_valid and ep.rep_to == t and ep.rep_seq == call_seq) {
             const answer = ep.rep;
             ep.rep_valid = false;
             ep.rep_to = null;
@@ -384,6 +398,7 @@ pub fn recv(
             if (was_call) {
                 ep.reply_owed = true;
                 ep.reply_target = caller;
+                ep.recv_seq = ep.req_seq;
             }
             receives += 1;
             // The request slot is free again: whoever was blocked on it may go.
@@ -443,6 +458,9 @@ pub fn reply(
     // `rep_valid` would let the same thread's *next* call — which has the same
     // identity — take it as its own reply. Both are decided by the deadline
     // alone, so the refusal cannot depend on which thread happens to run first.
+    // A call whose deadline passed is over even if its caller has not run yet:
+    // it will return ETIMEDOUT, and handing it this answer would turn that into
+    // a success. Decided by the deadline alone, never by which thread runs first.
     if (ep.reply_deadline != 0 and expired(ep.reply_deadline)) {
         ep.reply_owed = false;
         ep.reply_target = null;
@@ -458,9 +476,13 @@ pub fn reply(
     ep.rep = msg;
     ep.rep_valid = true;
     ep.rep_to = target;
-    // If the caller is already waiting, hand it over now; if it is still on its
-    // way into the wait, it will find the reply when it gets there.
-    if (ep.reply_thread == target) {
+    ep.rep_seq = ep.recv_seq;
+    // If the caller is waiting on *this* call, hand it over now; if it is still
+    // on its way into the wait it will find the reply when it gets there. A
+    // caller that has already published a newer call must not be woken by an
+    // older answer: the answer stays in the slot, the caller's wait matches on
+    // the sequence, and the newer answer replaces it when it arrives.
+    if (ep.reply_thread == target and ep.recv_seq == ep.req_seq) {
         ep.reply_thread = null;
         ep.reply_deadline = 0;
     }

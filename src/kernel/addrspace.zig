@@ -72,6 +72,13 @@ pub const AddressSpace = struct {
     region_count: u8 = 0,
 
     code_len: usize = 0,
+
+    /// Frames (own + page tables + shared mappings) this process may have. Set
+    /// from its quota when the ledger is attached; the default is a ceiling that
+    /// no image can reach, so creation is never refused by accounting.
+    page_budget: u32 = 4096,
+    /// Pages a shared object contributes to this space's budget (phase 29).
+    shared_pages: u16 = 0,
     /// Physical address of the first data page. The kernel writes the startup
     /// arguments here through the identity map, because the user virtual
     /// address is only valid while this process is the one loaded in TTBR0.
@@ -84,6 +91,12 @@ pub const AddressSpace = struct {
 
     pub fn bytes(self: *const AddressSpace) usize {
         return (@as(usize, self.frame_count) + @as(usize, self.table_count)) * page;
+    }
+
+    /// Everything this space has mapped and is charged for: its own frames, the
+    /// tables that map them, and any shared pages it attached (phase 29).
+    pub fn mappedPages(self: *const AddressSpace) usize {
+        return @as(usize, self.frame_count) + @as(usize, self.table_count) + @as(usize, self.shared_pages);
     }
 };
 
@@ -147,7 +160,15 @@ fn mapPage(as: *AddressSpace, alloc: *pmm.PageAllocator, va: usize, pa: usize, e
     return true;
 }
 
+/// Frames refused because the process reached its page budget. Monotonic, so the
+/// probe can show that a cap was enforced even after the process is gone.
+pub var budget_refusals: u64 = 0;
+
 fn allocFrameInto(as: *AddressSpace, alloc: *pmm.PageAllocator) ?usize {
+    if (as.mappedPages() + 1 > as.page_budget) {
+        budget_refusals += 1;
+        return null;
+    }
     const pa = alloc.allocZeroed() orelse return null;
     if (!trackFrame(as, pa)) {
         alloc.free(pa);
@@ -274,6 +295,12 @@ pub fn mapShared(as: *AddressSpace, alloc: *pmm.PageAllocator, va: usize, frames
     if (frames.len == 0) return false;
     if (va < shm_va or va + frames.len * page > window_end) return false;
     if (as.region_count >= uaccess.max_regions) return false;
+    // Shared pages are charged to the mapping process: attaching someone else's
+    // memory is still using your own address space and page tables (phase 29).
+    if (as.mappedPages() + frames.len > as.page_budget) {
+        budget_refusals += 1;
+        return false;
+    }
     for (frames, 0..) |pa, i| {
         if (!mapPage(as, alloc, va + i * page, pa, false, writable)) return false;
     }
@@ -284,6 +311,8 @@ pub fn mapShared(as: *AddressSpace, alloc: *pmm.PageAllocator, va: usize, frames
         .name = "shm",
     };
     as.region_count += 1;
+    const pages: u16 = @intCast(frames.len);
+    as.shared_pages +|= pages;
     cpu.tlbiVmalle1();
     cpu.dsbSy();
     cpu.isb();
@@ -311,6 +340,8 @@ pub fn unmapShared(as: *AddressSpace, va: usize, len: usize) bool {
     var j = slot;
     while (j + 1 < as.region_count) : (j += 1) as.regions[j] = as.regions[j + 1];
     as.region_count -= 1;
+    const pages: u16 = @intCast(len / page);
+    as.shared_pages = if (as.shared_pages >= pages) as.shared_pages - pages else 0;
     cpu.tlbiVmalle1();
     cpu.dsbSy();
     cpu.isb();

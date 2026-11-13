@@ -18,6 +18,7 @@ const sched = @import("sched.zig");
 const restart = @import("restart.zig");
 const timer = @import("../arch/aarch64/timer.zig");
 const klog = @import("klog.zig");
+const account = @import("account.zig");
 
 pub const max_services = 4;
 pub const max_argv = 3;
@@ -41,6 +42,9 @@ pub const Service = struct {
     last_kind: []const u8 = "",
     last_delay_ms: u64 = 0,
     policy: restart.Policy = .{},
+    /// What this service is allowed to use. Applied on every launch, so a
+    /// restart cannot escape the budget the first incarnation had (phase 29).
+    quota: account.Quota = .{},
 };
 
 var table: [max_services]Service = [_]Service{.{}} ** max_services;
@@ -81,6 +85,7 @@ fn launch(s: *Service) bool {
         s.state = .failed;
         return false;
     };
+    _ = account.setQuota(p.pid, s.quota);
     s.pid = p.pid;
     s.state = .running;
     s.started_ms = timer.uptimeMs();

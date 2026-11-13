@@ -23,6 +23,7 @@ const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
 const registry = @import("registry.zig");
 const names = @import("names.zig");
+const account = @import("account.zig");
 
 /// System calls a process may make from EL0. Deliberately small: each one is a
 /// place where the kernel acts with its own authority, so the surface is the
@@ -63,6 +64,11 @@ pub const UserNr = enum(u64) {
     // address space; the answer is a reason code, never an error that has to be
     // guessed from a pid.
     resolve = 38,
+
+    // Resource accounting (phase 29). A process asks about itself: the answer is
+    // its own usage, its own quota's verdict and whether the machine reported
+    // memory pressure. There is no way to name another process.
+    account = 39,
 };
 
 /// Rejected user pointers, counted so the probe can prove the kernel refused to
@@ -448,6 +454,28 @@ pub fn handleUser(number: u64, frame: *trap.Frame) Action {
                 frame.x[1],
                 frame.x[2],
             ) catch |e| errnoShm(e);
+            return .keep;
+        },
+        @intFromEnum(UserNr.account) => {
+            const space = sched.running().address_space orelse {
+                frame.x[0] = errno(.invalid);
+                return .keep;
+            };
+            const out = frame.x[0];
+            if (!user_space.checkPtr(space, out, 48, .write)) {
+                rejected_ptr += 1;
+                frame.x[0] = errno(.fault);
+                return .keep;
+            }
+            const snap = account.snapshot(process.currentPid());
+            const words: [*]u64 = @ptrFromInt(out);
+            words[0] = snap.pages;
+            words[1] = snap.handles;
+            words[2] = snap.cpu_ms;
+            words[3] = @intFromEnum(snap.level);
+            words[4] = snap.score;
+            words[5] = snap.flags;
+            frame.x[0] = 0;
             return .keep;
         },
         @intFromEnum(UserNr.resolve) => {

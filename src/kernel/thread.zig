@@ -69,6 +69,14 @@ pub const Thread = struct {
     /// Core this thread prefers; woken threads are queued there.
     cpu: u32 = 0,
     runs: u64 = 0,
+    /// CPU milliseconds over this thread's life. Written only by the scheduler
+    /// at a switch, read by the accounting watchdog (phase 29).
+    cpu_ms: u64 = 0,
+    /// When this thread started running on a core; 0 while it is off-CPU.
+    switch_in_ms: u64 = 0,
+    /// While this is in the future the scheduler will not pick the thread: it
+    /// stays ready and queued, it simply gets no CPU (phase 29 throttle).
+    throttled_until_ms: u64 = 0,
     /// Absolute uptime (ms) at which a sleeping thread becomes runnable.
     wake_at_ms: u64 = 0,
     is_idle: bool = false,
