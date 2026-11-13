@@ -22,6 +22,7 @@ const percpu = @import("percpu.zig");
 const threads = @import("thread.zig");
 const sync = @import("sync.zig");
 const process = @import("process.zig");
+const cap = @import("cap.zig");
 const syscall = @import("syscall.zig");
 
 pub const Context = struct {
@@ -74,6 +75,7 @@ fn printHelp() void {
         \\  --- user mode (EL0) -----------------------------------------------
         \\  user [mode]          run the EL0 demo: 0 normal, 1 priv op, 2 kernel read, 3 isolation
         \\  uprobe               full EL0 + address-space probe (run this)
+        \\  caps                 capability objects and their reference counts
         \\
     , .{});
 }
@@ -485,6 +487,22 @@ fn parseArg(tokens: *std.mem.TokenIterator(u8, .scalar), default: u32, min: u32,
 }
 
 
+/// `caps` — the kernel's view of capability objects.
+fn cmdCaps(_: Context) void {
+    out("  id  kind         refs  version  epoch  name\n", .{});
+    var i: usize = 0;
+    while (i < cap.objectSlots()) : (i += 1) {
+        if (cap.objectAt(i)) |o| {
+            out("  {d:>2}  {s:<11}  {d:>4}  {d:>7}  {d:>5}  {s}\n", .{
+                o.id, o.kind.label(), o.refs, o.version, o.epoch, o.name,
+            });
+        }
+    }
+    out("  derivations {d}, revocations {d}, refusals {d}, live tables {d}\n", .{
+        cap.derivations, cap.revocations, cap.refusals, cap.liveTables(),
+    });
+}
+
 fn status(ok: bool) []const u8 {
     return if (ok) "OK" else "FAIL";
 }
@@ -612,6 +630,59 @@ fn cmdUprobe(ctx: Context) void {
     });
     pass = pass and ok6;
 
+    // 7 -- capabilities: granted rights, refusals, stale handles, table limits.
+    out("  [7] capabilities: granted rights, missing rights, stale handles, table limits\n", .{});
+    const cap_before = syscall.cap_calls;
+    p = process.spawn(4, 0, "caps") orelse {
+        out("      FAIL: cannot spawn a process\n", .{});
+        return;
+    };
+    st = process.wait(p.pid, 6000);
+    _ = process.waitReaped(p.pid, 1000);
+    const ok7 = st == .exited and p.exit_code == 0;
+    out("      {d} capability calls, code {d}  {s}\n", .{ syscall.cap_calls - cap_before, p.exit_code, status(ok7) });
+    pass = pass and ok7;
+
+    // 8 -- one object, two holders, each bounded by its own mask.
+    out("  [8] two processes holding the same ledger, different rights\n", .{});
+    const ca = process.spawn(4, 0, "cap-rw") orelse {
+        out("      FAIL: cannot spawn the read/write holder\n", .{});
+        return;
+    };
+    const cb = process.spawnReadOnly(4, 1, "cap-ro") orelse {
+        out("      FAIL: cannot spawn the read-only holder\n", .{});
+        return;
+    };
+    // Read the identities now: a slot is recycled as soon as its process is
+    // reaped, so the pointers are only meaningful for the pids captured here.
+    const pid_rw = ca.pid;
+    const pid_ro = cb.pid;
+    const sca = process.wait(pid_rw, 6000);
+    const code_rw = ca.exit_code;
+    _ = process.waitReaped(pid_rw, 1000);
+    const scb = process.wait(pid_ro, 6000);
+    const code_ro = cb.exit_code;
+    _ = process.waitReaped(pid_ro, 1000);
+    const ok8 = sca == .exited and scb == .exited and code_rw == 0 and code_ro == 0;
+    out("      pids {d} (rw) and {d} (ro): {s}/{s}, codes {d}/{d}  {s}\n", .{
+        pid_rw, pid_ro, @tagName(sca), @tagName(scb), code_rw, code_ro, status(ok8),
+    });
+    pass = pass and ok8;
+
+    // 9 -- the kernel's own view of the objects.
+    out("  [9] object table after the run\n", .{});
+    var oi: usize = 0;
+    while (oi < cap.objectSlots()) : (oi += 1) {
+        if (cap.objectAt(oi)) |o| {
+            out("      id {d} {s:<11} refs {d}  version {d}  epoch {d}\n", .{
+                o.id, o.kind.label(), o.refs, o.version, o.epoch,
+            });
+        }
+    }
+    out("      derivations {d}, revocations {d}, refusals {d}, live tables {d}\n", .{
+        cap.derivations, cap.revocations, cap.refusals, cap.liveTables(),
+    });
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  user syscalls: {d}, processes spawned: {d}, faults caught: {d}\n", .{
         syscall.user_calls, process.spawns, process.kills,
@@ -673,6 +744,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {
         cmdUprobe(ctx);
+    } else if (std.mem.eql(u8, command, "caps")) {
+        cmdCaps(ctx);
     } else if (std.mem.eql(u8, command, "logstorm")) {
         cmdLogStorm(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "sleep")) {

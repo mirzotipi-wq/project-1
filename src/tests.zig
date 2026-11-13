@@ -16,6 +16,7 @@ test {
     _ = @import("kernel/klog.zig");
     _ = @import("kernel/sync.zig");
     _ = @import("kernel/uaccess.zig");
+    _ = @import("kernel/cap.zig");
     _ = @import("kernel/thread.zig");
 }
 

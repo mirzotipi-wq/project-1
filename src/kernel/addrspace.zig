@@ -236,6 +236,42 @@ pub fn setArgs(as: *AddressSpace, mode: u64, secret: u64) void {
     words[1] = secret;
 }
 
+/// Hand the process its capability numbers. They go in the data page next to
+/// the mode word: the virtual address is only valid while this process is the
+/// one loaded, so the kernel writes through the physical address.
+pub fn setHandles(as: *AddressSpace, console: u64, ledger: u64, supervisor: u64, page_handle: u64) void {
+    if (as.args_pa == 0) return;
+    const words: [*]u64 = @ptrFromInt(as.args_pa);
+    words[4] = console;
+    words[5] = ledger;
+    words[6] = supervisor;
+    words[7] = page_handle;
+}
+
+/// Where a mapped capability page appears in the user window. Between the data
+/// region (0x81000000) and the stack (0x82000000), so it collides with neither.
+pub const mapped_va: usize = 0x8150_0000;
+
+/// Map a kernel-owned page into this process. The frame is not owned by the
+/// address space, so teardown leaves it alone: the object outlives the mapping.
+pub fn mapKernelPage(as: *AddressSpace, alloc: *pmm.PageAllocator, va: usize, pa: usize) bool {
+    if (!mapPage(as, alloc, va, pa, false, false)) return false;
+    if (as.region_count < uaccess.max_regions) {
+        as.regions[as.region_count] = .{
+            .base = va,
+            .len = page,
+            .user_write = false,
+            .name = "mapped",
+        };
+        as.region_count += 1;
+    }
+    // The new translation must be visible before EL0 runs again.
+    cpu.tlbiVmalle1();
+    cpu.dsbSy();
+    cpu.isb();
+    return true;
+}
+
 /// Validate a user pointer against this process, then confirm the mapping
 /// exists. Both answers must agree before the kernel dereferences anything.
 pub fn checkPtr(as: *const AddressSpace, va: usize, len: usize, access: uaccess.Access) bool {

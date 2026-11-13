@@ -316,12 +316,74 @@ frames are allocated at load), stack growth (a fixed four-page stack with an
 unmapped guard below it) and an ELF loader — the demo is a flat blob embedded in
 the kernel image.
 
-### Phase 23 — Capabilities `[ ]`
+### Phase 23 — Capabilities `[x]`
 **Goal:** Authority is a first-class, transferable object.
 **Build:** Capability slots, rights masks, derivation, revocation, per-process handle tables,
 kernel object headers with refcounts.
 **Done when:** A process without a capability cannot reach a device, and revocation cuts
 access immediately.
+**Verified:** every process owns a 16-slot handle table and a handle number is
+`(generation << 8) | (slot + 1)`, so a closed or revoked slot can never be named again and
+zero is never a valid handle. A handle carries a rights mask — READ 1, WRITE 2, EXEC-or-MAP 4,
+CONTROL 8 — and the kernel resolves the handle before it looks at any user pointer: a forged
+number returns EBADF (-9), never a fault and never another process's memory. Derivation needs
+CONTROL on the parent plus a subset mask; revocation walks the parent chain, invalidates the
+whole subtree and bumps generations, so later use fails with EBADF while the parent keeps
+working. Objects are the console, a shared ledger (64-byte cell, version, epoch), the
+supervisor (another process's state, exported read-only) and a page object holding one kernel
+frame with magic `0xCA55A0B100000023`, which only a handle carrying EXEC-or-MAP can place in a
+process at 0x81500000. Eight syscalls (20-27) are the whole surface: query, derive, revoke,
+close, read, write, control, map. `caps` prints the object table with reference counts.
+
+The probe passes on `-smp 4` and `-smp 1` with identical numbers. The first process is born
+with handles 1/2/3/4 and passes all six cases: granted rights work (case 1); mapping a ledger
+without EXEC and controlling a read-only supervisor both return EPERM -1 (case 2); slot 10,
+slot 200 and handle 0 all return EBADF -9 without faulting (case 3); a derived CONTROL handle
+works, is revoked, and is then EBADF while its parent still answers (case 4); two live
+processes (pids 111 and 112) hold the same ledger and the read-only one gets EPERM for write
+while its read succeeds (case 5); deriving until the table is full returns EMFILE -24 and
+closing one handle lets the next derive succeed (case 6). Both holders exit 0. The run
+recorded 28 capability calls, 310 user syscalls, 13 spawned processes, 2 caught faults, and
+the ledger ends at version 4, epoch 2, 14 references, with derivations 28, revocations 2,
+refusals 7 and 2 live tables.
+
+```
+  [7] capabilities: granted rights, missing rights, stale handles, table limits
+[user] capability suite, profile 0, handles con/led/sup/pg = 1/2/3/4
+[user] case 1: OK
+[user] case 2: OK
+[user] case 3: OK
+[user] case 4: OK
+[user] case 5: OK
+[user] case 6: OK
+      28 capability calls, code 0  OK
+  [8] two processes holding the same ledger, different rights
+[user] capability suite, profile 0, handles con/led/sup/pg = 1/2/3/4
+[user] case 1: OK ... case 6: OK
+[user] capability suite, profile 1, handles con/led/sup/pg = 1/2/3/0
+[user] case 1: OK
+[user] case 2: OK
+[user] case 3: OK
+[user] case 5: OK
+      pids 111 (rw) and 112 (ro): exited/exited, codes 0/0  OK
+  [9] object table after the run
+      id 1 console     refs 2  version 0  epoch 0
+      id 2 ledger      refs 14  version 4  epoch 2
+      id 3 supervisor  refs 2  version 0  epoch 0
+      id 4 page        refs 1  version 0  epoch 0
+      derivations 28, revocations 2, refusals 7, live tables 2
+  RESULT: PASS
+```
+
+Regression sweep on the same build: 42/42 host tests; `stress 4 20000` → 80000 exact,
+0 lost; `preempt 1000` → 27..28 slices per thread (equal round robin); `reap 8` → 0 pages
+leaked; `logstorm 4` → 24 lines per writer, 96/96 intact; `cores` → 4/4 online; `irq` → PPI 30,
+0 spurious, 0 unhandled; `-m 1024M` → 1024 MiB managed, 259536 pages free, pmm self-test PASS;
+`textwrite` → permission fault at 0x40080000 (deliberate halt).
+
+Not done yet: handle transfer over IPC (phase 24), mapping the page object as shared memory
+(phase 25), a variable table size, an accounting charge for table memory, and an unmap
+syscall — the page object is mapped once per process and released with it.
 
 ### Phase 24 — IPC endpoints `[ ]`
 **Goal:** Fast, typed message passing between services.

@@ -13,6 +13,7 @@ const thread_mod = @import("thread.zig");
 const trap = @import("../arch/aarch64/trap.zig");
 const pmm = @import("pmm.zig");
 const klog = @import("klog.zig");
+const cap = @import("cap.zig");
 
 pub const State = enum { free, running, exited, killed };
 
@@ -51,6 +52,8 @@ fn freeSlot() ?*Process {
         // have been reaped. The exit record survives as long as anyone can
         // still ask about it, which is what the probes rely on.
         if (p.state != .running and thread_mod.find(p.thread_id) == null) {
+            // A dead process leaves no authority behind.
+            cap.releaseProcess(p.pid);
             p.* = .{};
             return p;
         }
@@ -72,8 +75,20 @@ fn slotForPid(pid: u32) ?*Process {
     return null;
 }
 
+/// Which authority a new process is born with. The read-only profile exists so
+/// the probe can show two holders of one object each bounded by their own mask.
+pub const Profile = enum { full, read_only };
+
 /// Launch the demo image at EL0 in a brand new address space.
 pub fn spawn(mode: u64, secret: u64, name: []const u8) ?*Process {
+    return spawnWith(mode, secret, name, .full);
+}
+
+pub fn spawnReadOnly(mode: u64, secret: u64, name: []const u8) ?*Process {
+    return spawnWith(mode, secret, name, .read_only);
+}
+
+fn spawnWith(mode: u64, secret: u64, name: []const u8, profile: Profile) ?*Process {
     const a = alloc orelse return null;
     const slot = freeSlot() orelse return null;
     const image = @import("../user/image.zig").bytes;
@@ -86,6 +101,18 @@ pub fn spawn(mode: u64, secret: u64, name: []const u8) ?*Process {
     slot.* = .{ .pid = next_pid, .thread_id = t.id, .state = .running };
     next_pid += 1;
     spawns += 1;
+
+    // Authority is granted here and nowhere else: a process is born with
+    // exactly these handles and can only ever narrow them.
+    const caps: ?cap.Grants = switch (profile) {
+        .full => cap.grantForProcess(slot.pid),
+        .read_only => cap.grantReadOnlyProfile(slot.pid),
+    };
+    if (caps) |c| {
+        user_space.setHandles(as, c.console, c.ledger, c.supervisor, c.page);
+    } else {
+        klog.warn("proc", "pid {d}: could not build a capability table", .{slot.pid});
+    }
     // Report before the thread is runnable: it can exit, be reaped and have its
     // address space released before this function would otherwise return.
     klog.info("proc", "pid {d} '{s}': EL0 entry 0x{x}, stack 0x{x}, {d} KiB, mode {d}", .{
@@ -93,6 +120,10 @@ pub fn spawn(mode: u64, secret: u64, name: []const u8) ?*Process {
     });
     sched.admit(t);
     return slot;
+}
+
+pub fn pageAllocator() ?*pmm.PageAllocator {
+    return alloc;
 }
 
 pub fn currentPid() u32 {
