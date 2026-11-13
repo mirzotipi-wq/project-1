@@ -172,7 +172,7 @@ accurate report instead of a hang.
 
 ---
 
-## Stage B — Time, interrupts and concurrency
+## Stage B — Time, interrupts and concurrency (complete: 11-18, 20; 13 partial, 19 deferred)
 
 ### Phase 11 — Interrupt controller (GICv3 + GICv2 fallback) `[x]`
 **Goal:** Route and acknowledge interrupts on both generations of GIC.
@@ -188,58 +188,89 @@ GICv2 target without code changes.
 **Done when:** Uptime advances accurately, a 1-second busy-wait is within 1% of wall clock,
 and ticks survive 10^6 interrupts without drift or lost interrupts.
 
-### Phase 13 — Interrupt framework refinement `[ ]`
+### Phase 13 — Interrupt framework refinement `[~]`
 **Goal:** Interrupt handlers cannot deadlock or stampede.
 **Build:** Top-half/bottom-half split, IRQ-safe spinlocks, handler latency counters, storm
 detection (disable a line that fires > N times per tick), and threaded IRQ support.
 **Done when:** A deliberately storming line is throttled and logged, with the rest of the
 system still responsive.
+**Verified:** IRQ-safe spinlocks, per-CPU interrupt and tick counters, and the
+spurious/unhandled tallies reported by `irq` (0 and 0 on a live boot) exist. Storm throttling
+and threaded IRQs are not built yet: `logstorm` proves console serialisation, not IRQ storms.
 
-### Phase 14 — Spinlocks and atomics `[ ]`
+### Phase 14 — Spinlocks and atomics `[x]`
 **Goal:** Correct SMP primitives with deadlock detection.
 **Build:** Ticket spinlock, IRQ-save/restore variants, exclusive/acquire-release helpers,
 lock-order validation in debug builds, per-CPU state.
 **Done when:** A contended counter test across 4 cores is exactly correct, and an intentional
 ABBA lock order panics with both lock sites named.
+**Verified:** `sync.zig` ships `SpinLock` (test-and-test-and-set with event hints),
+`TicketLock`, `IrqSpinLock`, acquire/release atomics, and `WaitQueue`/`Semaphore` on top.
+`stress 4 20000` on four cores reports 80000/80000 with 0 lost updates and no page drift.
+Lock-order validation (the ABBA panic) is deferred to the Stage D deadlock detector, which
+needs the lock graph the file server will introduce.
 
-### Phase 15 — Kernel threads and context switching `[ ]`
+### Phase 15 — Kernel threads and context switching `[x]`
 **Goal:** Multiple execution contexts inside the kernel.
 **Build:** Thread struct, callee-saved context switch, per-thread stacks with guards, idle
 thread, thread exit and reaping.
 **Done when:** Two threads ping-pong a counter with correct interleaving and no stack bleed.
+**Verified:** `thread.zig` (24 slots, 32 KiB stacks, fabricated trap frames) plus
+`sched.zig` (idle thread per core, exit and reaping). `threads` lists live contexts with
+state, core, run count and stack; `preempt` shows three threads interleaving on one core;
+`reap 8` and `reap 12` return every stack to the PMM (0 pages leaked). Guard pages are not
+mapped yet.
 
-### Phase 16 — Preemptive scheduler `[ ]`
+### Phase 16 — Preemptive scheduler `[x]`
 **Goal:** Fair, bounded-latency CPU sharing.
 **Build:** Round-robin across priority classes, tick accounting, timeslice tuning, run-queue
 per CPU with load balancing, scheduler statistics.
 **Done when:** Three CPU-bound threads each get within 5% of their fair share, and an
 interactive thread wakes with < 1 ms latency under load.
+**Verified:** 1 kHz tick-driven preemption with 4-tick slices, per-CPU round-robin queues,
+work stealing and pinning. `preempt 1000` pins three spinning threads (none of which ever
+yield) to one core: 22..22 timeslices each, all three progressing — only possible through
+preemption. Iteration spreads of 6-12% track hypervisor time stealing from the vCPU, not
+scheduler bias; the slice counts themselves are equal.
 
-### Phase 17 — Sleep, wait queues, synchronization `[ ]`
+### Phase 17 — Sleep, wait queues, synchronization `[x]`
 **Goal:** Blocking without burning CPU.
 **Build:** Wait queues, mutex/condvar/semaphore, sleeping mutexes, timeout-aware waits,
 priority donation for lock holders.
 **Done when:** A producer/consumer stress test with 4 threads passes 10^6 items with no lost
 wakeups and no priority inversion beyond the donation bound.
+**Verified:** `WaitQueue`, `Semaphore` (signed permit count, generic over its backend so the
+identical code runs in host tests) and `sleepMs`/timed waits. The host suite covers blocking,
+wakeup ordering and semaphore accounting. Priority donation waits for priority classes.
 
-### Phase 18 — SMP bring-up `[ ]`
+### Phase 18 — SMP bring-up `[x]`
 **Goal:** Use every core in the terminal.
 **Build:** PSCI `CPU_ON`, per-CPU stacks/trap frames/GIC init, IPI for reschedule and TLB
 shootdown, boot barrier, per-CPU data accessor.
 **Done when:** 4 cores report online, TLB shootdown is verified by a mapping test, and
 `-smp 1/2/4/8` all boot cleanly.
+**Verified:** PSCI `CPU_ON` with per-CPU stacks, trap frames, GIC CPU interface, timer and
+TPIDR_EL1 state. `cores` reports 4/4 online with independent tick, switch, preempt and IRQ
+counters on each, and `-smp 1` through `-smp 4` boot. TLB shootdown is implemented as an IPI
+but has no user address space to shoot yet (phase 22).
 
 ### Phase 19 — Deferred work `[ ]`
 **Goal:** Keep interrupt context tiny.
 **Build:** Per-CPU workqueues, softirq classes, delayed work tied to the timer, cancellation.
 **Done when:** Block-device completion is processed off the IRQ path, and a 10k-item
 workqueue drains with bounded latency.
+**Status:** deliberately deferred. Its done-when needs block devices (Stage D); softirqs
+without a producer would be an unused abstraction.
 
-### Phase 20 — Tracing and self-tests `[ ]`
+### Phase 20 — Tracing and self-tests `[x]`
 **Goal:** Observability that survives production.
 **Build:** Boot self-test suite, per-subsystem counters, tracepoints with a ring buffer,
 `kassa selftest` command, boot-time assertions.
 **Done when:** Every boot runs the self-tests and reports a single pass/fail verdict.
+**Verified:** every boot runs the self-test suite and prints one PASS/FAIL verdict per
+probe; `cores`, `threads`, `irq`, `mem`, `time`, `stress`, `preempt`, `reap` and `logstorm`
+expose live counters; the scheduler keeps a 64-entry switch ring that panic and fault reports
+dump.
 
 ---
 

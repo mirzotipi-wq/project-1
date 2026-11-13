@@ -13,6 +13,14 @@ var epoch: u64 = 0;
 var ticks: u64 = 0;
 var tick_hz: u64 = 1000;
 
+/// Installed by the scheduler. The timer driver stays policy-free: it keeps
+/// time and calls whoever subscribed to the tick.
+pub var tick_hook: ?*const fn () void = null;
+
+pub fn setTickHook(hook: *const fn () void) void {
+    tick_hook = hook;
+}
+
 fn arm() void {
     // TVAL is a 32-bit down-counter; one tick period at the counter frequency.
     const period = frequency / tick_hz;
@@ -22,6 +30,7 @@ fn arm() void {
 fn onTick(_: u32) void {
     arm();
     ticks +%= 1;
+    if (tick_hook) |hook| hook();
 }
 
 pub const InitError = error{NoCounter};
@@ -35,6 +44,14 @@ pub fn init(hz: u64) InitError!void {
     cpu.sysWrite("cntp_ctl_el0", 1); // enable, unmask, IMASK=0
     irq.register(timer_intid, onTick);
     klog.info("timer", "generic timer: {d} Hz counter, {d} Hz tick, PPI {d}", .{ frequency, hz, timer_intid });
+}
+
+/// Arm the period timer on the calling core. The handler and the frequency are
+/// global; CNTP_* are per-core registers, so every core arms its own.
+pub fn initCpu() void {
+    if (frequency == 0) return;
+    arm();
+    cpu.sysWrite("cntp_ctl_el0", 1);
 }
 
 pub fn frequencyHz() u64 {

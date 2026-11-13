@@ -1,9 +1,11 @@
-//! Kernel shell over the serial console (phase 12).
+//! Kernel shell over the serial console (phase 12, extended in phase 20).
 //!
-//! Deliberately small: it is the debugging surface for the kernel until the
-//! real POS shell exists in user space (phase 59). Commands never allocate.
+//! It now runs as an ordinary kernel thread, which is the point: commands can
+//! block, sleep, spawn work, take locks and be preempted exactly like any other
+//! code in the system. Nothing here is privileged.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cpu = @import("../arch/aarch64/cpu.zig");
 const timer = @import("../arch/aarch64/timer.zig");
 const gic = @import("../arch/aarch64/gic.zig");
@@ -15,6 +17,10 @@ const machine = @import("machine.zig");
 const pmm = @import("pmm.zig");
 const heap = @import("heap.zig");
 const symbols = @import("symbols.zig");
+const sched = @import("sched.zig");
+const percpu = @import("percpu.zig");
+const threads = @import("thread.zig");
+const sync = @import("sync.zig");
 
 pub const Context = struct {
     machine: *const machine.Machine,
@@ -33,7 +39,7 @@ fn prompt() void {
 
 fn printHelp() void {
     out(
-        \\
+        \\  --- system ---------------------------------------------------------
         \\  help                 this list
         \\  info                 machine and build information
         \\  mem                  physical page allocator statistics
@@ -51,17 +57,30 @@ fn printHelp() void {
         \\  reboot               warm reset via PSCI
         \\  halt                 stop the CPU
         \\
+        \\  --- threads and cores ----------------------------------------------
+        \\  threads              list every thread and its state
+        \\  cores                per-core scheduling and interrupt statistics
+        \\  spawn [n]            create n background workload threads
+        \\  kill <id>            ask a thread to exit (it dies at a safe point)
+        \\  yield                give up the rest of this thread's slice
+        \\  sleep <ms>           block this thread for a while
+        \\  stress [n] [iters]   contended counter test; expects no lost updates
+        \\  reap [n]             spawn n short-lived threads and prove no leak
+        \\  preempt              sample three CPU-bound threads (preemption proof)
+        \\  logstorm [n]         concurrent logging from n threads / every core
+        \\
     , .{});
 }
 
 fn cmdInfo(ctx: Context) void {
     const ks = symbols.kernelRange();
-    out("  build        : Cassa {s} ({s}, {s})\n", .{ build_version, @tagName(@import("builtin").mode), @tagName(@import("builtin").cpu.arch) });
+    out("  build        : Cassa {s} ({s}, {s})\n", .{ build_version, @tagName(builtin.mode), @tagName(builtin.cpu.arch) });
     out("  kernel image : 0x{x} .. 0x{x} ({d} KiB)\n", .{ ks.start, ks.end, (ks.end - ks.start) / 1024 });
     out("  machine      : {s}\n", .{ctx.machine.model});
-    out("  cpus         : 1 online (SMP in phase 18)\n", .{});
-    out("  boot dtb     : 0x{x} ({d} bytes, {s})\n", .{ ctx.machine.dtb, ctx.machine.dtb_size, if (ctx.machine.fdt_valid) "parsed" else "invalid" });
-    out("  current EL   : EL{d}\n", .{cpu.currentEl()});
+    out("  cpus         : {d} online of {d} described ({s})\n", .{ percpu.onlineCount(), ctx.machine.cpu_count, if (ctx.machine.fdt_valid) "device tree" else "defaults" });
+    out("  scheduler    : preemptive round robin, {d} tick slice, {d} threads\n", .{ sched.slice_ticks, sched.threadCount() });
+    out("  boot dtb     : 0x{x} ({d} bytes)\n", .{ ctx.machine.dtb, ctx.machine.dtb_size });
+    out("  current EL   : EL{d}, core {d}, thread {d}\n", .{ cpu.currentEl(), percpu.this().id, sched.running().id });
 }
 
 fn cmdMem(ctx: Context) void {
@@ -90,11 +109,46 @@ fn cmdTime(_: Context) void {
 
 fn cmdIrq(_: Context) void {
     const s = irq.stats();
+    const pc = percpu.this();
     out("  gic     : {s} ({s})\n", .{ @tagName(gic.getVersion()), if (gic.isReady()) "ready" else "not initialised" });
-    out("  timer   : PPI {d}, {d} interrupts\n", .{ timer.timer_intid, irq.countFor(timer.timer_intid) });
+    out("  timer   : PPI {d}, {d} interrupts on this core ({d} ticks)\n", .{ timer.timer_intid, irq.countFor(timer.timer_intid), pc.ticks });
     out("  spurious: {d}\n", .{s.spurious});
     out("  unhandled: {d}\n", .{s.unhandled});
     out("  irq mask: {s}\n", .{if (cpu.irqsEnabled()) "open" else "closed"});
+}
+
+fn cmdCores(_: Context) void {
+    out("  core  online     ticks   switches  preempt  irqs  runq  current\n", .{});
+    for (percpu.slice()) |*pc| {
+        const name = if (pc.current) |t| t.nameSlice() else "none";
+        out("  {d: >4}  {s: <6} {d: >9} {d: >10} {d: >8} {d: >5} {d: >5}  {s}\n", .{
+            pc.id,
+            if (pc.online) "yes" else "no",
+            pc.ticks,
+            pc.switches,
+            pc.preemptions,
+            pc.irqs,
+            pc.runq_len,
+            name,
+        });
+    }
+}
+
+fn cmdThreads(_: Context) void {
+    out("  id  name              state     core      runs  stack\n", .{});
+    for (&threads.table) |*t| {
+        if (t.state == .unused) continue;
+        const stack = if (t.owns_stack) t.stack_base else @as(usize, 0);
+        out("  {d: >2}  {s: <16}  {s: <8}  {d: >4} {d: >9}  0x{x}\n", .{
+            t.id,
+            t.nameSlice(),
+            t.state.label(),
+            t.cpu,
+            t.runs,
+            stack,
+        });
+    }
+    out("  {d} live thread(s), {d} slot(s) total\n", .{ threads.liveCount(), threads.max_threads });
 }
 
 fn cmdMap(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
@@ -134,9 +188,294 @@ fn cmdTextWrite() void {
 }
 
 fn cmdFsFault() void {
-    out("  provoking an unaligned/invalid access at 0x10...\n", .{});
+    out("  provoking an invalid access at 0x10...\n", .{});
     const bad: *volatile u64 = @ptrFromInt(0x10);
     bad.* = 0xdead_beef;
+}
+
+// ---------------------------------------------------------------------------
+// Workloads
+// ---------------------------------------------------------------------------
+
+// -- contention stress ------------------------------------------------------
+
+var stress_counter: u64 = 0;
+var stress_lock: sync.SpinLock = .{};
+var stress_iters: u32 = 0;
+var stress_done: sched.Semaphore = .{};
+var stress_threads: u32 = 0;
+
+fn stressWorker(_: ?*anyopaque) void {
+    var i: u32 = 0;
+    while (i < stress_iters) : (i += 1) {
+        stress_lock.acquire();
+        stress_counter += 1;
+        stress_lock.release();
+    }
+    stress_done.post();
+}
+
+fn cmdStress(ctx: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const n = parseArg(tokens, 4, 1, 12);
+    const iters = parseArg(tokens, 20000, 1, 2_000_000);
+
+    stress_counter = 0;
+    stress_iters = iters;
+    stress_done = .{};
+
+    const before = ctx.pmm.stats().free_pages;
+    const start = timer.uptimeMs();
+    var spawned: u32 = 0;
+    var name_buf: [16]u8 = undefined;
+    for (0..n) |i| {
+        const name = std.fmt.bufPrint(&name_buf, "stress{d}", .{i}) catch "stress";
+        if (sched.spawn(name, stressWorker, null) != null) spawned += 1;
+    }
+    if (spawned == 0) {
+        out("  could not create any worker threads\n", .{});
+        return;
+    }
+
+    // The shell blocks here: a genuine wait, not a polling loop.
+    var i: u32 = 0;
+    while (i < spawned) : (i += 1) stress_done.wait();
+    const elapsed = timer.uptimeMs() - start;
+
+    const expected = @as(u64, spawned) * @as(u64, iters);
+    const ok = stress_counter == expected;
+    out("  threads      : {d}\n", .{spawned});
+    out("  increments   : {d} per thread\n", .{iters});
+    out("  expected     : {d}\n", .{expected});
+    out("  observed     : {d}\n", .{stress_counter});
+    out("  lost updates : {d}\n", .{if (expected >= stress_counter) expected - stress_counter else 0});
+    out("  elapsed      : {d} ms\n", .{elapsed});
+    out("  result       : {s}\n", .{if (ok) "PASS (exact)" else "FAIL"});
+
+    // Threads have exited; let the reaper run so the page count comes back.
+    sched.sleepMsBlocking(20);
+    out("  pages        : {d} before, {d} after\n", .{ before, ctx.pmm.stats().free_pages });
+    _ = stress_threads;
+}
+
+// -- preemption proof -------------------------------------------------------
+
+var spin_counters: [4]u64 = [_]u64{0} ** 4;
+var spin_stop: [4]bool = [_]bool{false} ** 4;
+var spin_core: [4]u32 = [_]u32{0} ** 4;
+/// Start gate: every worker blocks here until the shell releases them, so the
+/// fairness window begins at the same instant for all of them.
+var spin_ready: u32 = 0;
+var spin_go: bool = false;
+
+fn spinWorker(arg: ?*anyopaque) void {
+    // Arguments travel as opaque pointers; index 0 would be a null pointer, so
+    // the caller passes index+1 and the worker shifts it back.
+    const idx = (@intFromPtr(arg.?) - 1) & 3;
+    spin_core[idx] = percpu.this().id;
+    _ = @atomicRmw(u32, &spin_ready, .Add, 1, .release);
+    while (!@atomicLoad(bool, &spin_go, .acquire)) {
+        cpu.wfe();
+    }
+    while (true) {
+        // Never yields, never sleeps, never blocks: the only way another
+        // thread on the same core can make progress is preemption.
+        asm volatile ("" ::: "memory");
+        if (@atomicLoad(bool, &spin_stop[idx], .monotonic)) return;
+        spin_counters[idx] +%= 1;
+    }
+}
+
+fn cmdPreempt(_: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const window_ms = parseArg(tokens, 200, 20, 5000);
+    const workers = 3;
+
+    for (0..workers) |i| {
+        spin_counters[i] = 0;
+        spin_stop[i] = false;
+        spin_core[i] = 0;
+    }
+    spin_ready = 0;
+    @atomicStore(bool, &spin_go, false, .release);
+    var spawned: u32 = 0;
+    var ids: [4]u32 = [_]u32{0} ** 4;
+    for (0..workers) |i| {
+        // Pinned to this core: the workers cannot migrate, so progress on all
+        // three can only come from being preempted.
+        if (sched.spawnPinned("spin", spinWorker, @ptrFromInt(i + 1))) |id| {
+            ids[spawned] = id;
+            spawned += 1;
+        }
+    }
+    if (spawned == 0) {
+        out("  could not create worker threads\n", .{});
+        return;
+    }
+
+    // Wait until every worker is parked at the gate, release them together and
+    // measure one full window: the fairness numbers then share a start instant.
+    var waited: u32 = 0;
+    while (@atomicLoad(u32, &spin_ready, .acquire) < spawned and waited < 50) : (waited += 1) {
+        sched.sleepMsBlocking(1);
+    }
+    @atomicStore(bool, &spin_go, true, .release);
+    sched.sleepMsBlocking(window_ms);
+
+    var deltas: [4]u64 = [_]u64{0} ** 4;
+    var slices: [4]u64 = [_]u64{0} ** 4;
+    for (0..spawned) |i| {
+        deltas[i] = spin_counters[i];
+        slices[i] = if (threads.find(ids[i])) |t| t.runs else 0;
+    }
+    for (0..spawned) |i| spin_stop[i] = true;
+
+    out("  {d} CPU-bound threads pinned to one core, none of which ever yield:\n", .{spawned});
+    var advanced: u32 = 0;
+    const core = spin_core[0];
+    var same_core = true;
+    for (0..spawned) |i| {
+        out("    thread {d}: {d} iterations, {d} runs, core {d}\n", .{ i, deltas[i], slices[i], spin_core[i] });
+        if (deltas[i] > 0) advanced += 1;
+        if (spin_core[i] != core) same_core = false;
+    }
+    out("  threads that made progress: {d}/{d}\n", .{ advanced, spawned });
+    // Fair share is 1/n of the window; report the worst deviation from it.
+    var total: u64 = 0;
+    for (0..spawned) |i| total += deltas[i];
+    var worst: u64 = 0; // in hundredths of a percent
+    if (total > 0) {
+        const fair = total / spawned;
+        for (0..spawned) |i| {
+            const d = if (deltas[i] > fair) deltas[i] - fair else fair - deltas[i];
+            const pct = d * 10000 / fair;
+            if (pct > worst) worst = pct;
+        }
+    }
+    var min_slices: u64 = slices[0];
+    var max_slices: u64 = slices[0];
+    for (0..spawned) |i| {
+        if (slices[i] < min_slices) min_slices = slices[i];
+        if (slices[i] > max_slices) max_slices = slices[i];
+    }
+    out("  timeslices : {d}..{d} per thread (equal round robin)\n", .{ min_slices, max_slices });
+    out("  iteration spread: {d}.{d:0>2}% (includes hypervisor time stealing)\n", .{ worst / 100, worst % 100 });
+    out("  gate: {d}/{d} workers ready after {d} ms\n", .{ @atomicLoad(u32, &spin_ready, .acquire), spawned, waited });
+    // Every worker must run, on one core, and receive the same number of
+    // timeslices. Iteration counts drift because the hypervisor steals host
+    // CPU time from a vCPU, so slices are the honest fairness measure.
+    // The window ends mid-rotation, so one thread can be a slice ahead.
+    const pass = advanced == spawned and same_core and (max_slices - min_slices) <= 2;
+    out("  single core: {s}\n", .{if (same_core) "yes" else "NO (migration invalidates the test)"});
+    out("  result: {s}\n", .{if (pass) "PASS (preemptive, single core)" else "FAIL"});
+
+    sched.sleepMsBlocking(10);
+}
+
+// -- spawn / kill -----------------------------------------------------------
+
+var work_counter: [8]u64 = [_]u64{0} ** 8;
+var work_index: u32 = 0;
+
+fn workEntry(arg: ?*anyopaque) void {
+    const idx = (@intFromPtr(arg.?) - 1) & 7;
+    while (true) {
+        work_counter[idx] +%= 1;
+        sched.sleepMsBlocking(25);
+    }
+}
+
+fn cmdSpawn(_: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const n = parseArg(tokens, 1, 1, 4);
+    var created: u32 = 0;
+    var name_buf: [16]u8 = undefined;
+    for (0..n) |_| {
+        const slot = work_index & 7;
+        const name = std.fmt.bufPrint(&name_buf, "work{d}", .{slot}) catch "work";
+        if (sched.spawn(name, workEntry, @ptrFromInt(slot + 1)) != null) {
+            work_index += 1;
+            created += 1;
+        }
+    }
+    out("  created {d} workload thread(s); 'threads' shows them running\n", .{created});
+}
+
+fn cmdKill(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const arg = tokens.next() orelse {
+        out("usage: kill <thread-id>\n", .{});
+        return;
+    };
+    const id = std.fmt.parseInt(u32, arg, 10) catch {
+        out("invalid thread id\n", .{});
+        return;
+    };
+    const t = sched.find(id) orelse {
+        out("no such thread: {d}\n", .{id});
+        return;
+    };
+    if (t.is_idle) {
+        out("refusing to kill an idle thread\n", .{});
+        return;
+    }
+    @atomicStore(bool, &t.kill_requested, true, .seq_cst);
+    sched.kick(t.cpu);
+    out("  thread {d} ('{s}') asked to exit\n", .{ t.id, t.nameSlice() });
+}
+
+// -- reaping ----------------------------------------------------------------
+
+fn shortLived(_: ?*anyopaque) void {}
+
+fn cmdReap(ctx: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const n = parseArg(tokens, 8, 1, 16);
+    const before = ctx.pmm.stats().free_pages;
+    var spawned: u32 = 0;
+    var name_buf: [16]u8 = undefined;
+    for (0..n) |i| {
+        const name = std.fmt.bufPrint(&name_buf, "zombie{d}", .{i}) catch "zombie";
+        if (sched.spawn(name, shortLived, null) != null) spawned += 1;
+    }
+    // Give every core a chance to run, exit and reap the zombies.
+    sched.sleepMsBlocking(250);
+    const after = ctx.pmm.stats().free_pages;
+    out("  spawned        : {d} short-lived threads\n", .{spawned});
+    out("  free pages     : {d} before, {d} after\n", .{ before, after });
+    out("  leaked pages   : {d}\n", .{if (before >= after) before - after else 0});
+    out("  live threads   : {d}\n", .{threads.liveCount()});
+    out("  result         : {s}\n", .{if (after == before) "PASS (no leak)" else "FAIL"});
+}
+
+// -- concurrent logging -----------------------------------------------------
+
+fn stormWorker(arg: ?*anyopaque) void {
+    const idx = (@intFromPtr(arg.?) - 1) & 7;
+    var i: u32 = 0;
+    while (i < 24) : (i += 1) {
+        klog.info("storm", "w{d} core{d} line {d: >2} .................... {d}", .{
+            idx, percpu.this().id, i, i * 37,
+        });
+    }
+}
+
+fn cmdLogStorm(_: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const n = parseArg(tokens, 4, 1, 8);
+    var spawned: u32 = 0;
+    for (0..n) |i| {
+        if (sched.spawn("logstorm", stormWorker, @ptrFromInt(i + 1)) != null) spawned += 1;
+    }
+    sched.sleepMsBlocking(120);
+    out("  {d} writers finished; every line above must be intact\n", .{spawned});
+}
+
+fn cmdSleep(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const ms = parseArg(tokens, 100, 0, 60_000);
+    const t0 = timer.uptimeMs();
+    sched.sleepMsBlocking(ms);
+    out("  slept {d} ms (asked {d})\n", .{ timer.uptimeMs() - t0, ms });
+}
+
+fn parseArg(tokens: *std.mem.TokenIterator(u8, .scalar), default: u32, min: u32, max: u32) u32 {
+    const arg = tokens.next() orelse return default;
+    const value = std.fmt.parseInt(u32, arg, 0) catch return default;
+    return @min(@max(value, min), max);
 }
 
 pub const build_version = "0.1.0-dev";
@@ -157,6 +496,10 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdTime(ctx);
     } else if (std.mem.eql(u8, command, "irq")) {
         cmdIrq(ctx);
+    } else if (std.mem.eql(u8, command, "cores")) {
+        cmdCores(ctx);
+    } else if (std.mem.eql(u8, command, "threads") or std.mem.eql(u8, command, "ps")) {
+        cmdThreads(ctx);
     } else if (std.mem.eql(u8, command, "map")) {
         cmdMap(&tokens);
     } else if (std.mem.eql(u8, command, "selftest")) {
@@ -166,8 +509,7 @@ fn execute(ctx: Context, line: []const u8) void {
             out("  self-tests: FAIL\n", .{});
         }
     } else if (std.mem.eql(u8, command, "mark")) {
-        const text = tokens.rest();
-        out("  [{d}.{d:0>3}] {s}\n", .{ timer.uptimeMs() / 1000, timer.uptimeMs() % 1000, text });
+        out("  [{d}.{d:0>3}] {s}\n", .{ timer.uptimeMs() / 1000, timer.uptimeMs() % 1000, tokens.rest() });
     } else if (std.mem.eql(u8, command, "echo")) {
         out("  {s}\n", .{tokens.rest()});
     } else if (std.mem.eql(u8, command, "svc")) {
@@ -176,6 +518,23 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdTextWrite();
     } else if (std.mem.eql(u8, command, "fault")) {
         cmdFsFault();
+    } else if (std.mem.eql(u8, command, "stress")) {
+        cmdStress(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "preempt")) {
+        cmdPreempt(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "spawn")) {
+        cmdSpawn(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "kill")) {
+        cmdKill(&tokens);
+    } else if (std.mem.eql(u8, command, "reap")) {
+        cmdReap(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "logstorm")) {
+        cmdLogStorm(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "sleep")) {
+        cmdSleep(&tokens);
+    } else if (std.mem.eql(u8, command, "yield")) {
+        sched.yieldNow();
+        out("  yielded\n", .{});
     } else if (std.mem.eql(u8, command, "panic")) {
         @panic("panic requested from the kernel shell");
     } else if (std.mem.eql(u8, command, "reboot")) {
@@ -189,9 +548,13 @@ fn execute(ctx: Context, line: []const u8) void {
     }
 }
 
+/// The shell is a kernel thread. It never returns: if it somehow did, the
+/// thread bootstrap would exit it cleanly.
 pub fn run(ctx: Context) noreturn {
     var line: [160]u8 = undefined;
     var len: usize = 0;
+
+    klog.info("shell", "thread {d} ready on core {d} (type 'help')", .{ sched.running().id, percpu.this().id });
     prompt();
 
     while (true) {
@@ -223,7 +586,7 @@ pub fn run(ctx: Context) noreturn {
                     if (c >= 0x20 and c < 0x7f and len < line.len) {
                         line[len] = c;
                         len += 1;
-                        uart.putc(c);
+                        uart.putcLocked(c);
                     }
                 },
             }

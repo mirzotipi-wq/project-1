@@ -89,9 +89,19 @@ fn initV2(dist: usize, cpu_if: usize) void {
 }
 
 fn waitForWake() void {
-    var guard: u32 = 1_000_000;
-    while ((mmio32(redist_base + GICR_WAKER).* & WAKER_CHILDREN_ASLEEP) != 0 and guard > 0) : (guard -= 1) {}
+    waitForWakeAt(redist_base);
 }
+
+fn waitForWakeAt(base: usize) void {
+    var guard: u32 = 1_000_000;
+    while ((mmio32(base + GICR_WAKER).* & WAKER_CHILDREN_ASLEEP) != 0 and guard > 0) : (guard -= 1) {}
+}
+
+/// GICv3 redistributors are laid out in memory with a fixed stride; the
+/// architecture leaves the size up to the implementation (SGI frames make it
+/// 128 KiB on some parts, 256 KiB on others). QEMU's `virt` machine uses
+/// 0x20000, and the device tree's `reg` entry describes exactly one of them.
+const redist_stride_v3: usize = 0x2_0000;
 
 fn initV3(dist: usize, redist: usize) void {
     dist_base = dist;
@@ -199,13 +209,60 @@ pub fn endOfInterrupt(intid: u32) void {
     }
 }
 
-/// Send a software-generated interrupt to one core (used by SMP bring-up).
-pub fn sendSgi(target_affinity: u64, intid: u32) void {
+// ---------------------------------------------------------------------------
+// Per-core bring-up
+// ---------------------------------------------------------------------------
+
+/// Initialise the calling core's interrupt interface. Must run on each core:
+/// the distributor is global, the CPU interface (v2) and redistributor (v3) are
+/// not. Both generations also leave the timer PPI and the reschedule SGI
+/// enabled locally here, because for v3 the enable bits live in the
+/// redistributor that belongs to this core.
+pub fn initCpu(index: u32) void {
     if (!initialized) return;
-    const value = ((target_affinity & 0xFF) << 24) | (intid & 0xF);
     switch (version) {
-        .v2 => mmio32(dist_base + 0xF00).* = @intCast(value),
-        .v3 => cpu.sysWrite("icc_sgi1r_el1", value),
+        .v2 => {
+            mmio32(cpu_base + GICC_PMR).* = 0xF0;
+            mmio32(cpu_base + GICC_CTLR).* = 1;
+            distWrite(GICD_ISENABLER + 0, (1 << 30) | 1);
+            distWrite(GICD_IPRIORITYR + 96, 0xA0A0_A0A0);
+            distWrite(GICD_IPRIORITYR + 0, 0xA0A0_A0A0);
+        },
+        .v3 => {
+            const rb = redist_base + @as(usize, index) * redist_stride_v3;
+            mmio32(rb + GICR_WAKER).* &= ~WAKER_PROCESSOR_SLEEP;
+            waitForWakeAt(rb);
+
+            cpu.sysWrite("icc_sre_el1", 0x7);
+            cpu.isb();
+            cpu.sysWrite("icc_pmr_el1", 0xFF);
+            cpu.sysWrite("icc_ctlr_el1", 0);
+            cpu.sysWrite("icc_igrpen1_el1", 1);
+            cpu.isb();
+
+            mmio32(rb + GICR_IGROUPR0).* = 0xFFFF_FFFF;
+            mmio32(rb + GICR_ISENABLER0).* = (1 << 30) | 1;
+        },
+    }
+}
+
+/// Send a software-generated interrupt to one core (SGI 0 is the reschedule
+/// IPI). The target is an Aff0 value, i.e. the core number within its cluster,
+/// which is what the device tree's MPIDR gives us for cores 0..N on every
+/// current multi-core AArch64 part.
+pub fn sendSgi(target_aff0: u64, intid: u32) void {
+    if (!initialized) return;
+    switch (version) {
+        .v2 => {
+            const value: u32 = (@as(u32, @intCast(target_aff0 & 0xFF)) << 24) | (intid & 0xF);
+            mmio32(dist_base + 0xF00).* = value;
+        },
+        .v3 => {
+            const value: u64 = (target_aff0 << 16) |
+                (@as(u64, intid) << 24) |
+                (@as(u64, 1) << @intCast(target_aff0 & 0xF));
+            cpu.sysWrite("icc_sgi1r_el1", value);
+        },
     }
 }
 

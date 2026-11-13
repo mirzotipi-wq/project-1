@@ -12,6 +12,10 @@ const klog = @import("klog.zig");
 
 pub const GicKind = enum { v2, v3 };
 
+/// How firmware exposes PSCI. The device tree says which instruction to use;
+/// guessing wrong hangs the core instead of failing cleanly.
+pub const PsciMethod = enum { none, hvc, smc };
+
 pub const Machine = struct {
     model: []const u8 = "unknown (no device tree)",
     ram_base: usize = 0x4000_0000,
@@ -26,6 +30,13 @@ pub const Machine = struct {
     dtb_size: usize = 0,
     fdt_valid: bool = false,
     bootargs: []const u8 = "",
+
+    // ---- SMP discovery -----------------------------------------------------
+    /// Cores described by the device tree (clamped to the kernel's CPU table).
+    cpu_count: u8 = 1,
+    /// MPIDR of each core, in device-tree order. Core 0 is the boot CPU.
+    cpu_mpidr: [8]u64 = [_]u64{0} ** 8,
+    psci: PsciMethod = .none,
 };
 
 fn readBe32(bytes: []const u8, off: usize) u32 {
@@ -99,6 +110,37 @@ pub fn detect(dtb_addr: usize) Machine {
         }
     }
 
+    // SMP: how to release the secondaries, and who they are.
+    if (tree.findByName("psci")) |psci| {
+        if (tree.prop(psci, "method")) |raw| {
+            const method = std.mem.trimRight(u8, raw, "\x00");
+            if (std.mem.eql(u8, method, "hvc")) {
+                m.psci = .hvc;
+            } else if (std.mem.eql(u8, method, "smc")) {
+                m.psci = .smc;
+            }
+        }
+    }
+
+    if (tree.findByName("cpus")) |cpus| {
+        var count: usize = 0;
+        var child = tree.firstChild(cpus);
+        while (child) |c| : (child = tree.nextSibling(c)) {
+            if (count >= m.cpu_mpidr.len) break;
+            if (!std.mem.startsWith(u8, tree.name(c), "cpu@")) continue;
+            // A /cpus child has a single address cell containing the MPIDR.
+            const reg = tree.prop(c, "reg") orelse {
+                m.cpu_mpidr[count] = count;
+                count += 1;
+                continue;
+            };
+            if (reg.len < 4) continue;
+            m.cpu_mpidr[count] = readBe32(reg, 0);
+            count += 1;
+        }
+        if (count > 0) m.cpu_count = @intCast(count);
+    }
+
     return m;
 }
 
@@ -109,5 +151,6 @@ pub fn describe(m: *const Machine) void {
     klog.info("machine", "uart:  0x{x} @ {d} Hz", .{ m.uart_base, m.uart_clock });
     klog.info("machine", "gic:   {s} dist=0x{x} second=0x{x}", .{ @tagName(m.gic_kind), m.gic_dist, m.gic_second });
     klog.info("machine", "timer: {d} Hz counter", .{m.timer_freq});
+    klog.info("machine", "cpus:  {d} described, PSCI {s}", .{ m.cpu_count, @tagName(m.psci) });
     if (m.bootargs.len > 0) klog.info("machine", "cmdline: {s}", .{m.bootargs});
 }

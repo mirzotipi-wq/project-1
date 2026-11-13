@@ -10,6 +10,8 @@ const cpu = @import("../arch/aarch64/cpu.zig");
 const uart = @import("../devices/pl011.zig");
 const klog = @import("klog.zig");
 const symbols = @import("symbols.zig");
+const sched = @import("sched.zig");
+const smp = @import("smp.zig");
 
 fn readSp() usize {
     return asm volatile ("mov %[out], sp"
@@ -30,9 +32,19 @@ fn dumpCapturedLog() void {
     uart.writeAll("--- end of log ---\n");
 }
 
+fn dumpSchedulerTrace() void {
+    var buf: [8192]u8 = undefined;
+    const text = sched.traceDump(&buf);
+    if (text.len == 0) return;
+    uart.writeAllRaw("--- ");
+    uart.writeAllRaw(text);
+    uart.writeAllRaw("--- end of trace ---\n");
+}
+
 /// Entry point for Zig's panic interface (`std.debug.FullPanic`).
 pub fn hook(msg: []const u8, first_trace_addr: ?usize) noreturn {
     cpu.allInterruptsDisable();
+    smp.stopOtherCores();
     uart.writeAll("\n\n");
     uart.writeAll("==================== CASSA KERNEL PANIC ====================\n");
     uart.writeAll("  message     : ");
@@ -43,8 +55,9 @@ pub fn hook(msg: []const u8, first_trace_addr: ?usize) noreturn {
     hexLine("SP", readSp());
     hexLine("SPSR_EL1", cpu.sysRead("spsr_el1"));
     hexLine("kernel base", @intFromPtr(&symbols.__kernel_start));
-    if (first_trace_addr) |addr| hexLine("first frame", addr);
+    if (first_trace_addr) |addr|     hexLine("first frame", addr);
     uart.writeAll("===========================================================\n");
+    dumpSchedulerTrace();
     dumpCapturedLog();
     uart.writeAll("*** CPU halted ***\n");
     uart.flush();
@@ -54,6 +67,7 @@ pub fn hook(msg: []const u8, first_trace_addr: ?usize) noreturn {
 /// Print a structured fault report, then halt. Used by the exception layer.
 pub fn faultReport(header: []const u8, body: []const u8) noreturn {
     cpu.allInterruptsDisable();
+    smp.stopOtherCores();
     uart.writeAll("\n\n");
     uart.writeAll("=================== CASSA KERNEL FAULT =====================\n");
     uart.writeAll("  ");
@@ -67,6 +81,7 @@ pub fn faultReport(header: []const u8, body: []const u8) noreturn {
         uart.writeAll("\n");
     }
     uart.writeAll("===========================================================\n");
+    dumpSchedulerTrace();
     dumpCapturedLog();
     uart.writeAll("*** CPU halted ***\n");
     uart.flush();

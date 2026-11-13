@@ -136,12 +136,15 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&bin_install.step);
 
     const qemu = b.option([]const u8, "qemu", "QEMU executable") orelse "qemu-system-aarch64";
+    // Four cores by default: the scheduler and the IPI path are exercised by
+    // the normal development run, not by a special one.
+    const smp = b.option([]const u8, "smp", "CPUs for the QEMU run steps") orelse "4";
     const run_cmd = b.addSystemCommand(&.{
         qemu,
         "-machine", "virt",
         "-cpu",   "cortex-a53",
         "-m",     "512M",
-        "-smp",   "1",
+        "-smp",   smp,
         "-nographic",
         "-serial", "mon:stdio",
         "-nic",    "none",
@@ -158,7 +161,7 @@ pub fn build(b: *std.Build) void {
         "-machine", "virt",
         "-cpu",   "cortex-a53",
         "-m",     "512M",
-        "-smp",   "1",
+        "-smp",   smp,
         "-nographic",
         "-serial", "mon:stdio",
         "-nic",    "none",

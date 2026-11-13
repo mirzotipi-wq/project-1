@@ -4,6 +4,7 @@
 //! this driver has no dependencies and never blocks forever.
 
 const cpu = @import("../../arch/aarch64/cpu.zig");
+const sync = @import("../kernel/sync.zig");
 
 const Reg = enum(u32) {
     dr = 0x000,
@@ -95,6 +96,11 @@ pub const Pl011 = struct {
 
 var console: ?Pl011 = null;
 
+/// One line of console output must arrive as one line, even when four cores
+/// log at once. The lock masks IRQs on the calling core, so the only wait is
+/// for another core that is already inside `writeAll` — it always finishes.
+var console_lock: sync.IrqSpinLock = .{};
+
 pub fn install(uart: Pl011) void {
     console = uart;
 }
@@ -108,7 +114,22 @@ pub fn putc(c: u8) void {
 }
 
 pub fn writeAll(bytes: []const u8) void {
+    const flags = console_lock.acquire();
+    defer console_lock.release(flags);
     if (console) |uart| uart.writeAll(bytes);
+}
+
+/// Lock-free write for the panic path, which may already hold the lock on this
+/// core (or be running on a core that died inside it).
+pub fn writeAllRaw(bytes: []const u8) void {
+    if (console) |uart| uart.writeAll(bytes);
+}
+
+/// Echo one character typed by the user, serialised against log output.
+pub fn putcLocked(c: u8) void {
+    const flags = console_lock.acquire();
+    defer console_lock.release(flags);
+    if (console) |uart| uart.putc(c);
 }
 
 pub fn tryGetc() ?u8 {

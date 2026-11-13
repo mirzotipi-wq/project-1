@@ -8,6 +8,7 @@
 const std = @import("std");
 const uart = @import("../devices/pl011.zig");
 const cpu = @import("../arch/aarch64/cpu.zig");
+const sync = @import("sync.zig");
 
 pub const Level = enum(u8) {
     err = 0,
@@ -57,6 +58,11 @@ const ring_capacity = 16 * 1024;
 var ring: [ring_capacity]u8 = undefined;
 var ring_len: usize = 0;
 var ring_head: usize = 0;
+
+/// Serialises formatting-to-console-plus-ring so the captured log is byte-for-
+/// byte what appeared on the console, from any core. IRQs off: a tick handler
+/// must never find this lock held by the thread it interrupted on this core.
+var log_lock: sync.IrqSpinLock = .{};
 
 fn ringAppend(bytes: []const u8) void {
     for (bytes) |b| {
@@ -114,8 +120,12 @@ fn emit(comptime level: Level, comptime scope: []const u8, comptime fmt: []const
     std.fmt.format(writer, fmt, args) catch {};
     _ = w.writeFn("\n") catch 0;
 
+    // One critical section for console and ring, so the captured post-mortem
+    // log is exactly what the operator saw, even with four cores logging.
+    const flags = log_lock.acquire();
     uart.writeAll(w.buf[0..w.len]);
     ringAppend(w.buf[0..w.len]);
+    log_lock.release(flags);
 }
 
 pub fn err(comptime scope: []const u8, comptime fmt: []const u8, args: anytype) void {

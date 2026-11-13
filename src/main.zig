@@ -26,11 +26,19 @@ const heap = @import("kernel/heap.zig");
 const shell = @import("kernel/shell.zig");
 const symbols = @import("kernel/symbols.zig");
 const panicHook = @import("kernel/panic.zig");
+const percpu = @import("kernel/percpu.zig");
+const sched = @import("kernel/sched.zig");
+const smp = @import("kernel/smp.zig");
 
 /// Global kernel state. Single-core for now; phase 18 moves these per-CPU.
 var g_machine: machine.Machine = undefined;
 var g_pmm: Pmm.PageAllocator = undefined;
 var g_heap: heap.Heap = undefined;
+var g_shell_ctx: shell.Context = undefined;
+
+fn shellEntry(_: ?*anyopaque) void {
+    shell.run(g_shell_ctx);
+}
 
 const boot_stack_size = 32 * 1024;
 var boot_stack: [boot_stack_size]u8 align(16) = undefined;
@@ -170,6 +178,11 @@ fn reportSelfTest(ok: bool, p: *Pmm.PageAllocator, h: *heap.Heap) bool {
 pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     cpu.allInterruptsDisable();
     cpu.enableFp();
+    // Bind this core to its per-CPU block before anything can fault, so even
+    // an early exception report knows which core it came from.
+    percpu.bindSelf(0);
+    percpu.cpus[0].id = 0;
+    percpu.cpus[0].online = true;
     setupSp0();
 
     klog.setCounterFrequency(cpu.cntFrq());
@@ -255,18 +268,37 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
         cpu.halt();
     };
 
+    // The scheduler must exist before the first interrupt can arrive: the tick
+    // handler assumes `current` is valid on whichever core takes it. Secondary
+    // cores are released here too, so every core that can take a tick already
+    // has an idle thread and a bound per-CPU block.
+    sched.init(&g_pmm);
+    smp.startAll(&g_machine);
+
     cpu.irqEnable();
     klog.info("boot", "interrupts unmasked; boot complete", .{});
 
     const ok = runSelfTest(&g_pmm, &g_heap);
     if (!ok) klog.warn("boot", "one or more boot self-tests failed", .{});
 
-    shell.run(.{
+    g_shell_ctx = .{
         .machine = &g_machine,
         .pmm = &g_pmm,
         .heap = &g_heap,
         .selftest = runSelfTest,
+    };
+    if (sched.spawn("shell", shellEntry, null) == null) {
+        klog.err("boot", "could not create the shell thread", .{});
+        cpu.halt();
+    }
+    klog.info("boot", "scheduler running: {d} core(s), {d} thread(s)", .{
+        percpu.onlineCount(),
+        sched.threadCount(),
     });
+
+    // The boot context retires here; this core's idle thread takes over and the
+    // shell runs as an ordinary preemptible thread.
+    sched.exitCurrent();
 }
 
 /// Deliberate fault used by the shell to prove the exception path works.

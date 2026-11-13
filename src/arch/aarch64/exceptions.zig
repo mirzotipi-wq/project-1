@@ -1,7 +1,8 @@
-//! AArch64 exception vectors, trap frames and fault decoding (phase 10).
+//! AArch64 exception vectors, trap frames and fault decoding (phase 10),
+//! extended in phase 15 into the scheduler's context-switch boundary.
 //!
 //! The vector table and its 16 entry trampolines are generated at comptime as
-//! one inline-assembly blob inside a Zig function. This matters for two
+//! one inline-assembly blob inside a Zig function. This matters for three
 //! reasons:
 //!
 //!   * The table lives in `.text`, so it is executable while `.bss`/`.data` stay
@@ -9,6 +10,9 @@
 //!   * Each trampoline knows its own vector index as an immediate, so no
 //!     register is sacrificed to carry it. Clobbering x9 before saving it would
 //!     silently corrupt interrupted code.
+//!   * The dispatcher returns the frame to resume, so the assembler side never
+//!     has to know that a context switch happened. `mov sp, x0` is the entire
+//!     switch.
 //!
 //! Vector index layout (architectural):
 //!   0-3   current EL with SP0   : sync, irq, fiq, serror
@@ -21,16 +25,39 @@ const cpu = @import("cpu.zig");
 const trap = @import("trap.zig");
 const irq = @import("../../kernel/irq.zig");
 const panic = @import("../../kernel/panic.zig");
+const sched = @import("../../kernel/sched.zig");
+const syscall = @import("../../kernel/syscall.zig");
+const percpu = @import("../../kernel/percpu.zig");
 
 pub const Frame = trap.Frame;
 
 /// Defined by the generated assembly below; VBAR_EL1 points here.
 extern const cassa_vectors: u8;
 
-const frame_size = 272;
+fn saveSimd() []const u8 {
+    var text: []const u8 = "";
+    for (0..16) |pair| {
+        text = text ++ std.fmt.comptimePrint(
+            "stp q{d}, q{d}, [sp, #{d}]\n",
+            .{ pair * 2, pair * 2 + 1, trap.simd_offset + pair * 16 },
+        );
+    }
+    return text;
+}
 
-const save_asm =
-    \\sub sp, sp, #272
+fn restoreSimd() []const u8 {
+    var text: []const u8 = "";
+    for (0..16) |pair| {
+        text = text ++ std.fmt.comptimePrint(
+            "ldp q{d}, q{d}, [sp, #{d}]\n",
+            .{ pair * 2, pair * 2 + 1, trap.simd_offset + pair * 16 },
+        );
+    }
+    return text;
+}
+
+const save_asm = std.fmt.comptimePrint(
+    \\sub sp, sp, #{d}
     \\stp x0, x1, [sp, #0]
     \\stp x2, x3, [sp, #16]
     \\stp x4, x5, [sp, #32]
@@ -51,13 +78,17 @@ const save_asm =
     \\str x0, [sp, #248]
     \\mrs x0, spsr_el1
     \\stp x0, xzr, [sp, #256]
-;
+    \\
+, .{trap.size}) ++ saveSimd();
 
-const restore_asm =
+const restore_asm = std.fmt.comptimePrint(
     \\ldr x0, [sp, #248]
     \\msr elr_el1, x0
     \\ldp x0, xzr, [sp, #256]
     \\msr spsr_el1, x0
+    \\
+, .{}) ++ restoreSimd() ++ std.fmt.comptimePrint(
+    \\
     \\ldp x0, x1, [sp, #0]
     \\ldp x2, x3, [sp, #16]
     \\ldp x4, x5, [sp, #32]
@@ -74,9 +105,10 @@ const restore_asm =
     \\ldp x26, x27, [sp, #208]
     \\ldp x28, x29, [sp, #224]
     \\ldr x30, [sp, #240]
-    \\add sp, sp, #272
+    \\add sp, sp, #{d}
     \\eret
-;
+    \\
+, .{trap.size});
 
 fn vectorAsm() []const u8 {
     var text: []const u8 = " .balign 2048\n.global cassa_vectors\ncassa_vectors:\n";
@@ -86,9 +118,15 @@ fn vectorAsm() []const u8 {
     }
     for (0..16) |i| {
         text = text ++ std.fmt.comptimePrint("cassa_tramp{d}:\n", .{i});
-        text = text ++ save_asm ++ "\n";
-        text = text ++ std.fmt.comptimePrint("mov x0, #{d}\nmov x1, sp\nbl cassa_exception_dispatch\n", .{i});
-        text = text ++ restore_asm ++ "\n";
+        text = text ++ save_asm;
+        text = text ++ std.fmt.comptimePrint(
+            \\mov x0, #{d}
+            \\mov x1, sp
+            \\bl cassa_exception_dispatch
+            \\mov sp, x0
+            \\
+        , .{i});
+        text = text ++ restore_asm;
     }
     return text;
 }
@@ -99,9 +137,8 @@ export fn cassa_vector_entries() callconv(.Naked) noreturn {
 }
 
 /// Point VBAR_EL1 at the table. Safe with the MMU on: the table is read-only
-/// and executable, and never patched at runtime.
+/// and executable, and never patched at runtime. Per-core register.
 pub fn init() void {
-    comptime std.debug.assert(frame_size == @sizeOf(Frame) + 8);
     cpu.sysWrite("vbar_el1", @intFromPtr(&cassa_vectors));
     cpu.isb();
 }
@@ -139,25 +176,31 @@ fn esrDescription(ec: u64) []const u8 {
     };
 }
 
+/// DFSC/IFSC encoding (ARM ARM D13.2.37). The low two bits are the translation
+/// level for the first four classes; getting this table wrong turns a W^X
+/// permission fault into a confusing "access flag" report, which is exactly
+/// what happened before this was corrected.
 fn faultStatusName(fsc: u64) []const u8 {
     return switch (fsc & 0x3F) {
         0b000000 => "address size fault, level 0",
-        0b000100 => "address size fault, level 1",
-        0b000101 => "address size fault, level 2",
-        0b000110 => "address size fault, level 3",
-        0b000111 => "translation fault, level 0",
-        0b001001 => "translation fault, level 1",
-        0b001010 => "translation fault, level 2",
-        0b001011 => "translation fault, level 3",
-        0b001101 => "access flag fault, level 1",
-        0b001110 => "access flag fault, level 2",
-        0b001111 => "access flag fault, level 3",
-        0b010001 => "synchronous external abort",
+        0b000001 => "address size fault, level 1",
+        0b000010 => "address size fault, level 2",
+        0b000011 => "address size fault, level 3",
+        0b000100 => "translation fault, level 0",
+        0b000101 => "translation fault, level 1",
+        0b000110 => "translation fault, level 2",
+        0b000111 => "translation fault, level 3",
+        0b001000 => "access flag fault, level 0",
+        0b001001 => "access flag fault, level 1",
+        0b001010 => "access flag fault, level 2",
+        0b001011 => "access flag fault, level 3",
+        0b001100 => "permission fault, level 0",
+        0b001101 => "permission fault, level 1",
+        0b001110 => "permission fault, level 2",
+        0b001111 => "permission fault, level 3",
+        0b010000 => "synchronous external abort",
         0b100001 => "alignment fault",
-        0b110000 => "permission fault, level 0",
-        0b110101 => "permission fault, level 1",
-        0b110110 => "permission fault, level 2",
-        0b110111 => "permission fault, level 3",
+        0b110000 => "TLB conflict abort",
         else => "abort with unknown status",
     };
 }
@@ -204,24 +247,37 @@ fn formatFault(index: usize, frame: *const Frame, esr: u64, far: u64) noreturn {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-export fn cassa_exception_dispatch(kind: u64, frame: *Frame) callconv(.C) void {
+/// Called by every trampoline with the vector index and the frame it just
+/// built. Returns the frame to resume — the same one for an ordinary
+/// interrupt, or another thread's after a context switch.
+export fn cassa_exception_dispatch(kind: u64, frame: *Frame) callconv(.C) *Frame {
     const index: usize = @intCast(kind & 0xF);
-    const esr = cpu.sysRead("esr_el1");
+    percpu.this().irqs += 1;
 
     switch (index) {
         // IRQ from any source.
-        1, 5, 9, 13 => irq.dispatch(),
+        1, 5, 9, 13 => {
+            irq.dispatch();
+            return sched.preempt(frame);
+        },
         // Synchronous exceptions.
         0, 4, 8, 12 => {
+            const esr = cpu.sysRead("esr_el1");
             if (exceptionClass(esr) == 0x15) {
-                const number = esr & 0xFFFF;
-                @import("../../kernel/syscall.zig").handle(number, frame);
-                return;
+                // On AArch64 a supervisor call is not restartable: ELR_EL1
+                // already holds the address of the instruction after the SVC.
+                // Advancing it here would skip one instruction of the caller —
+                // which silently skipped the `ldp x29, x30, [sp], #16` that
+                // restores a callee's frame, so the callee returned into
+                // whatever happened to be in x30.
+                const action = syscall.handle(esr & 0xFFFF, frame);
+                if (action == .reschedule) return sched.reschedule(frame);
+                return frame;
             }
             formatFault(index, frame, esr, cpu.sysRead("far_el1"));
         },
         // FIQ and SError are not expected yet, but must never be silent.
-        else => formatFault(index, frame, esr, cpu.sysRead("far_el1")),
+        else => formatFault(index, frame, cpu.sysRead("esr_el1"), cpu.sysRead("far_el1")),
     }
 }
 

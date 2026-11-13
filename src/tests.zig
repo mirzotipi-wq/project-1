@@ -14,6 +14,8 @@ test {
     _ = @import("arch/aarch64/trap.zig");
     _ = @import("devices/pl011.zig");
     _ = @import("kernel/klog.zig");
+    _ = @import("kernel/sync.zig");
+    _ = @import("kernel/thread.zig");
 }
 
 test "seeded prng is deterministic across runs" {

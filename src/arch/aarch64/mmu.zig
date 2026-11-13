@@ -226,6 +226,14 @@ pub fn init(regions: []const Region) void {
 }
 
 pub fn enable() void {
+    enableOnThisCpu();
+    klog.info("mmu", "enabled: 4 KiB granule, 48-bit VA, caches on, W^X on", .{});
+}
+
+/// Program the same tables and control registers on another core. Every
+/// secondary executes this before it touches memory it did not write itself:
+/// the tables are shared, TTBR/TCR/MAIR/SCTLR are per-core system registers.
+pub fn enableOnThisCpu() void {
     // MAIR: 0 = Device-nGnRnE, 1 = Normal WB/WA, 2 = Normal non-cacheable.
     const mair: u64 = 0x00 | (0xFF << 8) | (0x44 << 16);
     cpu.sysWrite("mair_el1", mair);
@@ -259,8 +267,6 @@ pub fn enable() void {
     sctlr &= ~@as(u64, 1 << 1); // no alignment checking
     cpu.sysWrite("sctlr_el1", sctlr);
     cpu.isb();
-
-    klog.info("mmu", "enabled: 4 KiB granule, 48-bit VA, caches on, W^X on", .{});
 }
 
 test "descriptor attributes set the execute-never bits" {

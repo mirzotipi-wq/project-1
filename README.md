@@ -22,7 +22,9 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Stage A complete — phases 1–12 of [PLAN.md](PLAN.md) boot and run on QEMU `virt`.**
+**Stages A and B complete — phases 1–20 of [PLAN.md](PLAN.md) boot and run on QEMU `virt`
+with four cores.** (Phase 13 is partial: IRQ-safe locks and counters exist, storm throttling
+does not. Phase 19 is deferred until block devices exist.)
 
 | Phase | What exists | How it is verified |
 |---|---|---|
@@ -38,6 +40,13 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 | 10 | 16-entry exception vectors, trap frames, ESR decoding | SVC round trip; data abort report names cause/address/write |
 | 11 | GICv2 + GICv3 | `irq` shows PPI 30 firing, 0 spurious |
 | 12 | generic timer, 1 kHz tick, uptime | `time` shows ticks advancing at 1 kHz |
+| 13 | IRQ-safe spinlocks, per-CPU IRQ counters | `irq` shows 0 spurious, 0 unhandled |
+| 14 | spin/ticket/IRQ locks, atomics, semaphores | `stress 4 20000` → 80000 exact, 0 lost |
+| 15 | kernel threads, 32 KiB stacks, exit and reaping | `threads`; `reap 8` → 0 pages leaked |
+| 16 | preemptive round-robin, work stealing, pinning | `preempt` → equal timeslices on one core |
+| 17 | wait queues, semaphore, timed sleep | `sleep 100`; host tests for blocking |
+| 18 | PSCI SMP bring-up, per-CPU state, reschedule IPI | `cores` shows 4/4 online and switching |
+| 20 | boot self-tests, counters, switch trace ring | every boot prints a PASS verdict |
 
 The remaining 88 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
@@ -49,14 +58,17 @@ Requires Zig 0.14.x. From a clean checkout:
 ```sh
 zig build           # ELF + cassa.bin (raw) + cassa.img (arm64 Image) in zig-out/bin
 zig build test      # host-side unit tests for pure logic
-zig build run       # boot the raw image under QEMU: firmware hands over a device tree
+zig build run       # boot the raw image under QEMU with 4 vCPUs (firmware hands over a DTB)
 zig build run-elf   # boot the ELF directly (no device-tree handoff)
 zig build image     # only the flat arm64 Image container
 ```
 
 `zig build run` invokes `qemu-system-aarch64` from `$PATH` (override with
-`-Dqemu=/path/to/qemu-system-aarch64`). The kernel console is the first PL011 UART;
-press Enter for a prompt and type `help`.
+`-Dqemu=/path/to/qemu-system-aarch64`) with `-smp 4` (override with `-Dsmp=N`). The kernel
+console is the first PL011 UART; press Enter for a prompt and type `help`. Concurrency can be
+inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
+(contended counter), `preempt 1000` (three spinning threads, one core), `reap 8` (reaping),
+`logstorm 4` (unbroken console lines from four cores) and `svc`.
 
 The kernel is built for the ARMv8.0-A baseline (`cortex-a53` + FP/NEON), so the same binary
 runs on Cortex-A53/A55/A72/A76/A78/X-series, Neoverse N1/N2/V1, Apple silicon and Graviton.
@@ -82,7 +94,8 @@ build.zig            build graph, generated linker script, QEMU runner, host tes
 src/main.zig         boot sequence, kernel wiring, self-tests
 src/arch/aarch64/    cpu registers, MMU, exceptions/trap frames, GIC, timer
 src/devices/         PL011 UART
-src/kernel/          logging, panic, pmm, heap, irq, syscall, machine, shell
+src/kernel/          logging, panic, pmm, heap, irq, sync, percpu, thread, sched,
+                     smp, syscall, machine, shell
 src/lib/             freestanding helpers (device-tree parser)
 tools/mkimage.zig    host-side Image wrapper used by the build
 src/tests.zig        host unit-test root
@@ -94,7 +107,7 @@ PLAN.md              100-phase master engineering plan
 
 | Target | Status |
 |---|---|
-| QEMU `virt` (GICv2 now, GICv3 driver present) | boots to shell, self-tests pass |
+| QEMU `virt` (GICv2 now, GICv3 driver present) | boots to shell on 4 vCPUs, self-tests pass |
 | Cortex-A53/A72 boards | kernel builds, board bring-up in Stage D |
 | Integrated POS terminals | Stage D/H |
 | Raspberry Pi 4/5 class SBCs | Stage D/H |
