@@ -437,11 +437,18 @@ pub fn reply(
         return Error.Again;
     }
     const target = ep.reply_target.?;
-    // The caller is gone if it is not parked here and its deadline has passed:
-    // answering now would hand an old answer to a future call.
-    if (ep.reply_thread != target and ep.reply_deadline != 0 and expired(ep.reply_deadline)) {
+    // A caller whose deadline has passed is gone, whether or not its thread has
+    // run yet. It is going to return ETIMEDOUT from `call`; handing it this
+    // answer would turn that timeout into a success, and leaving the answer in
+    // `rep_valid` would let the same thread's *next* call — which has the same
+    // identity — take it as its own reply. Both are decided by the deadline
+    // alone, so the refusal cannot depend on which thread happens to run first.
+    if (ep.reply_deadline != 0 and expired(ep.reply_deadline)) {
         ep.reply_owed = false;
         ep.reply_target = null;
+        if (ep.reply_thread == target) {
+            ep.reply_thread = null;
+        }
         ep.replied_to_nobody += 1;
         lock.release(flags);
         return Error.Again;
@@ -482,8 +489,10 @@ fn sweep(ep: *Endpoint) void {
         timeouts += 1;
     }
     if (ep.reply_thread != null and expired(ep.reply_deadline)) {
+        // The parked caller is not waiting any more, but its deadline stays on
+        // the endpoint: that is what makes the answer it is about to miss be
+        // refused as late instead of accepted for a caller returning ETIMEDOUT.
         ep.reply_thread = null;
-        ep.reply_deadline = 0;
     }
     if (ep.rep_valid) {
         if (ep.rep_to) |t| {

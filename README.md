@@ -67,7 +67,7 @@ Phase 19 is deferred until block devices exist.)
 | 26 | ELF64 loader, segment permissions, BSS, argv/envp, exit status | `uprobe` step 12: `pos.elf` exits 42; `exec`, `images`, `elf` |
 | 27 | service supervisor, backoff restarts, crash-loop parking, crash records, orphan reaping | `uprobe` step 13: printer killed 7× restarts 6× then parks, checkout 3/3; `service`, `dumps` |
 | 28 | name registry (`pos://`), by-name resolve with reasons, duplicate rejection, lazy start, generation counter | `uprobe` step 14: live/restarting/parked/unknown lookups, `pos.elf resolve` exits 0/4/1; `registry`, `resolve`, `ensure` |
-| 28a | run-queue lifecycle: single publish point, queue invariant, reaper guard, stray-ready audit | `killoop 150` ×2 clean, 30 four-core probe boots with 0 panics/hangs/queue anomalies, `stress`/`preempt`/`reap` green |
+| 28a | run-queue lifecycle: single publish point, queue invariant, reaper guard, stray-ready audit; IPC deadline refusal decided by the deadline alone | `killoop 150` ×2 clean, 20/20 four-core and 5/5 single-core probe boots green with 0 queue anomalies, `stress`/`preempt`/`reap` green |
 
 The remaining 73 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.

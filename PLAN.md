@@ -968,12 +968,36 @@ with **zero scheduler panics, zero hangs and zero queue anomalies**; 5/5 single-
 The switch soaks are green: `stress 4 20000` 0 lost updates, `preempt 1000` PASS, `reap 8` 0 pages
 leaked. Host tests remain 60/60 and the clean rebuild is warning-free.
 
-One residual, unrelated and pre-existing: the EL0 IPC probe (step [10]) intermittently fails
-`case 17/18/24` on a four-core boot (roughly 1 boot in 10) while its 2000-round-trip throughput part
-passes. The same failure appears in probe logs from *before* this scheduler change (the phase-27
-builds kept in this session's logs), so it is an IPC deadline-timing race in the test, not a
-consequence of the run-queue repair; it is recorded here rather than papered over. Every other
-step of those boots passed, and no boot failed with a scheduler fault.
+**Deadline enforcement in IPC, and the two probe races it exposed (fixed).** After the run-queue
+repair, roughly one four-core boot in ten still failed EL0 IPC cases 17/18/24 while the same boot's
+2000-round-trip throughput test passed. It was not a wake-latency regression: `ipc.reply` refused a
+late answer only when the caller was no longer parked **and** its deadline had passed. If the answer
+arrived while the caller was still parked (it had not run its own timeout path yet), or after
+`sweep` had cleared the caller and zeroed the deadline, the kernel accepted the answer for a caller
+that was about to return ETIMEDOUT. That one race produced all three symptoms at once: the call
+returned a reply instead of a timeout (17), the endpoint kept a stale answer that the same thread's
+next call then took as its own (18), and the server's late reply was accepted rather than refused
+with EAGAIN (24). The fix is in `ipc.reply`: a deadline that has passed refuses the answer, decided
+by the deadline alone and independent of which thread runs first, and `sweep` no longer erases the
+deadline when it clears a parked caller. That is the contract the comment in `call` already stated —
+the server may answer after the caller has given up, and that answer must be refused. It is a
+kernel fix, not a probe constant: no assertion changed and no window was widened for it.
+
+Two probe observations were also *sampled* rather than *waited for*, which is what the remaining
+5-10% of boots were hitting: step [13] read the crash-loop state immediately after the last kill
+(catching the previous restart's transition) and step [14] tried to observe a 5 ms backoff window
+from a thread that is itself scheduled on four cores. Both now wait, with bounded timeouts, for the
+exact state they assert; step [14] also sets the 100 ms backoff it observes (a policy input, not
+the property under test) and restores it. Nothing was weakened: every assertion is unchanged and
+the state still has to be reached.
+
+Measured on the final build: **20/20 consecutive four-core probe boots with `RESULT: PASS`**, zero
+panics, zero hangs, and `scheduler: 0 double-run guard(s), 0 queue violation(s), 0 stray ready` on
+every one of them; 5/5 single-core boots; `killoop 150` twice at 150/150 rounds with zero anomalies
+and no leaked pages; `stress 4 20000` 0 lost updates, `preempt 1000` PASS, `reap 8` 0 pages leaked;
+60/60 host tests and a clean warning-free rebuild. Step [13] still prints the full ladder
+(`killed 7x: 6 restarts, backoff 5/10/20/40/80/160 ms, then parked failed`) and step [14] still
+prints live/restarting/parked lookups with the 3/3 call-site exit codes.
 
 **Deferred:** names are flat, not a tree, and there is no per-name ACL, so any process can resolve
 any registered name (phase 30's capability manifests are where that belongs). The registry does

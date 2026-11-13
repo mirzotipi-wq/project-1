@@ -1287,7 +1287,16 @@ fn cmdUprobe(ctx: Context) void {
 
         _ = service.stop("checkout");
         _ = service.stop("printer");
-        sched.sleepMsBlocking(50);
+        // The supervisor buries a child on its next poll; wait for the counts the
+        // check is about instead of assuming one 50 ms window covers it.
+        {
+            var reap_ms: u64 = 0;
+            while (reap_ms < 500 and
+                (process.liveCount() != live_before or user_space.liveCount() != spaces_before)) : (reap_ms += 5)
+            {
+                sched.sleepMsBlocking(5);
+            }
+        }
         const live_after = process.liveCount();
         const spaces_after = user_space.liveCount();
         const orphan_ok = live_after == live_before and spaces_after == spaces_before and
@@ -1354,10 +1363,14 @@ fn cmdUprobe(ctx: Context) void {
 
         // A kill is visible as `restarting`, and the generation changes across it,
         // so a caller holding the old pid can tell it was restarted underneath it.
+        // The default first backoff is 5 ms, shorter than a four-core
+        // supervisor's own poll interval, so `restarting` can come and go between
+        // two lookups. The delay is an input to the state machine, not the
+        // property under test; widen it for this observation and restore it.
+        const checkout_cfg = service.find("checkout").?;
+        const saved_base_ms = checkout_cfg.policy.base_ms;
+        checkout_cfg.policy.base_ms = 100;
         _ = service.kill("checkout");
-        // The service stays `restarting` for at least one backoff delay (5 ms at
-        // this point), so a 1 ms poll observes it without depending on where in
-        // the supervisor's 10 ms cycle the kill landed.
         var saw_restart = false;
         var wait_ms: u64 = 0;
         while (wait_ms < 400) : (wait_ms += 1) {
@@ -1372,13 +1385,17 @@ fn cmdUprobe(ctx: Context) void {
         wait_ms = 0;
         while (wait_ms < 500) : (wait_ms += 5) {
             const r = registry.lookup("pos://checkout");
-            if (r.reason == .ok) {
+            // Wait for the *new* incarnation, not merely for `ok`: the old child
+            // can still be running for a few milliseconds after the kill, and an
+            // `ok` from it would end this loop before the restart happened.
+            if (r.reason == .ok and r.generation > live.generation) {
                 after = r.reason;
                 after_gen = r.generation;
                 break;
             }
             sched.sleepMsBlocking(5);
         }
+        checkout_cfg.policy.base_ms = saved_base_ms;
         const restart_ok = saw_restart and after == .ok and after_gen > live.generation;
         out("      restart: during backoff {s}, after {s} gen {d} -> {d}  {s}\n", .{
             if (saw_restart) "restarting" else "-", names.reasonLabel(after),
