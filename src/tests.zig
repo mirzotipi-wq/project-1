@@ -1,7 +1,23 @@
-//! Host-side unit test root. Kernel-only code is never imported here.
+//! Host-side unit tests. Only pure logic is imported here — anything that
+//! touches system registers or MMIO is verified in QEMU instead.
 
 const std = @import("std");
 
-test "host harness is alive" {
-    try std.testing.expectEqual(@as(u32, 4), 2 + 2);
+test {
+    _ = @import("kernel/heap.zig");
+    _ = @import("kernel/pmm.zig");
+    _ = @import("lib/fdt.zig");
+    _ = @import("arch/aarch64/cpu.zig");
+    _ = @import("arch/aarch64/mmu.zig");
+    _ = @import("arch/aarch64/gic.zig");
+    _ = @import("arch/aarch64/timer.zig");
+    _ = @import("arch/aarch64/trap.zig");
+    _ = @import("devices/pl011.zig");
+    _ = @import("kernel/klog.zig");
+}
+
+test "seeded prng is deterministic across runs" {
+    var a = std.Random.DefaultPrng.init(1234);
+    var b = std.Random.DefaultPrng.init(1234);
+    try std.testing.expectEqual(a.random().int(u64), b.random().int(u64));
 }

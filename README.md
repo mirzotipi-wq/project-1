@@ -22,10 +22,22 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-Stage A (phases 1–12 of [PLAN.md](PLAN.md)) is implemented and boot-verified on QEMU
-`virt`: boot handoff, UART console, structured logging, panic reporting, device-tree
-discovery, physical page allocator, kernel heap, MMU with W^X, exception vectors with
-fault decoding, GIC interrupt controller, and the ARM generic timer driving a kernel shell.
+**Stage A complete — phases 1–12 of [PLAN.md](PLAN.md) boot and run on QEMU `virt`.**
+
+| Phase | What exists | How it is verified |
+|---|---|---|
+| 1 | Zig build, generated linker script, host tests, QEMU runner | `zig build` from a clean tree |
+| 2 | `_start`, BSS clear, SP_EL1/SP_EL0, device-tree handoff | boot log |
+| 3 | PL011 console | banner and command output |
+| 4 | structured `klog` with ring buffer | every boot line |
+| 5 | panic surface with register dump and captured log | `panic` command |
+| 6 | FDT parser: RAM, UART, GIC, model, cmdline | `info` shows `linux,dummy-virt`, 512 MiB/1 GiB; `-m 1024` changes totals |
+| 7 | bitmap physical page allocator | host tests + `mem` counters |
+| 8 | boundary-tag heap behind `std.mem.Allocator` | 6 host tests incl. randomised workload; `std.ArrayList`/`allocPrint` at boot |
+| 9 | 4 KiB granule MMU, 48-bit VA, caches, W^X | `textwrite` faults; `map` translates |
+| 10 | 16-entry exception vectors, trap frames, ESR decoding | SVC round trip; data abort report names cause/address/write |
+| 11 | GICv2 + GICv3 | `irq` shows PPI 30 firing, 0 spurious |
+| 12 | generic timer, 1 kHz tick, uptime | `time` shows ticks advancing at 1 kHz |
 
 The remaining 88 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
@@ -35,13 +47,16 @@ order. Nothing in this repository is a mock: everything marked done boots and ru
 Requires Zig 0.14.x. From a clean checkout:
 
 ```sh
-zig build                 # produce zig-out/bin/cassa (AArch64 ELF)
-zig build test            # host-side unit tests for pure logic
-zig build run             # boot under QEMU (aarch64 virt machine)
+zig build           # ELF + cassa.bin (raw) + cassa.img (arm64 Image) in zig-out/bin
+zig build test      # host-side unit tests for pure logic
+zig build run       # boot the raw image under QEMU: firmware hands over a device tree
+zig build run-elf   # boot the ELF directly (no device-tree handoff)
+zig build image     # only the flat arm64 Image container
 ```
 
 `zig build run` invokes `qemu-system-aarch64` from `$PATH` (override with
-`-Dqemu=/path/to/qemu-system-aarch64`).
+`-Dqemu=/path/to/qemu-system-aarch64`). The kernel console is the first PL011 UART;
+press Enter for a prompt and type `help`.
 
 The kernel is built for the ARMv8.0-A baseline (`cortex-a53` + FP/NEON), so the same binary
 runs on Cortex-A53/A55/A72/A76/A78/X-series, Neoverse N1/N2/V1, Apple silicon and Graviton.
@@ -64,11 +79,12 @@ Machine differences are discovered at boot from the device tree, not compiled in
 
 ```
 build.zig            build graph, generated linker script, QEMU runner, host tests
-src/main.zig         boot sequence, kernel wiring, shell
-src/arch/aarch64/    cpu registers, MMU, exceptions, GIC, timers, SMP
-src/devices/         PL011 UART, PCIe, virtio, display, input
-src/kernel/          logging, panic, pmm, heap, scheduler, IPC, capabilities
-src/lib/             freestanding helpers: formatting, bitmaps, ring buffers
+src/main.zig         boot sequence, kernel wiring, self-tests
+src/arch/aarch64/    cpu registers, MMU, exceptions/trap frames, GIC, timer
+src/devices/         PL011 UART
+src/kernel/          logging, panic, pmm, heap, irq, syscall, machine, shell
+src/lib/             freestanding helpers (device-tree parser)
+tools/mkimage.zig    host-side Image wrapper used by the build
 src/tests.zig        host unit-test root
 docs/                subsystem documentation
 PLAN.md              100-phase master engineering plan
@@ -78,7 +94,7 @@ PLAN.md              100-phase master engineering plan
 
 | Target | Status |
 |---|---|
-| QEMU `virt` (GICv3, PL011, virtio) | boots, shell |
+| QEMU `virt` (GICv2 now, GICv3 driver present) | boots to shell, self-tests pass |
 | Cortex-A53/A72 boards | kernel builds, board bring-up in Stage D |
 | Integrated POS terminals | Stage D/H |
 | Raspberry Pi 4/5 class SBCs | Stage D/H |

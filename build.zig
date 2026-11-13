@@ -36,16 +36,25 @@ fn linkerScript(b: *std.Build) []const u8 {
         \\  __kernel_start = .;
         \\
         \\  .text : ALIGN(4096) {{
+        \\    __text_start = .;
         \\    KEEP(*(.text.boot))
         \\    *(.text .text.*)
+        \\    . = ALIGN(4096);
+        \\    __text_end = .;
         \\  }}
         \\
         \\  .rodata : ALIGN(4096) {{
+        \\    __rodata_start = .;
         \\    *(.rodata .rodata.*)
+        \\    . = ALIGN(4096);
+        \\    __rodata_end = .;
         \\  }}
         \\
         \\  .data : ALIGN(4096) {{
+        \\    __data_start = .;
         \\    *(.data .data.*)
+        \\    . = ALIGN(4096);
+        \\    __data_end = .;
         \\  }}
         \\
         \\  .bss (NOLOAD) : ALIGN(4096) {{
@@ -103,21 +112,62 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(kernel);
 
     // ------------------------------------------------------------------- run
+    // Flat binaries. `cassa.bin` is the raw kernel image (what QEMU loads at the
+    // link address and enters with the device tree in x0); `cassa.img` adds the
+    // arm64 Image header for firmware that speaks the Linux boot protocol.
+    const raw = b.addObjCopy(kernel.getEmittedBin(), .{ .format = .bin });
+
+    const mkimage_mod = b.createModule(.{
+        .root_source_file = b.path("tools/mkimage.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const mkimage = b.addExecutable(.{ .name = "mkimage", .root_module = mkimage_mod });
+    const wrap = b.addRunArtifact(mkimage);
+    wrap.addFileArg(raw.getOutput());
+    const wrapped = wrap.addOutputFileArg("cassa.img");
+    const wrap_step = b.step("image", "Build a flat arm64 Image (cassa.img)");
+    wrap_step.dependOn(&wrap.step);
+    const image = b.addInstallFileWithDir(wrapped, .bin, "cassa.img");
+    image.step.dependOn(&wrap.step);
+    b.getInstallStep().dependOn(&image.step);
+
+    const bin_install = b.addInstallFileWithDir(raw.getOutput(), .bin, "cassa.bin");
+    b.getInstallStep().dependOn(&bin_install.step);
+
     const qemu = b.option([]const u8, "qemu", "QEMU executable") orelse "qemu-system-aarch64";
     const run_cmd = b.addSystemCommand(&.{
         qemu,
         "-machine", "virt",
         "-cpu",   "cortex-a53",
         "-m",     "512M",
-        "-smp",   "4",
+        "-smp",   "1",
         "-nographic",
         "-serial", "mon:stdio",
+        "-nic",    "none",
         "-no-reboot",
     });
     run_cmd.addArg("-kernel");
-    run_cmd.addArtifactArg(kernel);
-    const run_step = b.step("run", "Boot the kernel under QEMU (aarch64 virt)");
+    run_cmd.addFileArg(raw.getOutput());
+    const run_step = b.step("run", "Boot the kernel under QEMU (arm64 Image, with device tree)");
     run_step.dependOn(&run_cmd.step);
+    run_step.dependOn(&image.step);
+
+    const run_elf = b.addSystemCommand(&.{
+        qemu,
+        "-machine", "virt",
+        "-cpu",   "cortex-a53",
+        "-m",     "512M",
+        "-smp",   "1",
+        "-nographic",
+        "-serial", "mon:stdio",
+        "-nic",    "none",
+        "-no-reboot",
+    });
+    run_elf.addArg("-kernel");
+    run_elf.addArtifactArg(kernel);
+    const run_elf_step = b.step("run-elf", "Boot the ELF directly (no firmware handoff)");
+    run_elf_step.dependOn(&run_elf.step);
 
     // ------------------------------------------------------------------ test
     // Pure logic (allocators, formatting, schedulers, protocol codecs) is

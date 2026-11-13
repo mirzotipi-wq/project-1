@@ -767,4 +767,5 @@ to the OS.
 
 | Date | Phases completed | Evidence |
 |---|---|---|
-| boot milestone | 1–12 | `zig build && zig build run` boots to shell; host tests green |
+| 2026-11-13 | 1–12 (Stage A) | Clean `zig build`; 23 host unit tests green; QEMU `virt` boots, parses the device tree (`linux,dummy-virt`, 512 MiB and 1 GiB), reports `selftest … PASS`; timer PPI 30 fires at 1 kHz with zero spurious interrupts; `svc` round trip prints through the syscall path; `textwrite` traps in the MMU with a decoded fault; `panic` prints the captured kernel log. |
+| next | 13–20 (Stage B) | interrupt framework refinement, spinlocks, threads, preemptive scheduler, wait queues, SMP bring-up, workqueues, tracing |
