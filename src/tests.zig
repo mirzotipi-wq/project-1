@@ -19,6 +19,7 @@ test {
     _ = @import("kernel/cap.zig");
     _ = @import("kernel/elf.zig");
     _ = @import("kernel/restart.zig");
+    _ = @import("kernel/names.zig");
     _ = @import("kernel/thread.zig");
 }
 

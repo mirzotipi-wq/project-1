@@ -22,6 +22,7 @@ const SYS_EXIT = 2;
 const SYS_GETPID = 3;
 const SYS_UPTIME_MS = 6;
 const SYS_SLEEP_MS = 5;
+const SYS_RESOLVE = 38;
 
 fn syscall3(n: u64, a: u64, b: u64, c: u64) u64 {
     @setRuntimeSafety(false);
@@ -54,6 +55,21 @@ fn printNum(value: u64) void {
         v /= 10;
     }
     write(buf[i..]);
+}
+
+fn reasonLabel(code: u64) []const u8 {
+    return switch (code) {
+        0 => "ok",
+        1 => "unknown name",
+        2 => "not running",
+        3 => "restarting",
+        4 => "crash-loop parked",
+        5 => "exited, restart pending",
+        6 => "already registered",
+        7 => "invalid name",
+        8 => "name table full",
+        else => "unavailable",
+    };
 }
 
 fn lenOf(s: [*:0]const u8) usize {
@@ -167,6 +183,27 @@ export fn _start(argc: usize, argv: [*][*:0]u8, envp: [*][*:0]u8) callconv(.C) n
         while (true) {
             _ = syscall3(SYS_SLEEP_MS, 20, 0, 0);
         }
+    }
+    if (equal(mode, "resolve")) {
+        // The call site this phase exists for: ask for a service by name, and if
+        // it is not usable say so and serve without it rather than fault.
+        const target: []const u8 = if (argc > 2) sliceOf(argv[2]) else "pos://";
+        var found_pid: u64 = 0;
+        const reason = syscall3(SYS_RESOLVE, @intFromPtr(target.ptr), target.len, @intFromPtr(&found_pid));
+        write("[user] pos: ");
+        write(target);
+        if (reason == 0) {
+            write(" -> pid ");
+            printNum(found_pid);
+            write("\n");
+        } else {
+            write(" unavailable (");
+            write(reasonLabel(reason));
+            write("), serving without it\n");
+        }
+        // The exit code *is* the reason, so a caller (and the probe) can check
+        // the degradation without parsing text.
+        exit(reason);
     }
 
     exit(if (ok) 42 else 9);

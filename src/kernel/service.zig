@@ -32,6 +32,9 @@ pub const Service = struct {
     pid: u32 = 0,
     failures: u32 = 0,
     restarts: u32 = 0,
+    /// Bumped on every launch. A caller that resolved a service can compare it
+    /// after the fact and learn that the pid it holds belongs to an older run.
+    generation: u32 = 0,
     started_ms: u64 = 0,
     next_restart_ms: u64 = 0,
     last_code: i64 = 0,
@@ -81,6 +84,7 @@ fn launch(s: *Service) bool {
     s.pid = p.pid;
     s.state = .running;
     s.started_ms = timer.uptimeMs();
+    s.generation += 1;
     starts += 1;
     return true;
 }

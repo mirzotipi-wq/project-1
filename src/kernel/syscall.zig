@@ -21,6 +21,8 @@ const user_space = @import("addrspace.zig");
 const cap = @import("cap.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
+const registry = @import("registry.zig");
+const names = @import("names.zig");
 
 /// System calls a process may make from EL0. Deliberately small: each one is a
 /// place where the kernel acts with its own authority, so the surface is the
@@ -56,6 +58,11 @@ pub const UserNr = enum(u64) {
     shm_unmap = 35,
     shm_wait = 36,
     shm_wake = 37,
+
+    // Service registry (phase 28). The name is a byte string in the caller's own
+    // address space; the answer is a reason code, never an error that has to be
+    // guessed from a pid.
+    resolve = 38,
 };
 
 /// Rejected user pointers, counted so the probe can prove the kernel refused to
@@ -441,6 +448,34 @@ pub fn handleUser(number: u64, frame: *trap.Frame) Action {
                 frame.x[1],
                 frame.x[2],
             ) catch |e| errnoShm(e);
+            return .keep;
+        },
+        @intFromEnum(UserNr.resolve) => {
+            // resolve(name_ptr, name_len, out_pid) -> reason code. The program asks
+            // for a name and is told *why* it cannot have it; it is never handed a
+            // pid that might not exist and never an errno it has to interpret.
+            const space = sched.running().address_space orelse {
+                frame.x[0] = @intFromEnum(names.Reason.unknown);
+                return .keep;
+            };
+            const ptr = frame.x[0];
+            const len = frame.x[1];
+            const out = frame.x[2];
+            if (len == 0 or len > names.max_len or
+                !user_space.checkPtr(space, ptr, len, .read) or
+                !user_space.checkPtr(space, out, 8, .write))
+            {
+                rejected_ptr += 1;
+                frame.x[0] = @intFromEnum(names.Reason.invalid_name);
+                return .keep;
+            }
+            const bytes: [*]const u8 = @ptrFromInt(ptr);
+            const r = registry.lookup(bytes[0..len]);
+            if (r.reason == .ok) {
+                const pid_out: *u64 = @ptrFromInt(out);
+                pid_out.* = r.pid;
+            }
+            frame.x[0] = @intFromEnum(r.reason);
             return .keep;
         },
         else => {

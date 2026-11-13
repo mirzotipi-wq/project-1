@@ -26,6 +26,8 @@ const thread_mod = @import("thread.zig");
 const service = @import("service.zig");
 const dump = @import("dump.zig");
 const restart = @import("restart.zig");
+const registry = @import("registry.zig");
+const names = @import("names.zig");
 const user_space = @import("addrspace.zig");
 const cap = @import("cap.zig");
 const ipc = @import("ipc.zig");
@@ -90,6 +92,9 @@ fn printHelp() void {
         \\  exec <image> [args]  load an ELF from the image store and run it
         \\  service [start|kill|stop <name>]  supervised services
         \\  dumps                crash records from faulting programs
+        \\  registry             service names and what they point at
+        \\  resolve <pos://name>  resolve a service name to a pid and generation
+        \\  ensure <pos://name>   resolve, starting the service if it is down
         \\  images               list the image store
         \\  elf                  ELF loader state and the last load plan
         \\
@@ -721,6 +726,38 @@ fn cmdDumps(_: Context) void {
     }
 }
 
+/// `registry` — every name the kernel knows, and what it points at right now.
+fn cmdRegistry(_: Context) void {
+    out("  name                   service     state       pid    lookups\n", .{});
+    var i: usize = 0;
+    while (i < registry.max_names) : (i += 1) {
+        const e = registry.entryAt(i) orelse continue;
+        const svc = service.find(e.target);
+        const state = if (svc) |sv| service.stateLabel(sv.state) else "missing";
+        const pid = if (svc) |sv| sv.pid else 0;
+        out("  {s:<21}  {s:<10}  {s:<10}  {d:>4}   {d:>7}\n", .{
+            e.storedName(), e.target, state, pid, e.lookups,
+        });
+    }
+    out("  {d} names, {d} lookups, {d} hits, {d} refusals, {d} lazy starts\n", .{
+        registry.count(), registry.lookups, registry.hits, registry.refusals, registry.lazy_starts,
+    });
+}
+
+/// `resolve <name>` — ask by name; `ensure <name>` also starts a stopped service.
+fn cmdResolve(tokens: *std.mem.TokenIterator(u8, .scalar), lazy: bool) void {
+    const name = tokens.next() orelse {
+        out("usage: {s} <pos://name>\n", .{if (lazy) "ensure" else "resolve"});
+        return;
+    };
+    const r = if (lazy) registry.ensure(name) else registry.lookup(name);
+    out("  {s}: {s}", .{ name, names.reasonLabel(r.reason) });
+    if (r.reason == .ok) {
+        out(" (service pid {d}, generation {d})", .{ r.pid, r.generation });
+    }
+    out("\n", .{});
+}
+
 fn status(ok: bool) []const u8 {
     return if (ok) "OK" else "FAIL";
 }
@@ -1199,6 +1236,154 @@ fn cmdUprobe(ctx: Context) void {
     }
     pass = pass and lc_ok;
 
+    // 14 -- registry: a POS application asks for a device by name and is told a
+    // reason when it cannot have it, instead of a pid that may not exist.
+    out("  [14] registry: by-name resolution, and graceful absence\n", .{});
+    var reg_ok = true;
+    {
+        const reg_live_before = process.liveCount();
+        const reg_spaces_before = user_space.liveCount();
+        const reg_co = registry.register("pos://checkout", "checkout");
+        const reg_pr = registry.register("pos://printer", "printer");
+        const reg_dup = registry.register("pos://checkout", "checkout");
+        const reg_bad = registry.register("Printer", "printer");
+        const reg_ghost = registry.register("pos://ghost", "ghost");
+        const reg_names_ok = reg_co == .ok and reg_pr == .ok and reg_dup == .duplicate and
+            reg_bad == .invalid_name and reg_ghost == .unknown;
+        out("      register: {s}, {s}, duplicate {s}, invalid {s}, unknown target {s}  {s}\n", .{
+            names.reasonLabel(reg_co), names.reasonLabel(reg_pr), names.reasonLabel(reg_dup),
+            names.reasonLabel(reg_bad), names.reasonLabel(reg_ghost), status(reg_names_ok),
+        });
+        reg_ok = reg_ok and reg_names_ok;
+
+        const stopped = registry.lookup("pos://printer");
+        const unknown = registry.lookup("pos://nope");
+        const invalid = registry.lookup("pos://Printer");
+        const bare = registry.lookup("pos://");
+        const lookups_ok = stopped.reason == .stopped and unknown.reason == .unknown and
+            invalid.reason == .invalid_name and bare.reason == .invalid_name;
+        out("      lookup: stopped {s}, unknown {s}, invalid {s}, bare scheme {s}  {s}\n", .{
+            names.reasonLabel(stopped.reason), names.reasonLabel(unknown.reason),
+            names.reasonLabel(invalid.reason), names.reasonLabel(bare.reason), status(lookups_ok),
+        });
+        reg_ok = reg_ok and lookups_ok;
+
+        const lazy = registry.ensure("pos://printer");
+        const lazy_ok = lazy.reason == .ok and lazy.pid != 0 and registry.lazy_starts == 1;
+        out("      lazy start: ensure pos://printer -> {s} pid {d} gen {d}  {s}\n", .{
+            names.reasonLabel(lazy.reason), lazy.pid, lazy.generation, status(lazy_ok),
+        });
+        reg_ok = reg_ok and lazy_ok;
+
+        _ = service.start("checkout");
+        sched.sleepMsBlocking(20);
+        const live = registry.lookup("pos://checkout");
+        const live_ok = live.reason == .ok and live.pid != 0 and live.generation > 0;
+        out("      live: pos://checkout -> {s} pid {d} gen {d}  {s}\n", .{
+            names.reasonLabel(live.reason), live.pid, live.generation, status(live_ok),
+        });
+        reg_ok = reg_ok and live_ok;
+
+        // A kill is visible as `restarting`, and the generation changes across it,
+        // so a caller holding the old pid can tell it was restarted underneath it.
+        _ = service.kill("checkout");
+        var saw_restart = false;
+        var wait_ms: u64 = 0;
+        while (wait_ms < 400) : (wait_ms += 2) {
+            if (registry.lookup("pos://checkout").reason == .restarting) {
+                saw_restart = true;
+                break;
+            }
+            sched.sleepMsBlocking(2);
+        }
+        var after: names.Reason = .unknown;
+        var after_gen: u32 = 0;
+        wait_ms = 0;
+        while (wait_ms < 500) : (wait_ms += 5) {
+            const r = registry.lookup("pos://checkout");
+            if (r.reason == .ok) {
+                after = r.reason;
+                after_gen = r.generation;
+                break;
+            }
+            sched.sleepMsBlocking(5);
+        }
+        const restart_ok = saw_restart and after == .ok and after_gen > live.generation;
+        out("      restart: during backoff {s}, after {s} gen {d} -> {d}  {s}\n", .{
+            if (saw_restart) "restarting" else "-", names.reasonLabel(after),
+            live.generation, after_gen, status(restart_ok),
+        });
+        reg_ok = reg_ok and restart_ok;
+
+        // Park the printer through its own crash-loop policy, then ask again: a
+        // parked service must answer, and the answer must be `failed`. The policy
+        // is the one step 13 configured (seven tolerated failures).
+        var k: usize = 0;
+        while (k < 7) : (k += 1) {
+            var w: u64 = 0;
+            while (w < 800) : (w += 5) {
+                if (service.find("printer").?.state == .running) break;
+                sched.sleepMsBlocking(5);
+            }
+            _ = service.kill("printer");
+            w = 0;
+            while (w < 800) : (w += 5) {
+                if (service.find("printer").?.state != .running) break;
+                sched.sleepMsBlocking(5);
+            }
+        }
+        const parked = registry.lookup("pos://printer");
+        const parked_reason = parked.reason == .failed and service.find("printer").?.state == .failed;
+        out("      parked: pos://printer -> {s}  {s}\n", .{
+            names.reasonLabel(parked.reason), status(parked_reason),
+        });
+        reg_ok = reg_ok and parked_reason;
+
+        // A real user-mode call site. The exit code is the reason, so absence is a
+        // value the program acts on: never a fault, never a hang.
+        var degraded: u32 = 0;
+        var cases_ok = true;
+        const wanted = [_][]const u8{ "pos://checkout", "pos://printer", "pos://nope" };
+        const want_code = [_]i64{ 0, 4, 1 };
+        var ci: usize = 0;
+        while (ci < wanted.len) : (ci += 1) {
+            const rargv = [_][]const u8{ "pos.elf", "resolve", wanted[ci] };
+            const renv = [_][]const u8{"POS_TERM=cassa-1"};
+            const rp = process.spawnElf("pos.elf", &rargv, &renv) orelse continue;
+            const rst = process.wait(rp.pid, 3000);
+            const rcode = rp.exit_code;
+            _ = process.waitReaped(rp.pid, 1000);
+            if (rst == .exited and rcode == want_code[ci]) degraded += 1 else cases_ok = false;
+        }
+        const site_ok = cases_ok and degraded == 3;
+        out("      call site: {d}/3 by-name lookups exited with the expected reason  {s}\n", .{
+            degraded, status(site_ok),
+        });
+        reg_ok = reg_ok and site_ok;
+
+        _ = service.stop("checkout");
+        _ = service.stop("printer");
+        // The supervisor notices a death on its next tick and reaps it, so give it
+        // a few ticks to settle before counting: this is the documented polling
+        // latency, not a licence to leak.
+        var settle_ms: u64 = 0;
+        while (settle_ms < 500 and process.liveCount() != reg_live_before) : (settle_ms += 10) {
+            sched.sleepMsBlocking(10);
+        }
+        const reg_live_after = process.liveCount();
+        const reg_spaces_after = user_space.liveCount();
+        const reg_clean = reg_live_after == reg_live_before and reg_spaces_after == reg_spaces_before;
+        out("      stop: live processes {d} -> {d}, spaces {d} -> {d}  {s}\n", .{
+            reg_live_before, reg_live_after, reg_spaces_before, reg_spaces_after, status(reg_clean),
+        });
+        out("      registry: {d} names, {d} lookups, {d} hits, {d} refusals, {d} lazy starts\n", .{
+            registry.count(), registry.lookups, registry.hits, registry.refusals,
+            registry.lazy_starts,
+        });
+        reg_ok = reg_ok and reg_clean;
+    }
+    pass = pass and reg_ok;
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  user syscalls: {d}, processes spawned: {d}, faults caught: {d}\n", .{
         syscall.user_calls, process.spawns, process.kills,
@@ -1276,6 +1461,12 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdService(&tokens);
     } else if (std.mem.eql(u8, command, "dumps")) {
         cmdDumps(ctx);
+    } else if (std.mem.eql(u8, command, "registry")) {
+        cmdRegistry(ctx);
+    } else if (std.mem.eql(u8, command, "resolve")) {
+        cmdResolve(&tokens, false);
+    } else if (std.mem.eql(u8, command, "ensure")) {
+        cmdResolve(&tokens, true);
     } else if (std.mem.eql(u8, command, "logstorm")) {
         cmdLogStorm(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "sleep")) {

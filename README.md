@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–27 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–28 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -31,7 +31,11 @@ futex-style wait and wake. Separately built ELF64 programs are loaded from an im
 given argv/envp and their own BSS, and run with their exit status propagated. Services are
 named processes under a supervisor: one that dies is restarted with exponential backoff, one
 that keeps dying is parked as a crash loop instead of thrashing the till, a fault leaves a
-crash record with its registers and stack, and stopping a service reaps its child. (Phase 13 is partial: IRQ-safe locks and counters exist, storm throttling does not.
+crash record with its registers and stack, and stopping a service reaps its child. Services are
+also addressable by name: a kernel-owned table maps `pos://` names to service identities, lookup
+answers with a reason (ok, unknown, not running, restarting, crash-loop parked) instead of an
+ambient error, a stopped service can be started lazily by name, and a POS program that asks for
+an absent service gets a reason code it can branch on. (Phase 13 is partial: IRQ-safe locks and counters exist, storm throttling does not.
 Phase 19 is deferred until block devices exist.)
 
 | Phase | What exists | How it is verified |
@@ -62,6 +66,7 @@ Phase 19 is deferred until block devices exist.)
 | 25 | shared memory objects, multi-space mapping, futex wait/wake, event counters | `uprobe` step 11: 21 cases on 1 and 4 cores; `shm` |
 | 26 | ELF64 loader, segment permissions, BSS, argv/envp, exit status | `uprobe` step 12: `pos.elf` exits 42; `exec`, `images`, `elf` |
 | 27 | service supervisor, backoff restarts, crash-loop parking, crash records, orphan reaping | `uprobe` step 13: printer killed 7× restarts 6× then parks, checkout 3/3; `service`, `dumps` |
+| 28 | name registry (`pos://`), by-name resolve with reasons, duplicate rejection, lazy start, generation counter | `uprobe` step 14: live/restarting/parked/unknown lookups, `pos.elf resolve` exits 0/4/1; `registry`, `resolve`, `ensure` |
 
 The remaining 73 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
@@ -86,7 +91,9 @@ inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `str
 `logstorm 4` (unbroken console lines from four cores), `caps` (capability objects and their
 reference counts), `ipc` (endpoint counters), `shm` (shared-memory objects, mappings and event
 counters), `exec`/`images`/`elf` (launch a program from the image store), `service` (list, start, kill or
-stop a supervised service by name), `dumps` (the crash records kept for faulting programs) and
+stop a supervised service by name), `dumps` (the crash records kept for faulting programs), `registry` (registered names, slots,
+generations and lookup counters), `resolve <name>` (ask the registry for a service and print the
+reason) and `ensure <name>` (start it if it is stopped), and
 `svc`.
 
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,

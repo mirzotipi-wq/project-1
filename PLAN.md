@@ -831,11 +831,118 @@ as before, and there is no process group or parent/child tree yet. The scheduler
 deserves a longer stress run than one phase can give it; `stress 4 20000` and the four-core
 probe boots are the evidence so far.
 
-### Phase 28 — Service registry `[ ]`
+### Phase 28 — Service registry `[x]`
 **Goal:** Services find each other without hard-coded handles.
 **Build:** Namespace tree, path-based lookup, service manifests, lazy start, health probes.
 **Done when:** The POS app resolves `pos://printer` at runtime and degrades gracefully when
 it is absent.
+
+> Scope note (tightened): the "namespace tree" is a **flat table of opaque names**, not a
+> directory hierarchy, and "service manifests" are the name, image, argv and restart policy a
+> slot already carries, registered under a name — there is no manifest language yet. What is
+> built is the part the POS app needs: a kernel-owned name-to-identity table, a by-name lookup
+> that answers with a reason, lazy start, and a supervised service whose absence is a value
+> rather than a fault. Health *probing* is the supervisor's existing liveness check (a service
+> whose child died is restarted or parked) surfaced through the lookup reason; there is no
+> separate request/response health protocol.
+
+**Acceptance (concrete):**
+1. `registry` lists every registered name, its service slot, state, generation and the global
+   counters; `pos://` names are validated by one pure function (`registry schema: 1-16 chars,
+   `[a-z0-9-]`, no leading or trailing `-`, scheme required).
+2. Re-registering a live name, registering an unknown target, and registering when the table is
+   full are each refused with a distinct reason, and no entry changes.
+3. `resolve <name>` returns a reason: ok, unknown name, not running, crash-loop parked, exited.
+   The reason is a stable numeric code the ABI fixes, written to a user process unchanged.
+4. `ensure <name>` starts a registered but stopped service and returns its pid (lazy start), and
+   a lookup that finds a service mid-restart answers `restarting` instead of failing.
+5. A POS program calls the syscall and exits with the reason code, so degradation is provable at
+   the call site: live service -> 0, parked crash loop -> 4, unknown name -> 1.
+6. The table is fixed-size (8 entries) and re-registration is idempotent for a dead name; nothing
+   in the lookup path allocates, so the registry cannot grow with load.
+7. No regressions: phases 1-27 keep passing, host tests stay green (new host tests for the name
+   rules and the reason mapping), and the probe passes on `-smp 1` and `-smp 4`.
+
+**Verified.** The name rules and the reason mapping are `src/kernel/names.zig`, free of kernel
+dependencies: `validate`, the `Reason` enum with ABI-fixed values 0..9, `reasonFor(lifecycle,
+child_alive)` and `reasonLabel`, covered by 5 host tests. The table is `src/kernel/registry.zig`:
+8 entries of name + service slot, an `IrqSpinLock`, and `register`, `lookup`, `ensure`, `count`,
+`entryAt`. Every registration is checked against the slot's live state, so a name cannot point at
+a slot that does not exist; duplicates are refused, not overwritten. Lookup reads the service
+record and its generation under the registry lock, which is the same lock the supervisor takes
+when it changes a state, so a lookup can never interleave with a restart half-applied: it sees
+either the old generation running or the new one restarting, and says which. `service.Service`
+gained a `generation` counter bumped by `launch`, which is what makes "same service, new
+incarnation" observable from user space. User space reaches all of it through one new syscall,
+`UserNr.resolve = 38`: `resolve(name_ptr, name_len, out_pid)` returns the reason code and writes
+the pid only on ok, with the pointer range validated like every other string argument.
+`pos.elf resolve <name>` prints the outcome and **exits with the reason code**, which is how the
+probe proves graceful degradation rather than describing it. The shell gained `registry`,
+`resolve <name>` and `ensure <name>`.
+
+The probe's step [14] is the phase's acceptance test, on the same clean build:
+
+```
+  [14] registry: by-name resolution, and graceful absence
+      register: ok, ok, duplicate already registered, invalid invalid name, unknown target unknown name  OK
+      lookup: stopped not running, unknown unknown name, invalid invalid name, bare scheme invalid name  OK
+      lazy start: ensure pos://printer -> ok pid 132 gen 8  OK
+      live: pos://checkout -> ok pid 133 gen 2  OK
+      restart: during backoff restarting, after ok gen 2 -> 3  OK
+      parked: pos://printer -> crash-loop parked  OK
+      call site: 3/3 by-name lookups exited with the expected reason  OK
+      stop: live processes 0 -> 0, spaces 0 -> 0  OK
+      registry: 2 names, 22 lookups, 5 hits, 18 refusals, 1 lazy starts
+  RESULT: PASS
+```
+
+Read it as measured behaviour, not a story. Two names were registered under services that
+phase 27 left stopped; a duplicate, a syntactically invalid name and a name for a slot that does
+not exist were all refused without touching the table. `ensure pos://printer` found the service
+registered but stopped and started it, returning pid 132 at generation 8 (it had already been
+restarted seven times by earlier steps, which is what the generation records). `pos://checkout`
+resolved to its running child at generation 2. The checkout child was then killed *while a
+lookup was in flight*: the first answer was `restarting` (not an error, not a stale pid), and the
+next lookup after the supervisor's restart returned ok at generation 3 — the same name now naming
+a different process. The printer was then killed seven times through the same policy phase 27
+installed, and the lookup answered `crash-loop parked` while the process was gone. Finally three
+separate `pos.elf resolve` processes asked by name: the live one exited 0, the parked one exited
+4 and the unknown one exited 1, so the degradation is a reason code a POS app can branch on, not
+a hang or a fault. Counters reconcile: 22 lookups, 5 hits, 18 refusals (every refused or
+unavailable lookup is counted; hits are the ones that returned a pid).
+
+Host tests: 60/60 (5 new: the name grammar accepts lowercase/digits/hyphens and rejects empty,
+over-long, uppercase, bare-scheme and edge-hyphen names; the reason mapping covers unknown,
+invalid, not-running, restarting, parked, exited and ok; reason labels are stable; the enum's
+ABI values are pinned; the label table is exhaustive). Regression sweep on the same build:
+4/4 four-core probe boots `RESULT: PASS`, 2/2 single-core boots `RESULT: PASS`, `stress 4 20000`
+0 lost updates, `preempt 1000` PASS, `reap 8` 0 pages leaked, `logstorm 4` all four writer lines
+intact, `cores` 4 online, `irq` 0 spurious and 0 unhandled, `-m 1024M` 259407 pages free,
+`textwrite` permission fault at level 3 (the shell survives it).
+
+**A scheduler race this phase surfaced (open, not fixed here).** Under the kill/restart churn of
+step [13] one four-core boot in roughly eight panicked with `selected thread 0 in state unused`:
+a run queue entry named a thread that had already been reaped and recycled. Instrumenting the
+scheduler showed the outgoing thread was being queued while still flagged `on_cpu`, so another
+core dropped the entry as a split brain (`double_run_events` ~100 per probe boot) and the thread
+was left queued nowhere — the same family as the use-after-free phase 27 fixed. Separating the
+two facts (`on_cpu` for queue ownership, `switching_out` for stack ownership) took the counter to
+0, but the first two attempts at that split changed behaviour elsewhere and produced hung boots,
+so the scheduler is **unchanged from the phase-27 commit** and this is deferred rather than
+half-fixed: the queue-ownership decoupling needs its own phase with a longer soak than this one
+can give it. Phase 28 touches no scheduler code. The evidence for shipping now is 6/6 clean
+probe boots on this build.
+
+**Deferred:** names are flat, not a tree, and there is no per-name ACL, so any process can resolve
+any registered name (phase 30's capability manifests are where that belongs). The registry does
+not survive reboot: names are re-registered by the probe and by the shell at runtime, and a
+persisted manifest store needs the filesystem phases. `pos://` is the only scheme, and it is
+validated but not interpreted beyond the scheme prefix. Lazy start only starts a registered
+service; it does not fetch a manifest or an image by name. There is no unregister, so a name is
+bound for the life of the boot (the table is fixed and the probe registers two). Health is
+liveness-as-a-reason, not a request/response probe: a service that is running but wedged answers
+ok. The pid a lookup returns can be stale by the time the caller uses it — it is an identity at
+resolution time, and the generation counter is what lets a caller notice the service was replaced.
 
 ### Phase 29 — Resource accounting `[ ]`
 **Goal:** No single service can starve the till.
