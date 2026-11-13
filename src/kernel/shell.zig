@@ -26,6 +26,8 @@ const thread_mod = @import("thread.zig");
 const cap = @import("cap.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
+const elf = @import("elf.zig");
+const store = @import("image.zig");
 const syscall = @import("syscall.zig");
 
 pub const Context = struct {
@@ -81,6 +83,9 @@ fn printHelp() void {
         \\  caps                 capability objects and their reference counts
         \\  ipc                  IPC endpoint counters
         \\  shm                  shared-memory objects and event counters
+        \\  exec <image> [args]  load an ELF from the image store and run it
+        \\  images               list the image store
+        \\  elf                  ELF loader state and the last load plan
         \\
     , .{});
 }
@@ -538,6 +543,117 @@ fn cmdShm(_: Context) void {
     }
 }
 
+fn cmdImages(_: Context) void {
+    out("  {d} image(s) in the store\n", .{store.count()});
+    var i: usize = 0;
+    while (i < store.count()) : (i += 1) {
+        const f = store.at(i);
+        out("    {s:<12} {d} bytes\n", .{ f.name, f.bytes.len });
+    }
+}
+
+fn cmdElf(_: Context) void {
+    out("  loads {d}, refused {d} (last: {s})\n", .{
+        process.execs, process.exec_failures, process.refusalLabel(process.last_refusal),
+    });
+    const file = store.find("pos.elf") orelse return;
+    if (elf.parse(file.bytes)) |img| {
+        out("  pos.elf: entry 0x{x}, {d} segment(s), {d} file bytes, {d} memory bytes, {d} BSS\n", .{
+            img.entry, img.count, img.file_bytes, img.memory_bytes, img.bss_bytes,
+        });
+        var i: usize = 0;
+        while (i < img.count) : (i += 1) {
+            const seg = img.segments[i];
+            out("    seg {d}: 0x{x} + 0x{x}  {s}{s}{s}\n", .{
+                i, seg.vaddr, seg.memsz,
+                if (seg.read) "r" else "-",
+                if (seg.write) "w" else "-",
+                if (seg.exec) "x" else "-",
+            });
+        }
+    } else |e| {
+        out("  pos.elf: refused: {s}\n", .{elf.errorLabel(e)});
+    }
+}
+
+fn cmdExec(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const name = tokens.next() orelse {
+        out("  usage: exec <image> [args...]\n", .{});
+        return;
+    };
+    var argv_buf: [8][]const u8 = undefined;
+    argv_buf[0] = name;
+    var argc: usize = 1;
+    while (tokens.next()) |tok| {
+        if (argc == argv_buf.len) break;
+        argv_buf[argc] = tok;
+        argc += 1;
+    }
+    const env = [_][]const u8{"POS_TERM=cassa-1"};
+    const p = process.spawnElf(name, argv_buf[0..argc], &env) orelse {
+        out("  exec: '{s}' refused: {s} ({d} refusal(s) so far)\n", .{
+            name, process.refusalLabel(process.last_refusal), process.exec_failures,
+        });
+        return;
+    };
+    const st = process.wait(p.pid, 5000);
+    const code = p.exit_code;
+    _ = process.waitReaped(p.pid, 1000);
+    out("  pid {d} '{s}': {s}, exit code {d}\n", .{ p.pid, name, @tagName(st), code });
+}
+
+fn refuses(bytes: []const u8, want: elf.Error) bool {
+    if (elf.parse(bytes)) |_| return false else |e| return e == want;
+}
+
+/// Prove the loader's refusal paths against the real file: a bad magic number,
+/// a writable-and-executable segment, an entry point outside every executable
+/// segment, and a truncated header. Each must be refused with its own error
+/// before a page is allocated.
+const ElfRefusals = struct {
+    bad_magic: bool = false,
+    write_exec: bool = false,
+    entry: bool = false,
+    truncated: bool = false,
+
+    fn all(self: ElfRefusals) bool {
+        return self.bad_magic and self.write_exec and self.entry and self.truncated;
+    }
+};
+
+fn elfRefusals() ElfRefusals {
+    var r = ElfRefusals{};
+    const img = elf.parse(store.pos_elf) catch return r;
+    if (img.count == 0) return r;
+
+    // The whole file, not just its header: a partial copy would be refused as
+    // truncated before the check under test is ever reached.
+    const scratch = struct {
+        var bytes: [store.pos_elf.len]u8 = undefined;
+    };
+    @memcpy(&scratch.bytes, store.pos_elf);
+    const view = scratch.bytes[0..];
+
+    scratch.bytes[1] = 'X';
+    r.bad_magic = refuses(view, error.BadMagic);
+    scratch.bytes[1] = 'E';
+
+    const phoff: usize = @intCast(std.mem.readInt(u64, scratch.bytes[32..40], .little));
+    if (phoff + elf.phdr_size > view.len) return r;
+    const saved_flags = scratch.bytes[phoff + 4 ..][0..4].*;
+    std.mem.writeInt(u32, scratch.bytes[phoff + 4 ..][0..4], 7, .little);
+    r.write_exec = refuses(view, error.WriteExecute);
+    scratch.bytes[phoff + 4 ..][0..4].* = saved_flags;
+
+    const saved_entry = scratch.bytes[24..32].*;
+    std.mem.writeInt(u64, scratch.bytes[24..32], 0x4000_0000, .little);
+    r.entry = refuses(view, error.EntryOutside);
+    scratch.bytes[24..32].* = saved_entry;
+
+    r.truncated = refuses(store.pos_elf[0..32], error.Truncated);
+    return r;
+}
+
 fn status(ok: bool) []const u8 {
     return if (ok) "OK" else "FAIL";
 }
@@ -650,6 +766,35 @@ fn cmdUprobe(ctx: Context) void {
     const shm_ok = procs_ok and shared_ok and objects == 1 and mappings == 3 and
         shm.creates >= 1 and shm.woken_threads >= 2 and shm.timeouts >= 1 and shm.unmaps >= 1;
     pass = pass and shm_ok;
+
+    out("  [12] ELF loading: a separate program launched from the image store\n", .{});
+    const refusals = elfRefusals();
+    out("      refuses bad magic {s}, writable+executable {s}, bad entry {s}, truncated {s}\n", .{
+        status(refusals.bad_magic), status(refusals.write_exec),
+        status(refusals.entry), status(refusals.truncated),
+    });
+    const loader_ok = refusals.all();
+    const pos_argv = [_][]const u8{ "pos.elf", "alpha", "beta" };
+    const pos_env = [_][]const u8{"POS_TERM=cassa-1"};
+    var exec_ok = false;
+    if (process.spawnElf("pos.elf", &pos_argv, &pos_env)) |p| {
+        const st = process.wait(p.pid, 5000);
+        const code = p.exit_code;
+        _ = process.waitReaped(p.pid, 1000);
+        exec_ok = st == .exited and code == 42;
+        out("      pid {d} 'pos.elf alpha beta': {s}, exit code {d}  {s}\n", .{
+            p.pid, @tagName(st), code, status(exec_ok),
+        });
+    } else {
+        out("      FAIL: cannot launch pos.elf ({s})\n", .{process.refusalLabel(process.last_refusal)});
+    }
+    const ghost = process.spawnElf("ghost.elf", &pos_argv, &pos_env);
+    const refused_ok = ghost == null and process.last_refusal == .not_found;
+    out("      missing image: refused ({s})  {s}\n", .{ process.refusalLabel(process.last_refusal), status(refused_ok) });
+    out("      elf: {d} load(s), {d} refusal(s), {d} process(es) spawned in total\n", .{
+        process.execs, process.exec_failures, process.spawns,
+    });
+    pass = pass and loader_ok and exec_ok and refused_ok;
 
     out("  ------------------------------------------------------------------\n", .{});
 
@@ -923,6 +1068,12 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdIpc(ctx);
     } else if (std.mem.eql(u8, command, "shm")) {
         cmdShm(ctx);
+    } else if (std.mem.eql(u8, command, "exec")) {
+        cmdExec(&tokens);
+    } else if (std.mem.eql(u8, command, "images")) {
+        cmdImages(ctx);
+    } else if (std.mem.eql(u8, command, "elf")) {
+        cmdElf(ctx);
     } else if (std.mem.eql(u8, command, "logstorm")) {
         cmdLogStorm(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "sleep")) {

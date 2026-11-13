@@ -630,11 +630,101 @@ charge stay open with the phase-23 items (variable handle-table size, no general
 other object kinds). The IPC throughput target above 100,000 msg/s remains unmet for the
 reason recorded in phase 24.
 
-### Phase 26 — Processes and ELF loading `[ ]`
+### Phase 26 — Processes and ELF loading `[x]`
 **Goal:** Run separately built programs.
 **Build:** ELF64/AArch64 loader (segments, permissions, BSS), argv/envp, process lifecycle,
 exit status propagation.
-**Done when:** The POS shell launches a user-space binary from the filesystem.
+**Done when:** The POS shell launches a user-space binary by name.
+
+> Scope note: the standalone VFS phases come later in this plan, so the name lookup runs
+> against a read-only image store (a table of embedded files) rather than a filesystem. The
+> loader consumes real file bytes and the shell launches by name, which is the observable
+> contract this phase owns; the store is the one call that a VFS will replace.
+
+**Acceptance (concrete):**
+1. A program built by the same toolchain as its own ELF64 executable — separate segments,
+   separate data, separate BSS — is embedded as *file bytes*, not a flat blob, and the kernel
+   parses it at runtime.
+2. The parser validates ELF64/little-endian/ET_EXEC/EM_AARCH64, refuses a bad magic number,
+   a wrong word size, a wrong machine, a truncated header or program table, a segment whose
+   file bytes do not fit in the file, `p_filesz > p_memsz`, a segment outside the user
+   window, overlapping segments, a writable-and-executable segment, and an entry point
+   outside an executable segment — before a single page is allocated.
+3. The loader maps each page once with the union of the permissions of the segments that
+   touch it, refuses a page that would end up both writable and executable, copies the
+   file-backed part of each page and leaves the rest zero, so BSS arrives as zeroes.
+4. The startup ABI is x0 = argc, x1 = argv, x2 = envp, with the strings and both pointer
+   vectors built on the user stack before the thread is admitted; SP is 16-byte aligned.
+5. `exec <image> [args...]` in the shell loads the image by name, runs it, and prints its exit
+   status; a missing image is refused as "no such image" and nothing is spawned.
+6. `images` lists the store and `elf` prints the last load plan (entry, segments, bytes, BSS)
+   and the load/refusal counters.
+7. No regressions: phases 1-25 keep passing, host tests stay green (with new host tests for
+   the parser), and the probe passes on `-smp 1` and `-smp 4`.
+
+**Verified:** `pos.elf` is a genuinely separate program: `zig build` compiles it as its own
+executable from `src/user/pos.zig` (its own linker script puts .text, .rodata, .data and .bss
+on their own pages), embeds the ELF file in the kernel, and the kernel parses those bytes at
+runtime. It is 67 KB of file for 1366 bytes of loadable content — the padding is the linker's
+64 KiB segment alignment, and the loader honours it because it maps pages, not offsets.
+
+The load plan the shell prints is the parser's own answer: entry 0x80000000, three segments
+(r-x at 0x80000000, r-- at 0x80001000, rw- at 0x80002000), 1366 file bytes, 1622 memory
+bytes, 256 BSS. The kernel maps each page once with the union of the permissions of the
+segments touching it and refuses any page that would be writable *and* executable; that rule
+is why the program's linker script aligns permission groups to pages, and why a hand-made
+image with W+X fails before a frame is allocated.
+
+The program itself checks what only the program can see: its BSS arrived as zeroes, its
+initialised data survived the load, argc is 3, argv[1] and argv[2] are the arguments the shell
+passed, envp carries `POS_TERM=cassa-1`, and it can print and read the clock through syscalls.
+It exits 42 when all of that holds and 9 otherwise, so the shell's exit-code check is the
+argv/envp check.
+
+```
+  [12] ELF loading: a separate program launched from the image store
+      refuses bad magic OK, writable+executable OK, bad entry OK, truncated OK
+[user] pos: argc 3
+[user] pos: argv[0] pos.elf
+[user] pos: argv[1] alpha
+[user] pos: argv[2] beta
+[user] pos: env POS_TERM=cassa-1
+[user] pos: pid 103, uptime 3175 ms
+[user] pos: loaded from ELF, argv and envp intact
+      pid 103 'pos.elf alpha beta': exited, exit code 42  OK
+      missing image: refused (no such image)  OK
+      elf: 1 load(s), 1 refusal(s), 4 process(es) spawned in total
+  RESULT: PASS
+```
+
+`-smp 1` prints the same case results and `RESULT: PASS`. After the probe has run, the `elf`
+command reports `loads 1, refused 1` and the plan above; `images` lists the single entry
+(`pos.elf 67264 bytes`) on a fresh boot.
+
+The four refusal cases are executed against the real file at probe time, by copying it and
+damaging one field at a time: the magic number, the first segment's permission bits, the
+entry point, and (without a copy) the header length. The first attempt at this proved a
+subtlety worth recording: a 1 KiB copy of the file is refused as *truncated* before the check
+under test is ever reached, because the segments live far past the header. The probe now
+copies the whole file, and the unit tests build their images with the correct total length —
+both were real bugs in the tests, not in the loader.
+
+Host tests: 52/52 (10 new ELF tests: a valid plan with BSS accounting, every header refusal,
+file/segment length errors, W^X, window bounds, overlaps, entry placement, and a table with
+no PT_LOAD). Regression sweep on the same clean build: `stress 4 20000` -> 80000 exact, 0
+lost; `preempt 1000` -> 22..23 slices per thread; `reap 8` -> 0 pages leaked; `logstorm 4` ->
+96/96 intact lines; `irq` -> 0 spurious, 0 unhandled; `-m 1024M` -> 1024 MiB; `textwrite` ->
+permission fault at 0x40080000. Five extra four-core probe boots after the change ran with no
+fault and `RESULT: PASS`.
+
+**Gap (open):** the image store is embedded in the kernel, not a filesystem: name lookup is a
+linear scan of one table, and the file bytes cost kernel image size. That is the VFS phases'
+job. ELF processes start with **no capability handles** — unlike the demo blob they get no
+ledger, page or bootstrap endpoint, because the startup ABI passes only argc/argv/envp; wiring
+a handle table into a loaded program belongs with the VFS/userland phase that gives programs
+something to do with it. Only ET_EXEC is supported (no PIE, no dynamic linking, no
+relocations), there is no ASLR, argv/envp are capped at 8 entries each, and `exec` does not
+inherit the caller's environment beyond the fixed `POS_TERM`.
 
 ### Phase 27 — Lifecycle and fault isolation `[ ]`
 **Goal:** One crashing service cannot take the till down.

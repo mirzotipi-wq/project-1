@@ -22,12 +22,13 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–25 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–26 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
 inline messages and handle transfer, and share 4 MiB buffers by mapping the same frames with
-futex-style wait and wake. (Phase 13 is partial: IRQ-safe locks and counters exist, storm throttling does not.
+futex-style wait and wake. Separately built ELF64 programs are loaded from an image store,
+given argv/envp and their own BSS, and run with their exit status propagated. (Phase 13 is partial: IRQ-safe locks and counters exist, storm throttling does not.
 Phase 19 is deferred until block devices exist.)
 
 | Phase | What exists | How it is verified |
@@ -56,8 +57,9 @@ Phase 19 is deferred until block devices exist.)
 | 23 | handle tables, rights masks, derivation, revocation, object refcounts | `uprobe` cases 1–6 on 1 and 4 cores; `caps` |
 | 24 | IPC endpoints, call/reply, handle transfer, deadlines, backpressure | `uprobe` step 10: 11 cases on 1 and 4 cores; `ipc` |
 | 25 | shared memory objects, multi-space mapping, futex wait/wake, event counters | `uprobe` step 11: 21 cases on 1 and 4 cores; `shm` |
+| 26 | ELF64 loader, segment permissions, BSS, argv/envp, exit status | `uprobe` step 12: `pos.elf` exits 42; `exec`, `images`, `elf` |
 
-The remaining 75 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 74 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -79,7 +81,7 @@ inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `str
 (contended counter), `preempt 1000` (three spinning threads, one core), `reap 8` (reaping),
 `logstorm 4` (unbroken console lines from four cores), `caps` (capability objects and their
 reference counts), `ipc` (endpoint counters), `shm` (shared-memory objects, mappings and event
-counters) and `svc`.
+counters), `exec`/`images`/`elf` (launch a program from the image store) and `svc`.
 
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
 1 privileged-register attempt, 2 kernel-memory read, 3 two-process isolation, 4 the capability
@@ -101,6 +103,9 @@ shares memory: a 4 MiB object created by one process, mapped read-write there an
 plus read-only in a second process through transferred handles, verified word for word in both
 directions, with one sleeper woken on a futex word, a stale expectation returning EAGAIN, a
 deadline returning ETIMEDOUT and an outsider refused with EBADF and EINVAL without a fault.
+Step 12 loads a program: `pos.elf` is built as its own ELF64 executable, parsed by the kernel,
+mapped segment by segment with the permissions the file asks for, given argv/envp on its
+stack, and exits 42 after proving its BSS arrived zeroed and its arguments intact.
 
 The kernel is built for the ARMv8.0-A baseline (`cortex-a53` + FP/NEON), so the same binary
 runs on Cortex-A53/A55/A72/A76/A78/X-series, Neoverse N1/N2/V1, Apple silicon and Graviton.

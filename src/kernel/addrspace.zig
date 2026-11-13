@@ -27,6 +27,7 @@ const pmm = @import("pmm.zig");
 const cpu = @import("../arch/aarch64/cpu.zig");
 const mmu = @import("../arch/aarch64/mmu.zig");
 const uaccess = @import("uaccess.zig");
+const elf = @import("elf.zig");
 const klog = @import("klog.zig");
 
 /// Base of the user window. Outside every kernel mapping (the kernel identity
@@ -45,6 +46,8 @@ pub const data_pages: usize = 2;
 pub const stack_pages: usize = 4;
 pub const max_image_bytes: usize = 48 * 1024;
 pub const max_frames: usize = 32;
+/// Upper bound on the pages one ELF image may occupy (256 KiB of program).
+pub const max_elf_pages: usize = 64;
 pub const max_tables: usize = 8;
 pub const max_spaces: usize = 6;
 
@@ -312,6 +315,188 @@ pub fn unmapShared(as: *AddressSpace, va: usize, len: usize) bool {
     cpu.dsbSy();
     cpu.isb();
     return true;
+}
+
+/// Write into a process's memory through its own page tables. The loader runs
+/// while the process is not scheduled, so it cannot just store to the address.
+pub fn writeUser(as: *AddressSpace, va: usize, bytes: []const u8) bool {
+    var done: usize = 0;
+    while (done < bytes.len) {
+        const v = va + done;
+        const pa = translate(as, v) orelse return false;
+        const chunk = @min(page - (v % page), bytes.len - done);
+        const dst: [*]u8 = @ptrFromInt(pa);
+        @memcpy(dst[0..chunk], bytes[done .. done + chunk]);
+        done += chunk;
+    }
+    return true;
+}
+
+pub const Start = struct {
+    sp: usize,
+    argc: usize,
+    argv: usize,
+    envp: usize,
+};
+
+pub const max_start_args: usize = 8;
+
+/// Build the process's initial stack: the strings, then the argv and envp
+/// pointer vectors. The startup ABI hands these over in x0..x2, so nothing has
+/// to be read out of a data page or guessed by the program.
+pub fn buildStartStack(as: *AddressSpace, argv: []const []const u8, envp: []const []const u8) ?Start {
+    if (argv.len == 0 or argv.len > max_start_args or envp.len > max_start_args) return null;
+    var p = as.stackTop();
+    var arg_va: [max_start_args]usize = [_]usize{0} ** max_start_args;
+    var env_va: [max_start_args]usize = [_]usize{0} ** max_start_args;
+    const nul = [_]u8{0};
+
+    var i: usize = 0;
+    while (i < envp.len) : (i += 1) {
+        const s = envp[i];
+        p -= s.len + 1;
+        if (!writeUser(as, p, s)) return null;
+        if (!writeUser(as, p + s.len, &nul)) return null;
+        env_va[i] = p;
+    }
+    i = 0;
+    while (i < argv.len) : (i += 1) {
+        const s = argv[i];
+        p -= s.len + 1;
+        if (!writeUser(as, p, s)) return null;
+        if (!writeUser(as, p + s.len, &nul)) return null;
+        arg_va[i] = p;
+    }
+    p &= ~@as(usize, 15);
+
+    var vec: [max_start_args + 1]u64 = [_]u64{0} ** (max_start_args + 1);
+    i = 0;
+    while (i < envp.len) : (i += 1) vec[i] = env_va[i];
+    p -= (envp.len + 1) * 8;
+    const envp_va = p;
+    if (!writeUser(as, p, std.mem.asBytes(&vec)[0 .. (envp.len + 1) * 8])) return null;
+
+    i = 0;
+    while (i < argv.len) : (i += 1) vec[i] = arg_va[i];
+    p -= (argv.len + 1) * 8;
+    const argv_va = p;
+    if (!writeUser(as, p, std.mem.asBytes(&vec)[0 .. (argv.len + 1) * 8])) return null;
+
+    // Red zone below the vectors, and a 16-byte aligned SP as the ABI requires.
+    const sp = (p - 16) & ~@as(usize, 15);
+    return .{ .sp = sp, .argc = argv.len, .argv = argv_va, .envp = envp_va };
+}
+
+/// Build an address space from an ELF load plan. Each segment gets exactly the
+/// permissions the file asked for, its file-backed part is copied in, and the
+/// rest of `p_memsz` is BSS that stays zero because the frames are zeroed.
+pub fn createElf(alloc: *pmm.PageAllocator, img: *const elf.Image, file: []const u8) ?*AddressSpace {
+    const as = freeSlot() orelse return null;
+    as.* = .{ .in_use = true, .id = next_id };
+    next_id += 1;
+
+    as.root = allocFrameInto(as, alloc) orelse return bail(alloc, as);
+    mmu.copyKernelRoot(as.root);
+    const l1 = allocFrameInto(as, alloc) orelse return bail(alloc, as);
+    as.l1 = l1;
+    copyPage(l1, mmu.kernelL1Pa());
+    @as(*[512]u64, @ptrFromInt(as.root))[mmu.l0Index(code_va)] = l1 | 0b11;
+    const l2 = allocFrameInto(as, alloc) orelse return bail(alloc, as);
+    as.l2 = l2;
+    @as(*[512]u64, @ptrFromInt(as.l1))[mmu.l1Index(code_va)] = l2 | 0b11;
+
+    // Two segments can share a page: the linker puts .text and .rodata in the
+    // same 4 KiB page when the first one ends mid-page. Mapping per segment
+    // would allocate the page twice and let the last segment's permissions win,
+    // so pages are collected first, given the union of the rights that touch
+    // them, and only then mapped and filled.
+    var page_va: [max_elf_pages]usize = undefined;
+    var page_write: [max_elf_pages]bool = undefined;
+    var page_exec: [max_elf_pages]bool = undefined;
+    var page_count: usize = 0;
+
+    var s: usize = 0;
+    while (s < img.count) : (s += 1) {
+        const seg = img.segments[s];
+        const first = std.mem.alignBackward(usize, seg.vaddr, page);
+        const last = std.mem.alignForward(usize, seg.vaddr + seg.memsz, page);
+        var va = first;
+        while (va < last) : (va += page) {
+            var found: ?usize = null;
+            var k: usize = 0;
+            while (k < page_count) : (k += 1) {
+                if (page_va[k] == va) found = k;
+            }
+            if (found) |idx| {
+                page_write[idx] = page_write[idx] or seg.write;
+                page_exec[idx] = page_exec[idx] or seg.exec;
+            } else {
+                if (page_count == max_elf_pages) return bail(alloc, as);
+                page_va[page_count] = va;
+                page_write[page_count] = seg.write;
+                page_exec[page_count] = seg.exec;
+                page_count += 1;
+            }
+        }
+    }
+    // A shared page can only stay W^X if no writable segment touches a page an
+    // executable segment also touches. Refuse rather than create a page that is
+    // both, which the ELF's own per-segment check cannot see.
+    var k: usize = 0;
+    while (k < page_count) : (k += 1) {
+        if (page_write[k] and page_exec[k]) return bail(alloc, as);
+    }
+    k = 0;
+    while (k < page_count) : (k += 1) {
+        const pa = allocFrameInto(as, alloc) orelse return bail(alloc, as);
+        if (!mapPage(as, alloc, page_va[k], pa, page_exec[k], page_write[k])) return bail(alloc, as);
+    }
+    // With the pages in place, the file-backed bytes are copied through the
+    // process's own tables; everything else in those pages stays zero.
+    s = 0;
+    while (s < img.count) : (s += 1) {
+        const seg = img.segments[s];
+        if (seg.filesz == 0) continue;
+        const lo = seg.vaddr;
+        const hi = seg.vaddr + seg.filesz;
+        var va = std.mem.alignBackward(usize, lo, page);
+        while (va < hi) : (va += page) {
+            const from = @max(va, lo);
+            const to = @min(va + page, hi);
+            const pa = translate(as, from) orelse return bail(alloc, as);
+            const dst: [*]u8 = @ptrFromInt(pa);
+            const src = seg.offset + (from - lo);
+            @memcpy(dst[0 .. to - from], file[src .. src + (to - from)]);
+        }
+        if (as.region_count >= uaccess.max_regions) return bail(alloc, as);
+        as.regions[as.region_count] = .{
+            .base = seg.vaddr,
+            .len = seg.memsz,
+            .user_write = seg.write,
+            .user_exec = seg.exec,
+            .name = "elf",
+        };
+        as.region_count += 1;
+    }
+
+    var i: usize = 0;
+    while (i < stack_pages) : (i += 1) {
+        const pa = allocFrameInto(as, alloc) orelse return bail(alloc, as);
+        if (!mapPage(as, alloc, stack_va + i * page, pa, false, true)) return bail(alloc, as);
+    }
+    if (as.region_count >= uaccess.max_regions) return bail(alloc, as);
+    as.regions[as.region_count] = .{
+        .base = stack_va,
+        .len = stack_pages * page,
+        .user_write = true,
+        .name = "stack",
+    };
+    as.region_count += 1;
+    as.code_len = img.memory_bytes;
+
+    // The instructions came from the file; make them visible to the fetcher.
+    cpu.icIallu();
+    return as;
 }
 
 /// Where a mapped capability page appears in the user window. Between the data

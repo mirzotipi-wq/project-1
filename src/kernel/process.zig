@@ -15,6 +15,8 @@ const pmm = @import("pmm.zig");
 const klog = @import("klog.zig");
 const cap = @import("cap.zig");
 const ipc = @import("ipc.zig");
+const store = @import("image.zig");
+const elf = @import("elf.zig");
 
 pub const State = enum { free, running, exited, killed };
 
@@ -133,6 +135,78 @@ fn spawnWith(mode: u64, secret: u64, name: []const u8, profile: Profile, endpoin
         slot.pid, name, user_space.code_va, as.stackTop(), as.bytes() / 1024, mode,
     });
     sched.admit(t);
+    return slot;
+}
+
+pub var execs: u32 = 0;
+pub var exec_failures: u32 = 0;
+pub const Refusal = enum { none, not_found, not_loadable, no_memory };
+pub var last_refusal: Refusal = .none;
+
+pub fn refusalLabel(r: Refusal) []const u8 {
+    return switch (r) {
+        .none => "none",
+        .not_found => "no such image",
+        .not_loadable => "image not loadable",
+        .no_memory => "out of memory",
+    };
+}
+
+/// Launch a program from the image store. The file is parsed as ELF64, its
+/// segments become the address space, its BSS is zero, and its argv/envp are on
+/// the stack before the thread is admitted — so the program's very first
+/// instruction runs with a complete environment.
+pub fn spawnElf(name: []const u8, argv: []const []const u8, envp: []const []const u8) ?*Process {
+    const file = store.find(name) orelse {
+        exec_failures += 1;
+        last_refusal = .not_found;
+        return null;
+    };
+    const img = elf.parse(file.bytes) catch |e| {
+        exec_failures += 1;
+        last_refusal = .not_loadable;
+        klog.warn("exec", "'{s}' refused: {s}", .{ name, elf.errorLabel(e) });
+        return null;
+    };
+    const a = alloc orelse return null;
+    const slot = freeSlot() orelse {
+        exec_failures += 1;
+        last_refusal = .no_memory;
+        return null;
+    };
+    const as = user_space.createElf(a, &img, file.bytes) orelse {
+        exec_failures += 1;
+        last_refusal = .no_memory;
+        return null;
+    };
+    const start = user_space.buildStartStack(as, argv, envp) orelse {
+        user_space.destroy(a, as);
+        exec_failures += 1;
+        last_refusal = .no_memory;
+        return null;
+    };
+    const t = thread_mod.createUser(a, name, as, img.entry, start.sp) orelse {
+        user_space.destroy(a, as);
+        exec_failures += 1;
+        last_refusal = .no_memory;
+        return null;
+    };
+    // x0 = argc, x1 = argv, x2 = envp: the documented startup ABI.
+    const frame: *trap.Frame = @ptrFromInt(t.sp);
+    frame.x[0] = start.argc;
+    frame.x[1] = start.argv;
+    frame.x[2] = start.envp;
+
+    const pid = next_pid;
+    next_pid += 1;
+    slot.* = .{ .pid = pid, .thread_id = t.id, .state = .running };
+    sched.admit(t);
+    spawns += 1;
+    execs += 1;
+    last_refusal = .none;
+    klog.info("exec", "pid {d} '{s}': entry 0x{x}, {d} segments, {d} bytes, {d} BSS, argc {d}", .{
+        pid, name, img.entry, img.count, img.file_bytes, img.bss_bytes, start.argc,
+    });
     return slot;
 }
 
