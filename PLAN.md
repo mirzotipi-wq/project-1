@@ -920,18 +920,60 @@ ABI values are pinned; the label table is exhaustive). Regression sweep on the s
 intact, `cores` 4 online, `irq` 0 spurious and 0 unhandled, `-m 1024M` 259407 pages free,
 `textwrite` permission fault at level 3 (the shell survives it).
 
-**A scheduler race this phase surfaced (open, not fixed here).** Under the kill/restart churn of
-step [13] one four-core boot in roughly eight panicked with `selected thread 0 in state unused`:
-a run queue entry named a thread that had already been reaped and recycled. Instrumenting the
-scheduler showed the outgoing thread was being queued while still flagged `on_cpu`, so another
-core dropped the entry as a split brain (`double_run_events` ~100 per probe boot) and the thread
-was left queued nowhere — the same family as the use-after-free phase 27 fixed. Separating the
-two facts (`on_cpu` for queue ownership, `switching_out` for stack ownership) took the counter to
-0, but the first two attempts at that split changed behaviour elsewhere and produced hung boots,
-so the scheduler is **unchanged from the phase-27 commit** and this is deferred rather than
-half-fixed: the queue-ownership decoupling needs its own phase with a longer soak than this one
-can give it. Phase 28 touches no scheduler code. The evidence for shipping now is 6/6 clean
-probe boots on this build.
+**Scheduler follow-up (after phase 28): run-queue lifecycle.** The kill-path churn of step [13]
+exposed an intermittent four-core panic, `selected thread 0 in state unused`, and the phase-28
+notes recorded it as open. It is now fixed. The panic was a **queue entry naming a thread that had
+already been reaped and whose slot had been recycled**: `thread.destroy` zeroes a slot, so a queue
+still holding that slot pops "thread 0 in state unused" — and because `destroy` also clears the
+freed thread's own `next`, the queue's *predecessor* is left pointing at the zeroed slot, which is
+how a boot that had run for seconds suddenly selected a thread id of 0.
+
+The cause was a **duplicate run-queue entry**, not a stolen one. There were two publish sites for
+the same outgoing thread: `reschedule` pushed it when it was runnable, and `cassa_after_switch`
+pushed it *again* if a wake arrived in the window between them (`on_cpu` was still true, so
+`makeReadyLocked` recorded `pending_wake` instead of queueing). The thread then had two entries.
+One was consumed when it ran; the survivor could be popped after the thread had blocked, died and
+been reaped, i.e. after its slot was zeroed. The earlier "queued while on_cpu" reading was a
+symptom: the `double_run_events` counter that appeared to confirm it was actually counting the
+core's own **idle** thread, which is legitimately on-CPU whenever a core falls back to it, so that
+counter said nothing about real duplicate entries at all.
+
+What changed, and the invariant it establishes:
+
+* **Invariant R:** every run-queue entry names a thread that is `ready` and that no core is
+  executing; every `ready` thread is in exactly one run queue. The transition into `ready` and the
+  push happen together under the scheduler lock at exactly two sites — `makeReadyLocked` for a
+  parked (off-CPU) thread, and `cassa_after_switch` for the thread that has just left the core.
+  `reschedule` no longer queues the outgoing thread at all; it only decides what the thread will
+  be (ready/blocked/dead) and folds a deferred wake into that decision. Publishing happens in the
+  trampoline, at the first instant the stack is genuinely free, in the same critical section that
+  clears `on_cpu`.
+* `pushTail` asserts Invariant R and counts a refusal (`queue_violations`); the reaper refuses to
+  free a thread that is still referenced by any run queue (`deferred_reaps`); a stale queue entry
+  is dropped instead of resumed; and the tick audits for a `ready` thread that has sat in no queue
+  for more than 50 ms, reports it with the site that made it ready, and re-queues it (`stray_ready`)
+  so a lost wake becomes one late slice and a number instead of a stalled service.
+* The idle fallback is no longer judged by the queue-entry rules, which is what the old
+  `double_run_events` count was really measuring.
+* Nothing allocates on the switch path; the only added state is three diagnostic words per thread
+  (`ready_site`, `ready_ms`) and three counters. `-smp 1` boot and the switch soaks are unchanged.
+
+Evidence on the fixed build: the new shell command `killoop <rounds>` is a relaunch ladder —
+spawn a user program, kill it, wait for the kernel to reap it, repeat — aimed at exactly this
+lifecycle. `killoop 150` ran twice, 150/150 rounds each, with `0 double-run, 0 queue violation(s),
+0 deferred reap(s), 0 stray ready` and 0 pages leaked; the phase-28 probe's step [13] (seven kills,
+six backoff restarts, park) and step [14] (by-name resolution, restarting, parked, 3/3 call-site
+exit codes) still pass with the same numbers. Boots: 30 four-core probe boots on the final build
+with **zero scheduler panics, zero hangs and zero queue anomalies**; 5/5 single-core boots pass.
+The switch soaks are green: `stress 4 20000` 0 lost updates, `preempt 1000` PASS, `reap 8` 0 pages
+leaked. Host tests remain 60/60 and the clean rebuild is warning-free.
+
+One residual, unrelated and pre-existing: the EL0 IPC probe (step [10]) intermittently fails
+`case 17/18/24` on a four-core boot (roughly 1 boot in 10) while its 2000-round-trip throughput part
+passes. The same failure appears in probe logs from *before* this scheduler change (the phase-27
+builds kept in this session's logs), so it is an IPC deadline-timing race in the test, not a
+consequence of the run-queue repair; it is recorded here rather than papered over. Every other
+step of those boots passed, and no boot failed with a scheduler fault.
 
 **Deferred:** names are flat, not a tree, and there is no per-name ACL, so any process can resolve
 any registered name (phase 30's capability manifests are where that belongs). The registry does

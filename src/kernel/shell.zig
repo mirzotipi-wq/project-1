@@ -82,6 +82,7 @@ fn printHelp() void {
         \\  reap [n]             spawn n short-lived threads and prove no leak
         \\  preempt              sample three CPU-bound threads (preemption proof)
         \\  logstorm [n]         concurrent logging from n threads / every core
+\\  killloop [rounds]    launch/kill/reap a program in a tight loop
         \\
         \\  --- user mode (EL0) -----------------------------------------------
         \\  user [mode]          run the EL0 demo: 0 normal, 1 priv op, 2 kernel read, 3 isolation
@@ -161,6 +162,9 @@ fn cmdCores(_: Context) void {
             name,
         });
     }
+    out("  queues: {d} double-run guard(s), {d} invariant violation(s), {d} deferred reap(s)\n", .{
+        sched.double_run_events, sched.queue_violations, sched.reaps_deferred,
+    });
 }
 
 fn cmdThreads(_: Context) void {
@@ -447,6 +451,70 @@ fn cmdKill(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
     @atomicStore(bool, &t.kill_requested, true, .seq_cst);
     sched.kick(t.cpu);
     out("  thread {d} ('{s}') asked to exit\n", .{ t.id, t.nameSlice() });
+}
+
+// -- process churn ----------------------------------------------------------
+
+/// A relaunch ladder: spawn a user program, kill it, wait for the kernel to reap
+/// it, and do it again, hundreds of times. Every round creates a thread, queues
+/// it, wakes it with a kill, kills it at a reschedule and frees its stack and
+/// address space — the exact lifecycle a four-core run queue has to get right,
+/// and the one that used to end in "selected a non-runnable thread".
+fn cmdKillLoop(ctx: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const rounds = parseArg(tokens, 200, 1, 5000);
+    const argv = [_][]const u8{ "pos.elf", "loop" };
+    const env = [_][]const u8{"POS_TERM=cassa-1"};
+    const pages_before = ctx.pmm.stats().free_pages;
+    const dbl_before = sched.double_run_events;
+    const viol_before = sched.queue_violations;
+    const def_before = sched.reaps_deferred;
+    const stray_before = sched.stray_ready;
+    var completed: u32 = 0;
+    var killed: u32 = 0;
+    var round: u32 = 0;
+    while (round < rounds) : (round += 1) {
+        const p = process.spawnElf("pos.elf", &argv, &env) orelse {
+            out("  killloop: launch refused at round {d} ({s})\n", .{ round, process.refusalLabel(process.last_refusal) });
+            break;
+        };
+        // Every other round lets the program reach its sleep loop first, so the
+        // kill has to wake a parked thread as well as one that never ran.
+        if ((round & 1) == 1) sched.sleepMsBlocking(1);
+        if (process.kill(p.pid)) killed += 1;
+        // `wait` observes the death, which is what turns the process record into
+        // `killed`; without it the slot stays `running` and the ladder runs out
+        // of process slots before it runs out of rounds.
+        _ = process.wait(p.pid, 100);
+        if (!process.waitReaped(p.pid, 100)) {
+            out("  killloop: round {d} stuck: pid {d} not reaped in 100 ms\n", .{ round, p.pid });
+            sched.dumpState("killloop stalled");
+            break;
+        }
+        completed += 1;
+    }
+    sched.sleepMsBlocking(20);
+    const pages_after = ctx.pmm.stats().free_pages;
+    const leaked = if (pages_before >= pages_after) pages_before - pages_after else 0;
+    out("  rounds       : {d}/{d} completed (each one launch + kill + reap)\n", .{ completed, rounds });
+    out("  kills        : {d}, processes spawned in total {d}, faults caught {d}\n", .{
+        killed, process.spawns, process.kills,
+    });
+    out("  threads      : {d} live, queues {d}/{d}/{d}/{d}\n", .{
+        sched.threadCount(),
+        percpu.cpus[0].runq_len, percpu.cpus[1].runq_len,
+        percpu.cpus[2].runq_len, percpu.cpus[3].runq_len,
+    });
+    out("  scheduler    : {d} double-run, {d} invariant violation(s), {d} deferred reap(s), {d} stray ready\n", .{
+        sched.double_run_events - dbl_before,
+        sched.queue_violations - viol_before,
+        sched.reaps_deferred - def_before,
+        sched.stray_ready - stray_before,
+    });
+    out("  free pages   : {d} -> {d} ({d} leaked)\n", .{ pages_before, pages_after, leaked });
+    const ok = completed == rounds and leaked == 0 and
+        sched.queue_violations == viol_before and sched.double_run_events == dbl_before and
+        sched.stray_ready == stray_before;
+    out("  result       : {s}\n", .{if (ok) "PASS (churn clean)" else "FAIL"});
 }
 
 // -- reaping ----------------------------------------------------------------
@@ -1287,14 +1355,17 @@ fn cmdUprobe(ctx: Context) void {
         // A kill is visible as `restarting`, and the generation changes across it,
         // so a caller holding the old pid can tell it was restarted underneath it.
         _ = service.kill("checkout");
+        // The service stays `restarting` for at least one backoff delay (5 ms at
+        // this point), so a 1 ms poll observes it without depending on where in
+        // the supervisor's 10 ms cycle the kill landed.
         var saw_restart = false;
         var wait_ms: u64 = 0;
-        while (wait_ms < 400) : (wait_ms += 2) {
+        while (wait_ms < 400) : (wait_ms += 1) {
             if (registry.lookup("pos://checkout").reason == .restarting) {
                 saw_restart = true;
                 break;
             }
-            sched.sleepMsBlocking(2);
+            sched.sleepMsBlocking(1);
         }
         var after: names.Reason = .unknown;
         var after_gen: u32 = 0;
@@ -1385,6 +1456,9 @@ fn cmdUprobe(ctx: Context) void {
     pass = pass and reg_ok;
 
     out("  ------------------------------------------------------------------\n", .{});
+    out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
+        sched.double_run_events, sched.queue_violations, sched.stray_ready,
+    });
     out("  user syscalls: {d}, processes spawned: {d}, faults caught: {d}\n", .{
         syscall.user_calls, process.spawns, process.kills,
     });
@@ -1441,6 +1515,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdKill(&tokens);
     } else if (std.mem.eql(u8, command, "reap")) {
         cmdReap(ctx, &tokens);
+    } else if (std.mem.eql(u8, command, "killoop")) {
+        cmdKillLoop(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "user")) {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {

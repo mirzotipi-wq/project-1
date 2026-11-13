@@ -180,7 +180,20 @@ fn idleLoop(_: ?*anyopaque) void {
 // Run queues
 // ---------------------------------------------------------------------------
 
-fn pushTail(pc: *percpu.Cpu, t: *Thread) void {
+/// Invariant R: every run-queue entry names a thread that is `ready` and that
+/// no core is executing. The transition into `ready` and the push happen
+/// together, under the scheduler lock, at exactly two places — `makeReadyLocked`
+/// for a parked thread and `cassa_after_switch` for the thread that just left
+/// this core — so a queue can never name a thread that is still on a CPU, still
+/// mid-switch, or already dead.
+fn pushTail(pc: *percpu.Cpu, t: *Thread, site: []const u8) void {
+    if (t.state != .ready or t.on_cpu) {
+        queue_violations += 1;
+        klog.err("sched", "queue invariant: thread {d} '{s}' state {s} on_cpu={} refused from {s}", .{
+            t.id, t.nameSlice(), t.state.label(), t.on_cpu, site,
+        });
+        return;
+    }
     t.next = null;
     if (pc.runq_tail) |tail| tail.next = t else pc.runq_head = t;
     pc.runq_tail = t;
@@ -242,17 +255,19 @@ fn makeReadyLocked(pc: *percpu.Cpu, t: *Thread) void {
     // which is exactly how a thread ends up jumping into its own stack.
     if (t.state != .blocked) return;
     t.state = .ready;
+    t.ready_site = 1;
+    t.ready_ms = timer.uptimeMs();
     t.pending_wake = false;
     if (!t.pinned or t.cpu >= percpu.cpu_count) {
         t.cpu = pc.id;
-        pushTail(pc, t);
+        pushTail(pc, t, "makeReady");
         pc.need_resched = true;
         return;
     }
     // Pinned: always run on the core it was created on, even if the wakeup
     // came from somewhere else.
     const home = &percpu.cpus[t.cpu];
-    pushTail(home, t);
+    pushTail(home, t, "makeReady-pinned");
     home.need_resched = true;
     if (home.id != pc.id) smp.sendRescheduleIpi(home.id);
 }
@@ -267,6 +282,7 @@ pub fn tick() void {
     pc.ticks += 1;
     wakeSleepers(timer.uptimeMs());
     reapAll();
+    auditQueues();
 
     const cur = pc.current orelse return;
     if (cur.is_idle) {
@@ -287,6 +303,40 @@ pub fn tick() void {
         pc.slice_left -= 1;
     }
     if (!cur.is_idle and pc.slice_left == 0) pc.need_resched = true;
+}
+
+/// A `ready` thread that no queue references will never run, and a later wake is
+/// dropped because `makeReadyLocked` only queues a `blocked` thread. That must
+/// never persist: it is a stalled wakeup. A thread is allowed to be ready and
+/// unqueued only for the microseconds of a switch in progress, so anything older
+/// than `audit_grace_ms` is a defect — it is reported with the site that made it
+/// ready and re-queued, which turns a permanent stall into one late slice and a
+/// number in the transcript instead of a hang.
+const audit_grace_ms: u64 = 50;
+pub var stray_ready: u64 = 0;
+
+fn auditQueues() void {
+    const now = timer.uptimeMs();
+    const flags = lock.acquire();
+    defer lock.release(flags);
+    const self = percpu.this().current;
+    for (&thread_mod.table) |*t| {
+        if (t.state != .ready or t.on_cpu or t.is_idle) continue;
+        if (t == self) continue;
+        // A thread created by `thread.create` is `.ready` for the few
+        // instructions before its creator admits it, and it is not discoverable
+        // by id yet. It is not a lost wake, and queueing it here would give it
+        // two entries.
+        if (t.ready_site == 0) continue;
+        if (now < t.ready_ms + audit_grace_ms) continue;
+        if (queuedAnywhere(t)) continue;
+        stray_ready += 1;
+        klog.err("sched", "stray ready: thread {d} '{s}' was in no queue for {d} ms (site {d}, cpu {d}, runs {d}, pending={})", .{
+            t.id, t.nameSlice(), now - t.ready_ms, t.ready_site, t.cpu, t.runs, t.pending_wake,
+        });
+        t.cpu = percpu.this().id;
+        pushTail(percpu.this(), t, "audit");
+    }
 }
 
 fn wakeSleepers(now_ms: u64) void {
@@ -319,13 +369,61 @@ fn reapAll() void {
     for (&thread_mod.table) |*t| {
         if (t.state != .dead or t.on_cpu) continue;
         if (self == t) continue;
+        if (queuedAnywhere(t)) {
+            reaps_deferred += 1;
+            continue;
+        }
         if (alloc) |a| thread_mod.destroy(a, t);
     }
+}
+
+/// Does any core's run queue still reference this thread? A `dead` thread must
+/// not be freed while a queue names it: the entry would survive the free and the
+/// next core to pop it would resume a recycled slot.
+fn queuedAnywhere(t: *Thread) bool {
+    for (percpu.slice()) |*pc| {
+        var node = pc.runq_head;
+        var guard: u32 = 0;
+        while (node) |n| : (node = n.next) {
+            if (n == t) return true;
+            guard += 1;
+            if (guard > thread_mod.max_threads) break;
+        }
+    }
+    return false;
 }
 
 fn reapPending(pc: *percpu.Cpu) void {
     _ = pc;
     reapAll();
+}
+
+/// Print every core's queue and every live thread slot. Called only on a fatal
+/// scheduler path, where the question is always "who was where".
+pub fn dumpState(tag: []const u8) void {
+    klog.err("sched", "--- scheduler state ({s}): {d} cores, {d} double-run, {d} queue violations, {d} deferred reaps", .{
+        tag, percpu.cpu_count, double_run_events, queue_violations, reaps_deferred,
+    });
+    for (percpu.slice()) |*pc| {
+        const cur = if (pc.current) |t| t.id else 0;
+        const head = if (pc.runq_head) |t| t.id else 0;
+        const tail = if (pc.runq_tail) |t| t.id else 0;
+        klog.err("sched", "core {d} online={}: current {d}, runq len {d} head {d} tail {d}, switching_out {d}", .{
+            pc.id, pc.online, cur, pc.runq_len, head, tail, if (pc.switching_out) |t| t.id else 0,
+        });
+    }
+    for (&thread_mod.table) |*t| {
+        if (t.state == .unused) continue;
+        klog.err("sched", "thread {d} '{s}': {s} on_cpu={} cpu {d} runs {d} sp 0x{x} kill={} wake={} pending={} next={d}", .{
+            t.id, t.nameSlice(), t.state.label(), t.on_cpu, t.cpu, t.runs, t.sp,
+            t.kill_requested, t.wake_at_ms, t.pending_wake,
+            if (t.next) |n| n.id else 0,
+        });
+    }
+}
+
+fn dumpSchedulerState() void {
+    dumpState("panic");
 }
 
 /// Pick the next thread on this core and return the trap frame to resume.
@@ -346,35 +444,55 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     // never be resumed.
     if (prev.kill_requested and prev.state != .dead and prev.state != .unused) prev.state = .dead;
 
-    // Apply any wake that arrived while this thread was still running. From
-    // here on it is genuinely off the CPU, so it is safe to queue.
-    var prev_runnable = false;
+    // Fold a wake that arrived while this thread was still running, and decide
+    // what its state will be once it is off this core. Nothing is queued here:
+    // the thread is still executing on this stack until the trampoline switches,
+    // so publishing it now would put a thread that is still on a CPU into a run
+    // queue. `cassa_after_switch` is the one place that publishes it, at the
+    // first instant that is true.
     if (prev.pending_wake and prev.state != .dead) {
         prev.pending_wake = false;
         prev.state = .ready;
-        prev_runnable = true;
+        prev.ready_site = 2;
+        prev.ready_ms = timer.uptimeMs();
     }
 
     if (prev.state == .running and !prev.is_idle) {
         prev.state = .ready;
-        prev_runnable = true;
     } else if (prev.state == .dead) {
         // The thread exited on this stack; hand it to whoever runs next.
         pc.pending_reap = prev;
     }
 
-    var next: *Thread = popHead(pc) orelse stealLocked(pc) orelse pc.idle.?;
+    var next: *Thread = undefined;
+    var from_queue = false;
+    if (popHead(pc)) |t| {
+        next = t;
+        from_queue = true;
+    } else if (stealLocked(pc)) |t| {
+        next = t;
+        from_queue = true;
+    } else {
+        // This core's own idle thread: it is not in any queue and it is
+        // legitimately `on_cpu` while it runs, so it must not be judged by the
+        // queue-entry rules below.
+        next = pc.idle.?;
+    }
     // A thread that is already marked on-CPU is running somewhere else. Two
     // cores must never share one kernel stack, so a queue entry that names such
     // a thread is dropped here (and counted) instead of being resumed: that is
     // a split brain, and running it would corrupt the stack of whichever core
     // is currently executing it.
-    if (next.on_cpu) {
+    if (from_queue and next.on_cpu) {
         double_run_events += 1;
+        klog.err("sched", "core {d} dropped duplicate entry: thread {d} '{s}' {s} on_cpu cpu {d} runs {d} ready_at_cpu", .{
+            pc.id, next.id, next.nameSlice(), next.state.label(), next.cpu, next.runs,
+        });
         next = pc.idle.?;
     }
     if (next.state == .dead or next.state == .unused) {
         klog.err("sched", "core {d} selected thread {d} in state {s} (sp=0x{x})", .{ pc.id, next.id, next.state.label(), next.sp });
+        dumpSchedulerState();
         @panic("scheduler: selected a non-runnable thread");
     }
 
@@ -387,8 +505,6 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
         lock.release(flags);
         return frame;
     }
-
-    if (prev_runnable) pushTail(pc, prev);
 
     // A frame that does not point at kernel code can only come from a corrupted
     // stack. Detect it here, where the offending thread is still identifiable,
@@ -458,17 +574,26 @@ export fn cassa_after_switch() callconv(.C) void {
     const prev = pc.switching_out orelse return;
     pc.switching_out = null;
     const flags = lock.acquire();
+    defer lock.release(flags);
+    // This is the first instant no core is executing on prev's stack. Making it
+    // off-CPU and (if it is runnable) putting it on the queue is one atomic step
+    // under the scheduler lock: no other core can see it queued-but-on-CPU, and
+    // none can see it off-CPU-but-missing from the queue.
     prev.on_cpu = false;
     // A wake that arrived during the switch was deferred because the thread was
-    // still on this core. Now that it is off, the wake has to be applied here or
-    // it would be lost: `reschedule` has already run its pending-wake check.
+    // still on this core; fold it in now rather than queuing twice. `reschedule`
+    // has already run its own pending-wake check, so a second push from here was
+    // exactly the double queue entry that could later name a reaped thread.
     if (prev.pending_wake and prev.state != .dead and prev.state != .unused) {
         prev.pending_wake = false;
         prev.state = .ready;
-        pushTail(pc, prev);
-        pc.need_resched = true;
+        prev.ready_site = 3;
+        prev.ready_ms = timer.uptimeMs();
     }
-    lock.release(flags);
+    // Published, not forced: the entry is visible to every core, and a core about
+    // to idle notices it in the tick's queue scan. Preempting on every switch
+    // would cost a reschedule per switch for no work.
+    if (prev.state == .ready and !prev.is_idle) pushTail(pc, prev, "afterSwitch");
 }
 
 /// Point this core's TTBR0 at the address space the next thread needs. A
@@ -520,7 +645,7 @@ fn spawnInner(name: []const u8, entry: thread_mod.EntryFn, arg: ?*anyopaque, pin
     t.cpu = pc.id;
     t.pinned = pinned;
     t.on_cpu = false;
-    pushTail(pc, t);
+    pushTail(pc, t, "spawn");
     pc.need_resched = true;
     pc.spawned += 1;
     lock.release(flags);
@@ -533,7 +658,7 @@ pub fn admit(t: *Thread) void {
     const pc = percpu.this();
     t.cpu = pc.id;
     t.on_cpu = false;
-    pushTail(pc, t);
+    pushTail(pc, t, "admit");
     pc.need_resched = true;
     pc.spawned += 1;
     lock.release(flags);
@@ -543,6 +668,17 @@ pub fn admit(t: *Thread) void {
 /// Always zero in a healthy system; the shell prints it so a regression in the
 /// wake path shows up as a number instead of a mystery fault.
 pub var double_run_events: u64 = 0;
+
+/// How many times a thread was about to enter a run queue in a state that is
+/// not publishable (not `ready`, or still owned by a CPU). Invariant R below
+/// says this can never happen; the counter exists so a regression is a number
+/// in a transcript instead of a fault report.
+pub var queue_violations: u64 = 0;
+
+/// How many times the reaper found a thread that was `dead` but still reachable
+/// from some queue. Counted for the same reason: it means a queue and a thread
+/// lifetime disagreed, and freeing the stack there would corrupt the queue.
+pub var reaps_deferred: u64 = 0;
 
 /// Give up the CPU for the rest of this thread's slice (syscall 64). Returns
 /// only once the thread is scheduled again.

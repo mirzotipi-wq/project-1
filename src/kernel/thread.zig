@@ -14,6 +14,7 @@ const std = @import("std");
 const pmm = @import("pmm.zig");
 const trap = @import("../arch/aarch64/trap.zig");
 const user_space = @import("addrspace.zig");
+const timer_now_ms = @import("../arch/aarch64/timer.zig").uptimeMs;
 
 pub const State = enum {
     unused,
@@ -88,6 +89,15 @@ pub const Thread = struct {
     /// at the point the thread really leaves the CPU.
     pending_wake: bool = false,
 
+    /// Diagnostic: which site last put this thread into `ready`. 0 = created,
+    /// 1 = woken from a park, 2 = folded in by `reschedule`, 3 = folded in by
+    /// `cassa_after_switch`. A thread that is `ready` but in no queue can be
+    /// traced to the site that made it ready.
+    ready_site: u8 = 0,
+    /// Uptime (ms) at which `ready_site` last made this thread ready. Used by the
+    /// scheduler's queue audit to tell a switch in progress from a lost wake.
+    ready_ms: u64 = 0,
+
     /// Run-queue link (only valid while queued).
     next: ?*Thread = null,
     /// Wait-queue link (only valid while blocked on a primitive).
@@ -149,6 +159,7 @@ pub fn create(
     t.id = next_id;
     next_id += 1;
     t.state = .ready;
+    t.ready_ms = timer_now_ms();
     t.entry = entry;
     t.arg = arg;
     t.stack_base = base;
@@ -193,6 +204,7 @@ pub fn createUser(
     t.id = next_id;
     next_id += 1;
     t.state = .ready;
+    t.ready_ms = timer_now_ms();
     t.stack_base = base;
     t.stack_pages = stack_pages;
     t.owns_stack = true;

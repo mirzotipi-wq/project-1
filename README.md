@@ -67,6 +67,7 @@ Phase 19 is deferred until block devices exist.)
 | 26 | ELF64 loader, segment permissions, BSS, argv/envp, exit status | `uprobe` step 12: `pos.elf` exits 42; `exec`, `images`, `elf` |
 | 27 | service supervisor, backoff restarts, crash-loop parking, crash records, orphan reaping | `uprobe` step 13: printer killed 7× restarts 6× then parks, checkout 3/3; `service`, `dumps` |
 | 28 | name registry (`pos://`), by-name resolve with reasons, duplicate rejection, lazy start, generation counter | `uprobe` step 14: live/restarting/parked/unknown lookups, `pos.elf resolve` exits 0/4/1; `registry`, `resolve`, `ensure` |
+| 28a | run-queue lifecycle: single publish point, queue invariant, reaper guard, stray-ready audit | `killoop 150` ×2 clean, 30 four-core probe boots with 0 panics/hangs/queue anomalies, `stress`/`preempt`/`reap` green |
 
 The remaining 73 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
@@ -93,7 +94,8 @@ reference counts), `ipc` (endpoint counters), `shm` (shared-memory objects, mapp
 counters), `exec`/`images`/`elf` (launch a program from the image store), `service` (list, start, kill or
 stop a supervised service by name), `dumps` (the crash records kept for faulting programs), `registry` (registered names, slots,
 generations and lookup counters), `resolve <name>` (ask the registry for a service and print the
-reason) and `ensure <name>` (start it if it is stopped), and
+reason), `ensure <name>` (start it if it is stopped), `killoop [rounds]` (a launch/kill/reap
+relaunch ladder that hammers the run-queue lifecycle and reports any queue anomaly), and
 `svc`.
 
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
