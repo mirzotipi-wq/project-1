@@ -81,11 +81,10 @@ pub fn register(name: []const u8, image: []const u8, argv: []const []const u8) ?
 }
 
 fn launch(s: *Service) bool {
-    const p = process.spawnElf(s.image, s.argv[0..s.argc], &env) orelse {
+    const p = process.spawnElfQuota(s.image, s.argv[0..s.argc], &env, s.quota) orelse {
         s.state = .failed;
         return false;
     };
-    _ = account.setQuota(p.pid, s.quota);
     s.pid = p.pid;
     s.state = .running;
     s.started_ms = timer.uptimeMs();

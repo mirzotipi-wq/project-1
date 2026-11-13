@@ -1023,9 +1023,10 @@ host-tested: levels at the boundary, a zero quota, score ordering, the ladder, a
 runaway reports absurd numbers.
 
 `account.zig` is the ledger and the watchdog. Every EL0 process gets an entry at creation (`attach`
-from `process.spawnWith`/`spawnElf`), a service's quota is applied on every launch so a restart
-cannot escape it, and the entry is dropped when the process slot is reused. Enforcement sits at the
-three funnels where a resource is actually handed out, not in a periodic scan:
+from `process.spawnWith`/`spawnElf`), a service's quota is attached *before* its thread is admitted
+(`spawnElfQuota`) so its very first instruction already runs under it, a restart cannot escape it,
+and the entry is dropped when the process slot is reused. Enforcement sits at the three funnels
+where a resource is actually handed out, not in a periodic scan:
 
   * **Frames** — `AddressSpace.page_budget` is set from the quota; `allocFrameInto` and `mapShared`
     refuse past it and count the refusal. Shared pages are charged to the process that maps them.
@@ -1056,7 +1057,9 @@ CONTROL handle by asking the kernel instead of assuming a slot order, then deriv
 four-core probe boots `RESULT: PASS` with zero panics, zero hangs and
 `0 double-run, 0 queue violation(s), 0 stray ready`; 5/5 single-core boots; `killoop 150` twice at
 150/150 with zero anomalies; `stress 4 20000` 0 lost updates; `preempt 1000` PASS; `reap 8` 0 pages
-leaked; 65/65 host tests.
+leaked; 65/65 host tests. The preemption soak also pins its three workers to one explicitly chosen
+core now: capturing the core per spawn let a migrating shell pin them to different cores and made
+the "single core" check flaky on a busier machine.
 
 The IPC probe needed one more kernel fix to stay deterministic under the new load: an answer is now
 tied to the *call* it belongs to by a request sequence (`req_seq`/`recv_seq`/`rep_seq`), so a late

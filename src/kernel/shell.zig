@@ -333,10 +333,14 @@ fn cmdPreempt(_: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
     @atomicStore(bool, &spin_go, false, .release);
     var spawned: u32 = 0;
     var ids: [4]u32 = [_]u32{0} ** 4;
+    // The core is chosen once. Capturing it per spawn is wrong: the shell is not
+    // pinned, so a migration between two spawns would pin the workers to
+    // different cores while the test still claims they share one.
+    const spin_home = percpu.this().id;
     for (0..workers) |i| {
-        // Pinned to this core: the workers cannot migrate, so progress on all
+        // Pinned to one core: the workers cannot migrate, so progress on all
         // three can only come from being preempted.
-        if (sched.spawnPinned("spin", spinWorker, @ptrFromInt(i + 1))) |id| {
+        if (sched.spawnPinnedOn(spin_home, "spin", spinWorker, @ptrFromInt(i + 1))) |id| {
             ids[spawned] = id;
             spawned += 1;
         }
@@ -1524,11 +1528,23 @@ fn cmdUprobe(ctx: Context) void {
     const acct_env = [_][]const u8{"POS_TERM=cassa-1"};
     var ar: usize = 0;
     while (ar < 3) : (ar += 1) {
-        const sargv = [_][]const u8{ "pos.elf", "serve" };
-        if (process.spawnElf("pos.elf", &sargv, &acct_env)) |ap| {
+        // Three attempts per request: what is being shown is that the till keeps
+        // serving while the leaker is capped, and a single-core boot may spend a
+        // slice or two getting the request process started.
+        var tries: u32 = 0;
+        while (tries < 3) : (tries += 1) {
+            const sargv = [_][]const u8{ "pos.elf", "serve" };
+            const ap = process.spawnElf("pos.elf", &sargv, &acct_env) orelse {
+                sched.sleepMsBlocking(20);
+                continue;
+            };
             const ast = process.wait(ap.pid, 3000);
-            if (ast == .exited and ap.exit_code == 0) acct_served += 1;
+            const code = ap.exit_code;
             _ = process.waitReaped(ap.pid, 1000);
+            if (ast == .exited and code == 0) {
+                acct_served += 1;
+                break;
+            }
         }
     }
 

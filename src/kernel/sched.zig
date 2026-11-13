@@ -666,16 +666,36 @@ pub fn spawn(name: []const u8, entry: thread_mod.EntryFn, arg: ?*anyopaque) ?u32
 }
 
 fn spawnInner(name: []const u8, entry: thread_mod.EntryFn, arg: ?*anyopaque, pinned: bool) ?u32 {
+    return spawnAt(name, entry, arg, if (pinned) percpu.this().id else null);
+}
+
+/// Spawn a thread pinned to a *specific* core rather than to whichever core the
+/// caller happens to be on. A caller that spawns several workers and can migrate
+/// between the calls would otherwise pin them to different cores while believing
+/// they share one.
+pub fn spawnPinnedOn(home_cpu: u32, name: []const u8, entry: thread_mod.EntryFn, arg: ?*anyopaque) ?u32 {
+    return spawnAt(name, entry, arg, home_cpu);
+}
+
+fn cpuById(id: u32) ?*percpu.Cpu {
+    for (percpu.slice()) |*c| {
+        if (c.id == id) return c;
+    }
+    return null;
+}
+
+fn spawnAt(name: []const u8, entry: thread_mod.EntryFn, arg: ?*anyopaque, home: ?u32) ?u32 {
     const a = alloc orelse return null;
+    const here = percpu.this();
+    const target = if (home) |h| (cpuById(h) orelse return null) else here;
     const t = thread_mod.create(a, name, entry, arg, @intFromPtr(&threadBootstrap)) orelse return null;
     const flags = lock.acquire();
-    const pc = percpu.this();
-    t.cpu = pc.id;
-    t.pinned = pinned;
+    t.cpu = target.id;
+    t.pinned = home != null;
     t.on_cpu = false;
-    pushTail(pc, t, "spawn");
-    pc.need_resched = true;
-    pc.spawned += 1;
+    pushTail(target, t, "spawn");
+    target.need_resched = true;
+    target.spawned += 1;
     lock.release(flags);
     return t.id;
 }

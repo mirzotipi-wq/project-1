@@ -178,6 +178,18 @@ pub fn refusalLabel(r: Refusal) []const u8 {
 /// the stack before the thread is admitted — so the program's very first
 /// instruction runs with a complete environment.
 pub fn spawnElf(name: []const u8, argv: []const []const u8, envp: []const []const u8) ?*Process {
+    return spawnElfInner(name, argv, envp, null);
+}
+
+/// Launch a program whose quota must be in force from its very first
+/// instruction. A caller that spawns and *then* re-quotas leaves a window in
+/// which the child is already runnable on another core — the ledger has to be
+/// attached with the right budget before the thread is admitted, not after.
+pub fn spawnElfQuota(name: []const u8, argv: []const []const u8, envp: []const []const u8, quota: account.Quota) ?*Process {
+    return spawnElfInner(name, argv, envp, quota);
+}
+
+fn spawnElfInner(name: []const u8, argv: []const []const u8, envp: []const []const u8, quota: ?account.Quota) ?*Process {
     const file = store.find(name) orelse {
         exec_failures += 1;
         last_refusal = .not_found;
@@ -231,7 +243,7 @@ pub fn spawnElf(name: []const u8, argv: []const []const u8, envp: []const []cons
     } else {
         klog.warn("proc", "pid {d}: could not build a capability table", .{slot.pid});
     }
-    _ = account.attach(slot.pid, .{});
+    _ = account.attach(slot.pid, quota orelse .{});
     sched.admit(t);
     spawns += 1;
     execs += 1;
