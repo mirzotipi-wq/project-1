@@ -284,7 +284,9 @@ dump.
 **Verified:** `user` runs the embedded program at EL0 and `uprobe` proves the
 contract. The program prints through `write`, receives its pid and the uptime
 from the kernel, yields and exits 0 (8 ms in a measured run). A `mrs tcr_el1`
-raises a trapped system-register exception at pc 0x80000268; a load from kernel
+is reported by the hardware as an undefined instruction at EL0 (EC 0x00,
+ESR 0x2000000) at pc 0x80000268 — EL0 has no access to that register at all, so
+the encoding is undefined there rather than "trapped"; a load from kernel
 text 0x40080000 raises a level-3 permission fault; both are logged with the pid,
 kill only that process, and the kernel keeps running. `write()` with kernel text
 and with an unmapped address each return -14 after the kernel refuses to follow
