@@ -1145,11 +1145,101 @@ every user mapping but there is no guard-page policy around them yet.
 
 ## Stage D — Devices, DMA and human interface hardware
 
-### Phase 31 — Driver model `[ ]`
+### Phase 31 — Driver model `[x]`
 **Goal:** Probe order that is data-driven, not hand-ordered.
 **Build:** Device objects, driver registration with compatible-string matching, dependency
 ordering, init error isolation, hotplug notifications.
 **Done when:** Disabling a device in QEMU removes its driver cleanly with a clear log.
+
+**Shipped.** Boot order used to *be* the policy: `kmain` called `gic.init`, then `timer.init`,
+then whatever came next, because that is what the QEMU `virt` machine happens to need. Nothing
+checked that the hardware was present, nothing could say "the timer needs the interrupt controller
+first", and a driver that could not start had no way to fail except by taking the machine down.
+`driver.zig` replaces that with a model:
+
+  * **Devices are data.** `discover` walks the device tree once and turns every node with a
+    `compatible` property into a `Device`: node name, compatible strings in tree order, `reg`
+    regions and `clock-frequency`. Nothing in the model knows a device by name.
+  * **Drivers claim compatible strings.** A device binds to the first driver whose claim list
+    contains one of the device's strings, testing the device's list first, so the most specific
+    string wins. Five drivers ship: `console` (pl011), `gic` (GICv2 and v3), `timer` (the generic
+    timer, both the v8 and v7 compatible strings), `rtc` (PL031) and a deliberate
+    always-failing `selftest-fail` that exists only to prove failure isolation.
+  * **Dependencies are declared.** `timer` names `gic`; the model orders drivers topologically
+    (Kahn, deterministic tie-break) and refuses a cycle instead of probing it.
+  * **Failure is isolated.** A probe returns an error, the device is marked `failed` with the
+    reason, a listener is told, and boot continues. A device whose dependency did not bind is
+    `skipped`, never half-initialised.
+  * **Devices come and go.** Removing a device unbinds its dependents first, calls the driver's
+    `remove` hook, then notifies listeners; adding it back probes it again. A driver without a
+    `remove` hook is boot-critical and the model refuses to unbind it.
+  * **The tree is the probe order.** `0 bound, N waiting` plus an `idle: '<driver>'` line per
+    driver with no device makes "the machine does not have it" visible and distinct from "it
+    broke".
+
+The console is still installed by the firmware handoff before any driver can log, and the pl011
+driver adopts it from the tree; if no timer binds, boot halts with a reason instead of running a
+scheduler without ticks.
+
+`devices` prints the device table, bindings and hotplug counters; probe step [17] is the
+acceptance test. Phase 31 also carries a real PL031 wall clock (`pl031.zig`) with host-tested
+civil-date arithmetic — the first driver that exists for the till rather than for the kernel:
+receipts need a date that survives a power cut, not uptime.
+
+**Measured (final build).** Step [17] on every probe boot:
+
+`devices: 48 from the tree, 4 bound, 44 waiting for a driver, 0 failed  OK`,
+`match: pl011->console, gic->gic, timer->timer, rtc->rtc  OK`,
+`order: gic probed before timer (declared dependency)  OK`,
+`isolation: cassa,broken probe failed, marked, machine unaffected  OK`,
+`hotplug: rtc unbound (listener told) and re-probed  OK`.
+
+Boot log: `48 device(s) in the tree, 5 driver(s) registered`, then `'console' bound pl011@9000000
+(arm,pl011)`, `'gic' bound intc@8000000 (arm,cortex-a15-gic)`, `'timer' bound timer
+(arm,armv8-timer)`, `pl031 wall clock 2026-11-14 00:32:56 UTC`, `'rtc' bound pl031@9010000
+(arm,pl031)`, `4 bound, 44 waiting for a driver, 0 failed`. The 44 waiting are the 32 virtio-mmio
+slots, the PCIe host bridge and the PL061 GPIO — devices this kernel does not drive yet, which is
+phase 32's and 33's work, and they say so at debug level instead of being silently ignored.
+
+**Device removal, in QEMU.** `virt` creates its RTC unconditionally, so the honest test is a tree
+without the node: `-machine virt,dumpdtb=…`, `tools/nop-node.zig` replaces the `pl031@9010000`
+node's tokens with FDT no-ops (header, strings and reservation map untouched), and the kernel boots
+with `-machine virt,dtb=…`. On that boot the same image logs `47 device(s) in the tree`,
+`3 bound, 44 waiting for a driver, 0 failed`, `idle: 'rtc' — no device it claims is in this
+machine`, and step [17] still passes — including its no-RTC branch, where removing a device that
+is not there is refused rather than crashing.
+
+Two bugs came out of the acceptance work and were fixed at the source rather than worked around:
+
+  * **`fdt.nextSibling` stopped at an `FDT_NOP` token.** A tree edited in place — which is exactly
+    what QEMU produces for a `-dtb` blob, and what any bootloader patching `/chosen` produces —
+    has no-ops between nodes. Traversal returned after the second node, so a machine with 56 nodes
+    discovered 0 devices. The parser now steps over no-ops, and a host test builds a tree with a
+    hole in it and walks past it.
+  * **The IPC throughput gate and two call deadlines measured the host, not the kernel.** Case 19
+    required an absolute 2000 msg/s, which the same code measured at 2346 msg/s on an idle boot and
+    925 msg/s with other emulators running — with zero lost messages. It now compares against a
+    same-boot baseline (a zero-length sleep takes the same two context switches) and keeps
+    `good == rounds` as the correctness gate. Separately, calls that exist to prove *an answer
+    arrives* were timing out on a starved guest (a vCPU can lose seconds under TCG on a shared
+    host), so their tolerance is 10 s; the 10 ms deadline-refusal test is untouched. The probe also
+    names the step that failed now, and the endpoint counts refused late replies, because
+    "RESULT: FAIL" with no step is not a diagnosis.
+
+On the final build: clean `rm -rf .zig-cache zig-out && zig build` with 0 errors and 0 warnings;
+79/79 host tests; 20/20 consecutive four-core probe boots `RESULT: PASS` with zero panics and zero
+hangs; 5/5 single-core boots; `killoop 150` twice at 150/150 with 0 pages leaked; `stress 4 20000`
+exact; `preempt 1000` PASS on a single core; `reap 8` 0 pages leaked.
+
+**Deferred (open items).** Hotplug is a model-level operation plus a QEMU-level device tree without
+the device; `virt` has no live hot-unplug without ACPI/PCIe hotplug, so the notification path is
+exercised by removal in the running machine rather than by a physical unplug. There is no driver
+unload beyond calling the remove hook, and no reference counting for a device another driver is
+still using. Dependencies are declared between drivers, not between individual devices, which is
+enough for a SoC but not for two instances of one bus. The 32 virtio-mmio slots and the PCIe host
+bridge stay unbound until phases 32 and 33, and the GPIO controller has no driver yet (no button,
+no cash-drawer line). The RTC is read-only: no alarm interrupt, no timezone or drift handling, and
+the kernel has no `settime` path yet. Devices are not exported to userspace as `/dev` nodes.
 
 ### Phase 32 — PCIe host bridge `[ ]`
 **Goal:** Enumerate the terminal's internal buses.

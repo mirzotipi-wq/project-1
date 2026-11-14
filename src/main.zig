@@ -21,6 +21,8 @@ const timer = @import("arch/aarch64/timer.zig");
 const uart = @import("devices/pl011.zig");
 const klog = @import("kernel/klog.zig");
 const machine = @import("kernel/machine.zig");
+const driver = @import("kernel/driver.zig");
+const builtin_drivers = @import("devices/builtin.zig");
 const Pmm = @import("kernel/pmm.zig");
 const heap = @import("kernel/heap.zig");
 const shell = @import("kernel/shell.zig");
@@ -262,16 +264,21 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     g_heap = heap.Heap.init(heap_slice);
     klog.info("heap", "arena 0x{x}..0x{x} ({d} MiB)", .{ heap_start, heap_start + heap_bytes, heap_bytes / (1024 * 1024) });
 
-    // ---- interrupts and time ----------------------------------------------
-    gic.init(g_machine.gic_dist, g_machine.gic_second, switch (g_machine.gic_kind) {
-        .v2 => .v2,
-        .v3 => .v3,
-    });
-
-    timer.init(1000) catch |err| {
-        klog.err("timer", "generic timer unavailable: {s}", .{@errorName(err)});
+    // ---- devices -----------------------------------------------------------
+    // From here on the hardware is discovered rather than assumed: the device
+    // tree lists the devices, each driver claims compatible strings and names
+    // what it needs first, and the model binds them in dependency order. The
+    // console was installed above by the firmware handoff so that a driver that
+    // fails to probe can still be reported; the pl011 driver re-installs it from
+    // the tree, which is why `console` appears in the bound set.
+    builtin_drivers.installAll();
+    _ = driver.discover(&g_machine);
+    driver.bindAll();
+    driver.describe();
+    if (!driver.isBound("timer")) {
+        klog.err("boot", "no generic timer bound: the scheduler cannot run", .{});
         cpu.halt();
-    };
+    }
 
     // The scheduler must exist before the first interrupt can arrive: the tick
     // handler assumes `current` is valid on whichever core takes it. Secondary

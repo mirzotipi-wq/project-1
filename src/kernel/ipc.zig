@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const cap = @import("cap.zig");
+const klog = @import("klog.zig");
 const sched = @import("sched.zig");
 const thread_mod = @import("thread.zig");
 const user_space = @import("addrspace.zig");
@@ -58,6 +59,9 @@ pub var sends: u64 = 0;
 pub var receives: u64 = 0;
 pub var replies: u64 = 0;
 pub var timeouts: u64 = 0;
+/// Replies the kernel refused to deliver: nothing owed, or the caller's
+/// deadline had already passed.
+pub var late_replies: u64 = 0;
 pub var full_events: u64 = 0;
 pub var transfers: u64 = 0;
 pub var transfer_failures: u64 = 0;
@@ -448,6 +452,8 @@ pub fn reply(
     sweep(ep);
     if (!ep.reply_owed or ep.reply_target == null) {
         ep.replied_to_nobody += 1;
+        late_replies += 1;
+        klog.debug("ipc", "reply refused: nothing owed (recv_seq {d}, req_seq {d})", .{ ep.recv_seq, ep.req_seq });
         lock.release(flags);
         return Error.Again;
     }
@@ -462,12 +468,14 @@ pub fn reply(
     // it will return ETIMEDOUT, and handing it this answer would turn that into
     // a success. Decided by the deadline alone, never by which thread runs first.
     if (ep.reply_deadline != 0 and expired(ep.reply_deadline)) {
+        klog.debug("ipc", "reply refused as late: deadline {d} now {d}, seq {d}", .{ ep.reply_deadline, timer.uptimeMs(), ep.recv_seq });
         ep.reply_owed = false;
         ep.reply_target = null;
         if (ep.reply_thread == target) {
             ep.reply_thread = null;
         }
         ep.replied_to_nobody += 1;
+        late_replies += 1;
         lock.release(flags);
         return Error.Again;
     }

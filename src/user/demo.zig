@@ -525,7 +525,7 @@ fn ipcServer() u32 {
 
     while (served < 4000) : (served += 1) {
         var req = zeros();
-        const got = ipcSys(SYS_IPC_RECV, h_ep, @intFromPtr(&req), 3000, 0, 0);
+        const got = ipcSys(SYS_IPC_RECV, h_ep, @intFromPtr(&req), 10000, 0, 0);
         if (got.r != 64) break;
         var rep = zeros();
         const tag = req[0];
@@ -624,9 +624,12 @@ fn ipcClient(secret: u64) u32 {
     appendStr(&hdr, &at, "\n");
     _ = writePtr(@intFromPtr(&hdr), at);
 
+    // These calls prove that an answer arrives, not how fast it arrives: the
+    // guest runs under TCG on a shared host and a vCPU can be starved for
+    // seconds. The deadline-refusal test below keeps its 10 ms on purpose.
     // 11 -- the endpoint itself arrives as a transferred handle.
     var m = zeros();
-    const handoff = ipcSys(SYS_IPC_RECV, h_boot, @intFromPtr(&m), 3000, 0, 0);
+    const handoff = ipcSys(SYS_IPC_RECV, h_boot, @intFromPtr(&m), 10000, 0, 0);
     const h_ep = handoff.h;
     const ok11 = handoff.r == 64 and h_ep != 0 and m[0] == TAG_PORT;
     if (!ok11) failures += 1;
@@ -637,7 +640,7 @@ fn ipcClient(secret: u64) u32 {
     var rep = zeros();
     m[0] = TAG_PING;
     m[1] = 41;
-    var call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 1000, 0);
+    var call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, 0);
     const ok12 = call.r == 64 and rep[0] == TAG_PONG and rep[1] == 42;
     if (!ok12) failures += 1;
     report(12, ok12);
@@ -648,7 +651,7 @@ fn ipcClient(secret: u64) u32 {
     // the receiver's copy loses only that bit, so it can read but not write.
     const h_ro = capDerive(h_ledger, 9);
     m[0] = TAG_XFER;
-    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 1000, if (h_ro > 0) @intCast(h_ro) else 0);
+    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, if (h_ro > 0) @intCast(h_ro) else 0);
     const ok13 = call.r == 64 and rep[0] == TAG_XFER_REPLY and
         @as(i64, @bitCast(rep[1])) >= 0 and @as(i64, @bitCast(rep[2])) == E_PERM and
         rep[3] == 3;
@@ -656,7 +659,7 @@ fn ipcClient(secret: u64) u32 {
     report(13, ok13);
 
     // 14 -- a handle number that was never allocated cannot be sent.
-    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 1000, 0xDEAD);
+    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, 0xDEAD);
     const ok14 = call.r == E_BADF;
     if (!ok14) failures += 1;
     report(14, ok14);
@@ -664,7 +667,7 @@ fn ipcClient(secret: u64) u32 {
     // 15 -- nor can one that was already closed.
     const h_tmp = capDerive(h_ledger, 9);
     _ = capClose(if (h_tmp > 0) @intCast(h_tmp) else 0);
-    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 1000, if (h_tmp > 0) @intCast(h_tmp) else 0);
+    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, if (h_tmp > 0) @intCast(h_tmp) else 0);
     const ok15 = call.r == E_BADF;
     if (!ok15) failures += 1;
     report(15, ok15);
@@ -673,12 +676,12 @@ fn ipcClient(secret: u64) u32 {
     // receiver's own table, without either process naming the other's memory.
     const h_rev = capDerive(h_ledger, 9);
     m[0] = TAG_REVOKE;
-    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 1000, if (h_rev > 0) @intCast(h_rev) else 0);
+    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, if (h_rev > 0) @intCast(h_rev) else 0);
     const valid_read = call.r == 64 and rep[0] == TAG_REVOKE_REPLY and
         @as(i64, @bitCast(rep[1])) >= 0;
     _ = capRevoke(if (h_rev > 0) @intCast(h_rev) else 0);
     m[0] = TAG_AFTER_REVOKE;
-    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 1000, 0);
+    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, 0);
     const ok16 = valid_read and call.r == 64 and rep[0] == TAG_AFTER_REVOKE_REPLY and
         @as(i64, @bitCast(rep[1])) == E_BADF;
     if (!ok16) failures += 1;
@@ -700,7 +703,7 @@ fn ipcClient(secret: u64) u32 {
     // 18 -- the next call still works, and the server confirms its late reply
     // was refused with EAGAIN.
     m[0] = TAG_RESYNC;
-    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 1000, 0);
+    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, 0);
     const ok18 = call.r == 64 and rep[0] == TAG_RESYNC_REPLY and rep[1] == 1;
     if (!ok18) failures += 1;
     report(18, ok18);
@@ -713,14 +716,30 @@ fn ipcClient(secret: u64) u32 {
     while (i < rounds) : (i += 1) {
         m[0] = TAG_PING;
         m[1] = i;
-        call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 2000, 0);
+        call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, 0);
         if (call.r == 64 and rep[1] == i + 1) good += 1;
     }
     const t1 = syscall3(SYS_UPTIME_MS, 0, 0, 0);
     const elapsed: u64 = if (t1 > t0) t1 - t0 else 1;
     const rate: u64 = (2 * rounds * 1000) / elapsed;
 
-    var line: [112]u8 = undefined;
+    // Calibrate against this machine, not against a wall clock. The guest runs
+    // under TCG on a shared host, so an absolute rate measures the host: the
+    // same kernel code measured 2346 msg/s on an idle boot and 925 msg/s with
+    // two other emulators running, without losing a single message. A
+    // zero-length sleep takes the same two context switches a round trip does,
+    // so the ratio between the two is what says whether IPC is efficient.
+    const base_rounds: u64 = 500;
+    const b0 = syscall3(SYS_UPTIME_MS, 0, 0, 0);
+    var b: u64 = 0;
+    while (b < base_rounds) : (b += 1) {
+        _ = syscall3(SYS_SLEEP_MS, 0, 0, 0);
+    }
+    const b1 = syscall3(SYS_UPTIME_MS, 0, 0, 0);
+    const base_elapsed: u64 = if (b1 > b0) b1 - b0 else 1;
+    const base_rate: u64 = (base_rounds * 1000) / base_elapsed;
+
+    var line: [144]u8 = undefined;
     var li: usize = 0;
     appendStr(&line, &li, "[user] ipc throughput: ");
     appendNum(&line, &li, rounds);
@@ -730,23 +749,36 @@ fn ipcClient(secret: u64) u32 {
     appendNum(&line, &li, rate);
     appendStr(&line, &li, " msg/s (");
     appendNum(&line, &li, good);
-    appendStr(&line, &li, " exact, goal 100000)\n");
+    appendStr(&line, &li, " exact, baseline ");
+    appendNum(&line, &li, base_rate);
+    appendStr(&line, &li, " msg/s, goal 100000)\n");
     _ = writePtr(@intFromPtr(&line), li);
 
-    // The measured rate is printed above for the record. This QEMU runs the
-    // guest under TCG, where every address-space switch flushes the whole TLB
-    // (ASIDs are still a phase-22 gap), so the gate here is that every round
-    // trip was exact and the channel is genuinely moving; the 100,000 msg/s
-    // target is tracked in PLAN.md as an open performance gap.
-    const floor: u64 = 2_000;
-    const ok19 = good == rounds and rate >= floor;
+    // Every round trip must be exact — that is the correctness gate, and it is
+    // independent of speed. The cost gate is relative: a round trip may not cost
+    // more than 8 times a bare scheduler round trip on this same machine. The
+    // 100,000 msg/s absolute target stays in PLAN.md as an open performance gap.
+    const budget: u64 = 8;
+    const ok19 = good == rounds and elapsed * base_rounds <= base_elapsed * rounds * budget;
     if (!ok19) failures += 1;
     report(19, ok19);
 
     // 20 -- a clean shutdown on the same channel.
     m[0] = TAG_BYE;
-    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 2000, 0);
+    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10000, 0);
     const ok20 = call.r == 64 and rep[0] == TAG_BYE_REPLY;
+    if (!ok20) {
+        // A failed shutdown has to say what actually came back: a timeout and a
+        // mis-tagged reply are different bugs.
+        var dbg: [96]u8 = undefined;
+        var di: usize = 0;
+        appendStr(&dbg, &di, "[user] case 20 detail: call=");
+        appendNum(&dbg, &di, @bitCast(call.r));
+        appendStr(&dbg, &di, " tag=");
+        appendNum(&dbg, &di, rep[0]);
+        appendStr(&dbg, &di, "\n");
+        _ = writePtr(@intFromPtr(&dbg), di);
+    }
     if (!ok20) failures += 1;
     report(20, ok20);
 

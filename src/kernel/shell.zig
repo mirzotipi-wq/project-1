@@ -32,6 +32,8 @@ const user_space = @import("addrspace.zig");
 const cap = @import("cap.zig");
 const account = @import("account.zig");
 const sandbox = @import("sandbox.zig");
+const driver = @import("driver.zig");
+const pl031 = @import("../devices/pl031.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
 const elf = @import("elf.zig");
@@ -66,6 +68,7 @@ fn printHelp() void {
         \\  selftest             run the boot self-tests
         \\  accounting           per-process quotas, usage, OOM scores, watchdog
         \\  sandbox              service manifests, syscall gate, W^X counters
+        \\  devices              driver model: devices, bindings, hotplug counters
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -867,7 +870,21 @@ fn cmdUser(ctx: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
 /// a user program that runs, two privilege violations that are caught, a
 /// pointer the kernel refuses, two processes that cannot see each other, and a
 /// launch loop that leaks nothing.
+/// Step-level attribution for the probe. An intermittent boot has to name the
+/// step it lost: "RESULT: FAIL" on its own is not a diagnosis.
+var failed_steps: [8][]const u8 = undefined;
+var failed_step_count: usize = 0;
+
+fn verdict(pass: bool, ok: bool, step: []const u8) bool {
+    if (!ok and failed_step_count < failed_steps.len) {
+        failed_steps[failed_step_count] = step;
+        failed_step_count += 1;
+    }
+    return pass and ok;
+}
+
 fn cmdUprobe(ctx: Context) void {
+    failed_step_count = 0;
     var pass = true;
     out("\n  EL0 / address-space probe\n", .{});
     out("  [11] shared memory: 4 MiB mapped in two spaces, futex wakeups\n", .{});
@@ -945,7 +962,7 @@ fn cmdUprobe(ctx: Context) void {
     });
     const shm_ok = procs_ok and shared_ok and objects == 1 and mappings == 3 and
         shm.creates >= 1 and shm.woken_threads >= 2 and shm.timeouts >= 1 and shm.unmaps >= 1;
-    pass = pass and shm_ok;
+    pass = verdict(pass, shm_ok, "[11]");
 
     out("  [12] ELF loading: a separate program launched from the image store\n", .{});
     const refusals = elfRefusals();
@@ -974,7 +991,7 @@ fn cmdUprobe(ctx: Context) void {
     out("      elf: {d} load(s), {d} refusal(s), {d} process(es) spawned in total\n", .{
         process.execs, process.exec_failures, process.spawns,
     });
-    pass = pass and loader_ok and exec_ok and refused_ok;
+    pass = verdict(pass, loader_ok and exec_ok and refused_ok, "[12]");
 
     out("  ------------------------------------------------------------------\n", .{});
 
@@ -992,7 +1009,7 @@ fn cmdUprobe(ctx: Context) void {
     _ = process.waitReaped(p.pid, 1000);
     const ok1 = st == .exited and p.exit_code == 0;
     out("      {s}, exit code {d}, {d} ms  {s}\n", .{ @tagName(st), p.exit_code, timer.uptimeMs() - t0, status(ok1) });
-    pass = pass and ok1;
+    pass = verdict(pass, ok1, "[1]");
 
     // 2 -- a privileged system register read must trap.
     out("  [2] MRS TCR_EL1 from EL0\n", .{});
@@ -1007,7 +1024,7 @@ fn cmdUprobe(ctx: Context) void {
     if (process.processOfPid(p.pid)) |proc| {
         if (proc.fault) |f| out("      caught: {s} at pc 0x{x}  {s}\n", .{ f.kind, f.pc, status(ok2) });
     }
-    pass = pass and ok2;
+    pass = verdict(pass, ok2, "[2]");
 
     // 3 -- reading kernel memory must fault, not succeed.
     out("  [3] load from kernel text 0x40080000 at EL0\n", .{});
@@ -1021,14 +1038,14 @@ fn cmdUprobe(ctx: Context) void {
     if (process.processOfPid(p.pid)) |proc| {
         if (proc.fault) |f| out("      caught: {s} addr 0x{x}  {s}\n", .{ f.kind, f.addr, status(ok3) });
     }
-    pass = pass and ok3;
+    pass = verdict(pass, ok3, "[3]");
 
     // 4 -- a syscall pointer outside the process is refused, not followed.
     out("  [4] syscall pointers outside the process\n", .{});
     const rejected = syscall.rejected_ptr - rejected_before;
     const ok4 = rejected >= 2;
     out("      kernel refused {d} pointer(s) (kernel text + unmapped)  {s}\n", .{ rejected, status(ok4) });
-    pass = pass and ok4;
+    pass = verdict(pass, ok4, "[4]");
 
     // 5 -- two processes, the same virtual address, different physical pages.
     out("  [5] two processes writing 0x81000010 with different secrets\n", .{});
@@ -1048,7 +1065,7 @@ fn cmdUprobe(ctx: Context) void {
     out("      pids {d} and {d}: {s}/{s}, codes {d}/{d}  {s}\n", .{
         a.pid, b.pid, @tagName(sa), @tagName(sb), a.exit_code, b.exit_code, status(ok5),
     });
-    pass = pass and ok5;
+    pass = verdict(pass, ok5, "[5]");
 
     // 6 -- launch and exit repeatedly; the page counter must come back.
     out("  [6] five launch/exit cycles\n", .{});
@@ -1065,7 +1082,7 @@ fn cmdUprobe(ctx: Context) void {
     out("      {d}/5 cycles, free pages {d} -> {d} ({d} leaked)  {s}\n", .{
         cycles, base_pages, after_pages, leaked, status(ok6),
     });
-    pass = pass and ok6;
+    pass = verdict(pass, ok6, "[6]");
 
     // 7 -- capabilities: granted rights, refusals, stale handles, table limits.
     out("  [7] capabilities: granted rights, missing rights, stale handles, table limits\n", .{});
@@ -1078,7 +1095,7 @@ fn cmdUprobe(ctx: Context) void {
     _ = process.waitReaped(p.pid, 1000);
     const ok7 = st == .exited and p.exit_code == 0;
     out("      {d} capability calls, code {d}  {s}\n", .{ syscall.cap_calls - cap_before, p.exit_code, status(ok7) });
-    pass = pass and ok7;
+    pass = verdict(pass, ok7, "[7]");
 
     // 8 -- one object, two holders, each bounded by its own mask.
     out("  [8] two processes holding the same ledger, different rights\n", .{});
@@ -1104,7 +1121,7 @@ fn cmdUprobe(ctx: Context) void {
     out("      pids {d} (rw) and {d} (ro): {s}/{s}, codes {d}/{d}  {s}\n", .{
         pid_rw, pid_ro, @tagName(sca), @tagName(scb), code_rw, code_ro, status(ok8),
     });
-    pass = pass and ok8;
+    pass = verdict(pass, ok8, "[8]");
 
     // 9 -- the kernel's own view of the objects.
     out("  [9] object table after the run\n", .{});
@@ -1148,7 +1165,7 @@ fn cmdUprobe(ctx: Context) void {
     out("      server thread {d}: state {s}, runs {d} -> {d} over 20 ms  {s}\n", .{
         srv_tid, park_state.label(), runs_before, runs_after, status(parked_ok),
     });
-    pass = pass and parked_ok;
+    pass = verdict(pass, parked_ok, "[10]");
 
     const cli = process.spawnIpc(5, 0, "ipc-cli") orelse {
         out("      FAIL: cannot spawn the IPC client\n", .{});
@@ -1176,10 +1193,10 @@ fn cmdUprobe(ctx: Context) void {
         @tagName(s_cli), @tagName(s_out), @tagName(s_srv),
         c_srv, c_cli, c_out, status(ipc_ok),
     });
-    out("      ipc: {d} sent, {d} received, {d} replied, {d} timeouts, {d} full, {d} transfers, {d} transfer failures\n", .{
-        ipc.sends, ipc.receives, ipc.replies, ipc.timeouts, ipc.full_events, ipc.transfers, ipc.transfer_failures,
+    out("      ipc: {d} sent, {d} received, {d} replied, {d} timeouts, {d} full, {d} transfers, {d} transfer failures, {d} late\n", .{
+        ipc.sends, ipc.receives, ipc.replies, ipc.timeouts, ipc.full_events, ipc.transfers, ipc.transfer_failures, ipc.late_replies,
     });
-    pass = pass and ipc_ok;
+    pass = verdict(pass, ipc_ok, "[10]");
 
     // 13 -- lifecycle: one service is killed in a loop while another keeps
     // serving, a fault is captured as a crash record, and nothing is orphaned.
@@ -1319,7 +1336,7 @@ fn cmdUprobe(ctx: Context) void {
             service.crash_loops, dump.total, service.reaps,
         });
     }
-    pass = pass and lc_ok;
+    pass = verdict(pass, lc_ok, "[13]");
 
     // 14 -- registry: a POS application asks for a device by name and is told a
     // reason when it cannot have it, instead of a pid that may not exist.
@@ -1478,7 +1495,7 @@ fn cmdUprobe(ctx: Context) void {
         });
         reg_ok = reg_ok and reg_clean;
     }
-    pass = pass and reg_ok;
+    pass = verdict(pass, reg_ok, "[14]");
 
     // [15] resource accounting: a leaking service is capped and reported, and
     // the till keeps serving while the watchdog escalates.
@@ -1591,7 +1608,7 @@ fn cmdUprobe(ctx: Context) void {
         account.pressures, account.pressure_victims,
     });
     acct_ok = acct_ok and acct_clean;
-    pass = pass and acct_ok;
+    pass = verdict(pass, acct_ok, "[15]");
 
     // [16] sandbox: declarative manifests, the syscall gate, W^X, and a
     // compromised renderer that must not be able to open the raw block device.
@@ -1654,7 +1671,79 @@ fn cmdUprobe(ctx: Context) void {
     out("      W^X: writable-executable mapping refused at the funnel ({d} total)  {s}\n", .{
         mmu.wx_refusals, status(wx_ok),
     });
-    pass = pass and storage_ok and cap_ok and renderer_ok and blocked >= 16 and gate_denied >= 17 and wx_ok;
+    pass = verdict(pass, storage_ok and cap_ok and renderer_ok and blocked >= 16 and gate_denied >= 17 and wx_ok, "[16]");
+
+    // [17] driver model: devices as data, compatible matching, declared
+    // dependency order, isolated probe failures, and hotplug.
+    out("  [17] driver model: discovery, matching, ordering, isolation, hotplug\n", .{});
+    const dev_list = driver.allDevices();
+    var bound_count: usize = 0;
+    var waiting_count: usize = 0;
+    var failed_count: usize = 0;
+    for (dev_list) |d| switch (d.state) {
+        .bound => bound_count += 1,
+        .unbound, .skipped => waiting_count += 1,
+        .failed => failed_count += 1,
+        .absent => {},
+    };
+    const console_dev = driver.findByCompat("arm,pl011");
+    const gic_dev = driver.findByCompat("arm,gic-v3") orelse driver.findByCompat("arm,cortex-a15-gic");
+    const timer_dev = driver.findByCompat("arm,armv8-timer");
+    const rtc_dev = driver.findByCompat("arm,pl031");
+    const named = struct {
+        fn is(dev: ?*driver.Device, want: []const u8) bool {
+            const d = dev orelse return false;
+            const drv = d.driver orelse return false;
+            return std.mem.eql(u8, drv.name, want);
+        }
+    };
+    const match_ok = named.is(console_dev, "console") and named.is(gic_dev, "gic") and
+        named.is(timer_dev, "timer") and (rtc_dev == null or named.is(rtc_dev, "rtc"));
+
+    // The probe log is the boot order: the timer declares that it needs the
+    // interrupt controller, so the model must have probed the GIC first.
+    const order_ok = blk: {
+        var gic_at: ?usize = null;
+        var timer_at: ?usize = null;
+        for (driver.probeLog(), 0..) |entry, i| {
+            if (gic_at == null and std.mem.eql(u8, entry.driver, "gic")) gic_at = i;
+            if (timer_at == null and std.mem.eql(u8, entry.driver, "timer")) timer_at = i;
+        }
+        break :blk gic_at != null and timer_at != null and gic_at.? < timer_at.?;
+    };
+
+    // A failing probe is isolated: the device is marked and counted, and the
+    // machine keeps running. The device is invented; the driver is real code.
+    const failed_before = driver.failed_probes;
+    const broken = driver.inject("broken", "cassa,broken", 0, 0);
+    driver.bindAll();
+    const iso_ok = broken != null and broken.?.state == .failed and
+        driver.failed_probes == failed_before + 1 and driver.isBound("gic") and driver.isBound("timer");
+
+    // Hotplug: take the wall clock out of a running machine and put it back.
+    const removed_before = driver.events_removed;
+    const added_before = driver.events_added;
+    var hot_ok = false;
+    if (rtc_dev) |d| {
+        const down = driver.removeDevice(d.name);
+        const gone = d.state == .absent and !pl031.isPresent();
+        const back = driver.readdDevice(d.name);
+        hot_ok = down != null and gone and back != null and d.state == .bound and
+            driver.events_removed == removed_before + 1 and driver.events_added == added_before + 1;
+    } else {
+        // A machine with no RTC: removing what is not there must be refused
+        // cleanly, not crash, and nothing may be reported as removed.
+        hot_ok = driver.removeDevice("rtc@9010000") == null and driver.events_removed == removed_before;
+    }
+
+    out("      devices: {d} from the tree, {d} bound, {d} waiting for a driver, {d} failed  {s}\n", .{
+        dev_list.len, bound_count, waiting_count, failed_count, status(failed_count == 0 and bound_count >= 3),
+    });
+    out("      match: pl011->console, gic->gic, timer->timer, rtc->rtc  {s}\n", .{status(match_ok)});
+    out("      order: gic probed before timer (declared dependency)  {s}\n", .{status(order_ok)});
+    out("      isolation: cassa,broken probe failed, marked, machine unaffected  {s}\n", .{status(iso_ok)});
+    out("      hotplug: rtc unbound (listener told) and re-probed  {s}\n", .{status(hot_ok)});
+    pass = verdict(pass, failed_count == 0 and bound_count >= 3 and match_ok and order_ok and iso_ok and hot_ok, "[17]");
 
     out("  ------------------------------------------------------------------\n", .{});
     out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
@@ -1663,6 +1752,11 @@ fn cmdUprobe(ctx: Context) void {
     out("  user syscalls: {d}, processes spawned: {d}, faults caught: {d}\n", .{
         syscall.user_calls, process.spawns, process.kills,
     });
+    if (failed_step_count != 0) {
+        out("  failing step(s):", .{});
+        for (failed_steps[0..failed_step_count]) |label| out(" {s}", .{label});
+        out("\n", .{});
+    }
     out("  RESULT: {s}\n", .{if (pass) "PASS" else "FAIL"});
 }
 
@@ -1707,6 +1801,41 @@ fn cmdSandbox() void {
     out("  gate: {d} syscall(s) denied, {d} block attempt(s) denied, {d} W+X mapping(s) refused\n", .{
         sandbox.denied, sandbox.block_denials, mmu.wx_refusals,
     });
+}
+
+/// `devices` — the driver model as the kernel sees it: every device the machine
+/// described, what claimed it, and everything that is still waiting.
+fn cmdDevices() void {
+    out("  device                      state    driver         compatible\n", .{});
+    for (driver.allDevices()) |d| {
+        out("  {s:<27} {s:<8} {s:<14} {s}\n", .{
+            d.name,
+            d.state.label(),
+            if (d.driver) |drv| drv.name else "-",
+            d.compatible,
+        });
+    }
+    var bound: usize = 0;
+    var waiting: usize = 0;
+    var failed: usize = 0;
+    for (driver.allDevices()) |d| switch (d.state) {
+        .bound => bound += 1,
+        .unbound, .skipped => waiting += 1,
+        .failed => failed += 1,
+        .absent => {},
+    };
+    out("  {d} bound, {d} waiting, {d} failed · {d} probe failure(s), {d} removal(s), {d} addition(s)\n", .{
+        bound, waiting, failed, driver.failed_probes, driver.removals, driver.additions,
+    });
+    out("  drivers: {d} registered, {d} hotplug event(s) delivered\n", .{
+        driver.driverNames().len, driver.events_added + driver.events_removed + driver.events_failed,
+    });
+    if (pl031.now()) |dt| {
+        var buf: [40]u8 = undefined;
+        out("  wall clock: {s}\n", .{pl031.format(dt, &buf)});
+    } else {
+        out("  wall clock: no RTC bound\n", .{});
+    }
 }
 
 pub const build_version = "0.1.0-dev";
@@ -1765,6 +1894,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdAccounting();
     } else if (std.mem.eql(u8, command, "sandbox")) {
         cmdSandbox();
+    } else if (std.mem.eql(u8, command, "devices")) {
+        cmdDevices();
     } else if (std.mem.eql(u8, command, "user")) {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {

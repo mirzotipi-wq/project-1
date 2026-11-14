@@ -125,7 +125,12 @@ pub const Fdt = struct {
     }
 
     pub fn nextSibling(self: Fdt, node: Node) ?Node {
-        const after = self.skipNode(node.off);
+        var after = self.skipNode(node.off);
+        // FDT_NOP tokens are legal anywhere a token is legal, and a tree that
+        // has been edited in place (QEMU re-packs a `-dtb` blob, a bootloader
+        // patches /chosen) leaves them between nodes. A no-op is not the end of
+        // the sibling list: skip it and keep looking.
+        while (after + 4 <= self.bytes.len and readU32(self.bytes, after) == FDT_NOP) after += 4;
         if (after + 4 > self.bytes.len) return null;
         if (readU32(self.bytes, after) == FDT_BEGIN_NODE) return Node{ .off = after };
         return null;
@@ -271,4 +276,35 @@ test "init accepts a minimal valid header" {
     const fdt = try Fdt.init(&blob);
     try std.testing.expectEqual(@as(usize, 40), fdt.off_struct);
     try std.testing.expectEqualStrings("unknown", fdt.model());
+}
+
+test "nextSibling skips FDT_NOP tokens between nodes" {
+    // A minimal tree: root -> a, NOP, b. A tree edited in place can leave a
+    // no-op where a node used to be; traversal must step over it.
+    var blob = [_]u8{0} ** 88;
+    const header = [_]u32{ 0xd00d_feed, 88, 40, 84, 40, 17, 16, 0, 4, 44 };
+    for (header, 0..) |word, i| std.mem.writeInt(u32, blob[i * 4 ..][0..4], word, .big);
+    const put = struct {
+        fn at(bytes: []u8, off: usize, token: u32) void {
+            std.mem.writeInt(u32, bytes[off..][0..4], token, .big);
+        }
+    }.at;
+    put(&blob, 40, 1); // begin root, empty name at 44
+    put(&blob, 48, 1); // begin "a", name at 52
+    blob[52] = 'a';
+    put(&blob, 56, 2); // end "a"
+    put(&blob, 60, 4); // a no-op where a node used to be
+    put(&blob, 64, 1); // begin "b", name at 68
+    blob[68] = 'b';
+    put(&blob, 72, 2); // end "b"
+    put(&blob, 76, 2); // end root
+    put(&blob, 80, 9); // end of structure
+
+    const fdt = try Fdt.init(&blob);
+    const root = fdt.root();
+    const a = fdt.firstChild(root).?;
+    try std.testing.expectEqualStrings("a", fdt.name(a));
+    const b = fdt.nextSibling(a).?;
+    try std.testing.expectEqualStrings("b", fdt.name(b));
+    try std.testing.expect(fdt.nextSibling(b) == null);
 }
