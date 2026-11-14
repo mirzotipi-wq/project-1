@@ -25,6 +25,7 @@ test {
     _ = @import("kernel/sandbox.zig");
     _ = @import("kernel/driver.zig");
     _ = @import("devices/pl031.zig");
+    _ = @import("kernel/pci.zig");
 }
 
 test "seeded prng is deterministic across runs" {

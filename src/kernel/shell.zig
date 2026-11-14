@@ -33,6 +33,7 @@ const cap = @import("cap.zig");
 const account = @import("account.zig");
 const sandbox = @import("sandbox.zig");
 const driver = @import("driver.zig");
+const pci = @import("pci.zig");
 const pl031 = @import("../devices/pl031.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
@@ -1745,6 +1746,63 @@ fn cmdUprobe(ctx: Context) void {
     out("      hotplug: rtc unbound (listener told) and re-probed  {s}\n", .{status(hot_ok)});
     pass = verdict(pass, failed_count == 0 and bound_count >= 3 and match_ok and order_ok and iso_ok and hot_ok, "[17]");
 
+    out("  [18] pcie: ecam walk, BAR placement, MSI/INTx\n", .{});
+    const bus = pci.current();
+    const host_id = if (bus.root.ecam != 0) pci.read32(&bus.root, bus.root.bus_first, 0, 0, 0x00) else 0xFFFF_FFFF;
+    const root_ok = driver.isBound("pci-host") and bus.root.ecam != 0 and bus.root.mmio_len != 0;
+    // The configuration window has to answer: a function 0 that reads back all
+    // ones means the ECAM base is wrong or not mapped, not an empty bus.
+    const ecam_ok = root_ok and (host_id & 0xFFFF) != 0xFFFF and (host_id & 0xFFFF) != 0;
+    const published = driver.countPci();
+    const walk_ok = root_ok and bus.count != 0 and published == bus.count;
+    var bars_ok = root_ok and bus.bars_placed != 0;
+    var irq_ok = true;
+    var irq_count: usize = 0;
+    for (bus.functions[0..bus.count]) |*f| {
+        for (f.bars) |bar| {
+            if (bar.kind == .absent) continue;
+            if (bar.size == 0 or bar.assigned == 0) bars_ok = false;
+            if ((bar.size & (bar.size - 1)) != 0) bars_ok = false; // sizes are powers of two
+            if (bar.kind != .io and (bar.assigned < bus.root.mmio or
+                bar.assigned + bar.size > bus.root.mmio + bus.root.mmio_len)) bars_ok = false;
+        }
+        if (!pci.deliveryOk(f)) irq_ok = false;
+        if (f.msi_on or f.intx_routed) irq_count += 1;
+    }
+    irq_ok = irq_ok and irq_count != 0;
+    out("      root: pci-host-ecam-generic, ECAM 0x{x}+0x{x}, buses {d}..{d}, mmio 0x{x}+0x{x}  {s}\n", .{
+        bus.root.ecam, bus.root.ecam_len, bus.root.bus_first, bus.root.bus_last,
+        bus.root.mmio, bus.root.mmio_len, status(root_ok),
+    });
+    out("      ecam: 00:00.0 reads {x:0>4}:{x:0>4}  {s}\n", .{
+        host_id & 0xFFFF, host_id >> 16, status(ecam_ok),
+    });
+    out("      walk: {d} function(s), {d} published as devices  {s}\n", .{
+        bus.count, published, status(walk_ok),
+    });
+    out("      bars: {d} placed, sizes powers of two inside the windows  {s}\n", .{
+        bus.bars_placed, status(bars_ok),
+    });
+    out("      irq: {d} connected ({d} msi, {d} fell back to intx), {s}  {s}\n", .{
+        irq_count, bus.root.msi_functions, bus.root.msi_fallbacks,
+        switch (bus.root.msi) {
+            .none => "msi unavailable (no GICv2m frame, no ITS): INTx only",
+            .its => "msi controller is an ITS, not programmed: INTx only",
+            .v2m => "GICv2m frame present",
+        },
+        status(irq_ok),
+    });
+    for (bus.functions[0..bus.count]) |*f| {
+        out("        {d:0>2}:{d:0>2}.{d} {x:0>4}:{x:0>4} {s}: {s}\n", .{
+            f.bus, f.dev, f.func, f.vendor, f.device, pci.classLabel(f.class_code),
+            if (f.msi_on) "msi" else if (f.intx_routed) "intx routed" else "no interrupt",
+        });
+    }
+    out("      unclaimed: {d} pci function(s) waiting for a driver  {s}\n", .{
+        published, status(published != 0),
+    });
+    pass = verdict(pass, root_ok and ecam_ok and walk_ok and bars_ok and irq_ok, "[18]");
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
         sched.double_run_events, sched.queue_violations, sched.stray_ready,
@@ -1801,6 +1859,13 @@ fn cmdSandbox() void {
     out("  gate: {d} syscall(s) denied, {d} block attempt(s) denied, {d} W+X mapping(s) refused\n", .{
         sandbox.denied, sandbox.block_denials, mmu.wx_refusals,
     });
+}
+
+/// `lspci` — the PCIe bus as the kernel sees it. Same facts QEMU's `info pci`
+/// prints, plus where this kernel placed each BAR and how the interrupt is
+/// delivered.
+fn cmdLspci() void {
+    pci.printTable(out);
 }
 
 /// `devices` — the driver model as the kernel sees it: every device the machine
@@ -1894,6 +1959,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdAccounting();
     } else if (std.mem.eql(u8, command, "sandbox")) {
         cmdSandbox();
+    } else if (std.mem.eql(u8, command, "lspci")) {
+        cmdLspci();
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();
     } else if (std.mem.eql(u8, command, "user")) {

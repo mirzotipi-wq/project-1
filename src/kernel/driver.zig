@@ -78,6 +78,28 @@ pub const ProbeError = error{
     NoMemory,
 };
 
+/// What a PCI function is, carried on the device object so the bus layer does
+/// not have to keep a parallel table: `devices` and `lspci` read the same thing.
+pub const PciInfo = struct {
+    bus: u8 = 0,
+    dev: u8 = 0,
+    func: u8 = 0,
+    vendor: u16 = 0,
+    device: u16 = 0,
+    class_code: u32 = 0,
+    header_type: u8 = 0,
+    intx_pin: u8 = 0,
+    intx_spi: u32 = 0,
+    intx_routed: bool = false,
+    msi: bool = false,
+    msix: bool = false,
+    msi_vector: u32 = 0,
+    msi_on: bool = false,
+    bar_count: u8 = 0,
+    bars: [6]u64 = [_]u64{0} ** 6,
+    bar_sizes: [6]u64 = [_]u64{0} ** 6,
+};
+
 pub const Device = struct {
     /// Node name from the tree, e.g. `rtc@9010000`. Unique per machine.
     name: []const u8 = "",
@@ -96,6 +118,12 @@ pub const Device = struct {
     /// False for devices the model synthesised (no device tree) or a self-test
     /// injected.
     from_tree: bool = true,
+    /// Device-tree node offset, for drivers that need more properties than the
+    /// model stores (the PCIe bridge reads `ranges`, `bus-range` and
+    /// `interrupt-map`). Zero means "not from the tree".
+    node_off: usize = 0,
+    /// PCI identity, when the device came from a bus walk rather than the tree.
+    pci: PciInfo = .{},
 
     pub fn claims(self: *const Device, compatible: []const u8) bool {
         for (self.compatibles[0..self.compatible_count]) |entry| {
@@ -153,6 +181,68 @@ pub var events_failed: u64 = 0;
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
+
+/// The machine the current boot discovered. Probes that need more than the
+/// device's own properties (the PCIe bridge reads the node's `ranges`) look here
+/// instead of growing a parameter every phase.
+var attached_machine: ?*const machine_mod.Machine = null;
+
+pub fn attachMachine(m: *const machine_mod.Machine) void {
+    attached_machine = m;
+}
+
+pub fn attachedMachine() ?*const machine_mod.Machine {
+    return attached_machine;
+}
+
+/// Publish a device the model did not discover itself: a bus function, or a
+/// device a driver found behind another one. It enters the same table, so it is
+/// matched, described and counted like any tree device.
+pub fn publish(dev: Device) ?*Device {
+    if (device_count >= max_devices) {
+        overflowed += 1;
+        return null;
+    }
+    devices[device_count] = dev;
+    device_count += 1;
+    return &devices[device_count - 1];
+}
+
+/// Drop every published device whose name starts with `prefix` (the PCIe bridge
+/// removing itself removes its functions). Returns how many went.
+pub fn unpublish(prefix: []const u8) usize {
+    var removed: usize = 0;
+    var i: usize = 0;
+    while (i < device_count) {
+        if (!std.mem.startsWith(u8, devices[i].name, prefix)) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j + 1 < device_count) : (j += 1) devices[j] = devices[j + 1];
+        device_count -= 1;
+        removed += 1;
+    }
+    return removed;
+}
+
+/// Functions published by the PCIe bus: a tree node called `pcie@...` must not
+/// be mistaken for one, so this counts the devices that carry PCI identity.
+pub fn countPci() usize {
+    var n: usize = 0;
+    for (devices[0..device_count]) |*dev| {
+        if (dev.pci.vendor != 0) n += 1;
+    }
+    return n;
+}
+
+pub fn countPrefix(prefix: []const u8) usize {
+    var n: usize = 0;
+    for (devices[0..device_count]) |*dev| {
+        if (std.mem.startsWith(u8, dev.name, prefix)) n += 1;
+    }
+    return n;
+}
 
 pub fn installDriver(driver: *const Driver) bool {
     if (driver_count >= max_drivers) {
@@ -213,7 +303,7 @@ fn addFromNode(tree: fdt.Fdt, node: fdt.Node) void {
     if (isSkippedName(name)) return;
     const compat = tree.prop(node, "compatible") orelse return;
 
-    var dev = Device{ .name = name, .from_tree = true, .state = .unbound };
+    var dev = Device{ .name = name, .from_tree = true, .state = .unbound, .node_off = node.off };
     var it = std.mem.splitScalar(u8, compat, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;

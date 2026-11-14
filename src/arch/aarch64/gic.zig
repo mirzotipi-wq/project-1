@@ -190,6 +190,20 @@ pub fn disableIrq(intid: u32) void {
     }
 }
 
+/// Is the line actually enabled? Route and enable are only worth anything if
+/// the controller reads back the bit: the PCIe probe checks it after routing an
+/// INTx and after a driver claims an SPI.
+pub fn irqEnabled(intid: u32) bool {
+    if (!initialized or intid >= 1020) return false;
+    return switch (version) {
+        .v2 => distRead(GICD_ISENABLER + (intid / 32) * 4) & (@as(u32, 1) << @intCast(intid % 32)) != 0,
+        .v3 => if (intid < 32)
+            mmio32(redist_base + GICR_ISENABLER0).* & (@as(u32, 1) << @intCast(intid)) != 0
+        else
+            distRead(GICD_ISENABLER + (intid / 32) * 4) & (@as(u32, 1) << @intCast(intid % 32)) != 0,
+    };
+}
+
 /// Acknowledge the highest-priority pending interrupt.
 pub fn acknowledge() u32 {
     return switch (version) {

@@ -247,8 +247,10 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     }
     regions[region_count] = .{ .base = g_machine.ram_base, .size = g_machine.ram_size, .kind = .normal };
     region_count += 1;
-    // PCIe ECAM window used by the virt machine (phase 32 maps BARs inside it).
-    regions[region_count] = .{ .base = 0x40_0000_0000, .size = 0x1000_0000, .kind = .device };
+    // PCIe ECAM window used by the virt machine: 256 buses x 32 devices x 8
+    // functions x 4 KiB, at 0x40_1000_0000. The earlier 256 MiB slot below it
+    // was a placeholder and did not cover the real configuration space.
+    regions[region_count] = .{ .base = 0x40_1000_0000, .size = 0x1000_0000, .kind = .device };
     region_count += 1;
 
     // Exceptions first: the vector table is patched while text is still
@@ -271,6 +273,7 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     // console was installed above by the firmware handoff so that a driver that
     // fails to probe can still be reported; the pl011 driver re-installs it from
     // the tree, which is why `console` appears in the bound set.
+    driver.attachMachine(&g_machine);
     builtin_drivers.installAll();
     _ = driver.discover(&g_machine);
     driver.bindAll();

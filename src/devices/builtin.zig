@@ -9,6 +9,7 @@ const gic = @import("../arch/aarch64/gic.zig");
 const timer = @import("../arch/aarch64/timer.zig");
 const uart = @import("pl011.zig");
 const pl031 = @import("pl031.zig");
+const pci = @import("../kernel/pci.zig");
 const klog = @import("../kernel/klog.zig");
 
 fn probeConsole(dev: *driver.Device) driver.ProbeError!void {
@@ -41,6 +42,58 @@ fn probeRtc(dev: *driver.Device) driver.ProbeError!void {
 
 fn removeRtc(_: *driver.Device) void {
     pl031.remove();
+}
+
+/// The PCIe host bridge: read the root complex out of the tree, walk its buses,
+/// place the BARs, connect the interrupts, and publish every function as a
+/// device. The bridge driver owns the bus, not the devices on it.
+fn probePciHost(dev: *driver.Device) driver.ProbeError!void {
+    const m = driver.attachedMachine() orelse return error.Unsupported;
+    const bus = pci.current();
+    bus.* = .{};
+    bus.root = try pci.parseRoot(m, dev);
+    bus.count = pci.walk(&bus.root, bus.functions[0..]);
+    // A root complex with no functions at all means the walk or the ECAM window
+    // is wrong; failing here is the loud diagnosis, not a quiet empty bus.
+    if (bus.count == 0) return error.Unsupported;
+    bus.bars_placed = pci.assignBars(&bus.root, bus.functions[0..bus.count]);
+    pci.connectInterrupts(&bus.root, bus.functions[0..bus.count]);
+    _ = pci.publishAll(bus.functions[0..bus.count]);
+
+    klog.info("pci", "root complex 0x{x}+0x{x}: buses {d}..{d}, mmio 0x{x}+0x{x}", .{
+        bus.root.ecam, bus.root.ecam_len, bus.root.bus_first, bus.root.bus_last,
+        bus.root.mmio, bus.root.mmio_len,
+    });
+    var msi_count: usize = 0;
+    var intx_count: usize = 0;
+    for (bus.functions[0..bus.count]) |*f| {
+        if (f.msi_on) {
+            msi_count += 1;
+        } else if (f.intx_routed) {
+            intx_count += 1;
+        }
+    }
+    if (bus.root.msi_fallbacks != 0) {
+        klog.warn("pci", "{d} function(s) advertise MSI but are delivered by INTx: their vector table is not reachable until their transport is driven", .{bus.root.msi_fallbacks});
+    }
+    klog.info("pci", "{d} function(s), {d} BAR(s) placed, {d} msi, {d} intx{s}", .{
+        bus.count, bus.bars_placed, msi_count, intx_count,
+        switch (bus.root.msi) {
+            .none => " (no MSI controller: INTx fallback)",
+            .its => " (ITS present, not programmed: INTx fallback)",
+            .v2m => " (GICv2m)",
+        },
+    });
+}
+
+fn removePciHost(_: *driver.Device) void {
+    for (pci.current().functions[0..pci.current().count]) |*f| {
+        if (f.msi_on and f.msi_vector != 0) gic.disableIrq(f.msi_vector);
+        if (f.intx_routed and f.intx_spi != 0) gic.disableIrq(f.intx_spi);
+    }
+    const gone = driver.unpublish("pci");
+    pci.current().count = 0;
+    klog.info("pci", "bus removed: {d} function(s) unpublished", .{gone});
 }
 
 /// A driver whose probe always fails. It binds to nothing QEMU produces; the
@@ -78,6 +131,17 @@ const rtc_driver = driver.Driver{
     .remove = removeRtc,
 };
 
+const pci_host_driver = driver.Driver{
+    .name = "pci-host",
+    .compat = &.{"pci-host-ecam-generic"},
+    // The bridge enables INTx lines and MSI vectors, so the controller must be
+    // up before it probes. This is the first device whose dependency is real
+    // hardware rather than another driver's bookkeeping.
+    .deps = &.{"gic"},
+    .probe = probePciHost,
+    .remove = removePciHost,
+};
+
 const broken_driver = driver.Driver{
     .name = "selftest-fail",
     .compat = &.{"cassa,broken"},
@@ -89,6 +153,7 @@ pub const all = [_]*const driver.Driver{
     &gic_driver,
     &timer_driver,
     &rtc_driver,
+    &pci_host_driver,
     &broken_driver,
 };
 

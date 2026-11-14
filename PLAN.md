@@ -1241,11 +1241,99 @@ bridge stay unbound until phases 32 and 33, and the GPIO controller has no drive
 no cash-drawer line). The RTC is read-only: no alarm interrupt, no timezone or drift handling, and
 the kernel has no `settime` path yet. Devices are not exported to userspace as `/dev` nodes.
 
-### Phase 32 — PCIe host bridge `[ ]`
+### Phase 32 — PCIe host bridge `[x]`
 **Goal:** Enumerate the terminal's internal buses.
 **Build:** ECAM config access, bus/device/function walk, BAR sizing and mapping, MSI/MSI-X
 allocation, legacy INTx fallback.
 **Done when:** `lspci`-equivalent output matches QEMU's device list, including BAR layout.
+
+**Shipped.** The terminal's internal bus is now a first-class device in the phase-31 model:
+`pci-host` claims `pci-host-ecam-generic`, and every function it finds enters the device table as
+its own object (`pci0:01.0`, compatible `pci,1b36:0005`, vendor/device/class, BARs, interrupt
+capability). Nothing is hidden inside the bridge driver: the functions are unbound, appear in
+`devices`, and are counted with everything else — which is what the virtio transport binds next.
+
+What `src/kernel/pci.zig` does, driven entirely by the tree and the PCI register layout:
+
+  * **ECAM access.** `ecamAddress` is the spec's bus/device/function shift into the 256 MiB
+    window; config space is read and written as aligned 32-bit accesses only, with half-word and
+    byte fields rebuilt inside their word.
+  * **The root complex from the device tree.** `ranges` (decoded without being told the parent's
+    address-cell width: every plausible width is tried, and ambiguity is refused rather than
+    guessed), `bus-range`, `interrupt-map`/`-mask`, and `#address-cells`/`#size-cells`.
+  * **Walk.** All 256 buses, 32 devices, 8 functions where the header says multifunction; every
+    present function becomes a `Function` and then a device object.
+  * **BARs.** Each BAR is sized by writing all ones and reading the mask back (restoring the
+    original), decoded as 32-bit, 64-bit or I/O, assigned inside the host bridge's windows,
+    written to the device, and read back to prove it took the address.
+  * **Interrupts.** MSI (message registers in config space), MSI-X (table entry in a BAR) and
+    legacy INTx through the tree's `interrupt-map`, in that order. The GICv2m frame is the MSI
+    controller: its `SETSPI_NSR` register is the message address and the allocated SPI is the
+    data. Every path is verified by readback — the MSI/MSI-X enable bit, the table entry, and the
+    GIC's own ISENABLER bit for INTx — before a function is reported as connected.
+
+**Measured (final build).** Step [18] on every probe boot, with `-device pci-testdev -device
+virtio-rng-pci`:
+
+`root: pci-host-ecam-generic, ECAM 0x4010000000+0x10000000, buses 0..255, mmio
+0x10000000+0x2eff0000  OK`,
+`ecam: 00:00.0 reads 1b36:0008  OK`,
+`walk: 3 function(s), 3 published as devices  OK`,
+`bars: 5 placed, sizes powers of two inside the windows  OK`,
+`irq: 1 connected (0 msi, 1 fell back to intx), GICv2m frame present  OK`,
+`unclaimed: 3 pci function(s) waiting for a driver  OK`.
+
+`lspci` on that boot, matching QEMU's own `info pci` device list:
+
+```
+  bus:dev.fn  vendor:device  class            bars                       irq
+  00:00.0   1b36:0008   bridge                                      intx (unrouted)
+  00:01.0   1b36:0005   unclassified     mem 0x10000000+0x1000 io 0x3eff0000+0x100 intx (unrouted)
+  00:02.0   1af4:1005   unclassified     io 0x3eff0000+0x20 mem 0x10001000+0x1000 mem 0x10004000+0x4000 intx (routed)
+```
+
+The BAR layout is the kernel's own: `virt` has no firmware assigning addresses, so the sizes come
+from the devices and the addresses from the host bridge's windows — which is why they match the
+tree's ranges exactly.
+
+**MSI unavailable, INTx fallback.** `tools/nop-node.zig` removes the `v2m@8020000` frame from a
+QEMU-dumped tree, so the same image boots a machine with no MSI controller:
+`irq: 1 connected (0 msi, 1 fell back to intx), msi unavailable (no GICv2m frame, no ITS): INTx
+only  OK`, the virtio function routed to its SPI, and step [18] passes. INTx is not "declared":
+`interrupt-map` resolves the pin to a controller line, the line is enabled, and the GIC's
+ISENABLER bit is read back to prove it.
+
+**Two real bugs the verification found, both fixed at the source:**
+
+  * **An unassigned 32-bit memory BAR reads back zero, exactly like an absent one.** The first
+    implementation treated `raw == 0` as "no BAR" and found nothing to place on a machine with no
+    firmware. Only the all-ones write distinguishes them, so sizing always probes the mask now.
+    (A second, related one: complementing a 32-bit mask in 64 bits made every size
+    `0xffffffff00001000` and unmappable.)
+  * **`interrupt-map`'s parent cell is a type and an *index*, not an interrupt id.** Map entry
+    `SPI 3` means GIC interrupt 35. The kernel was enabling interrupt 3 — an SGI — which looks
+    like a working route until the first interrupt arrives. The translation (`32 + n` for SPI,
+    `16 + n` for PPI) is host-tested now.
+
+On the final build: clean `rm -rf .zig-cache zig-out && zig build` with 0 errors and 0 warnings;
+82/82 host tests; 20/20 consecutive four-core probe boots `RESULT: PASS` with zero panics and zero
+hangs; 5/5 single-core boots; `killoop 150` twice at 150/150 with 0 pages leaked; `stress 4 20000`
+exact; `reap 8` with 0 pages leaked; `preempt 1000` PASS on one core; the RTC-less tree still
+passes with PCI devices present.
+
+**Deferred (open items).** The walk covers the root complex's bus range; bridges are seen as
+functions but their secondary buses are not walked, so a card behind a root port is not enumerated
+yet. BAR assignment is a cursor, not a resource tree, and there is no reclamation on removal. Only
+MSI-X vector 0 is programmed, with no PBA/vector-mask handling and no free-list; a device that asks
+twice gets one. MSI-X table programming is implemented and was attempted on this machine's only
+MSI-X device (virtio), whose table BAR reads back all-ones until its transport is negotiated —
+phase 33's work — so the kernel logs that fallback and uses INTx; no device this kernel probes
+exposes a plain MSI capability (e1000, e1000e and pci-testdev have none), so that path is built and
+unit-shaped but not exercised by hardware here. A **GICv3 boot hangs after the idle thread starts**
+(on `-smp 4` and `-smp 1`), which this phase's verification exposed but did not cause; GICv2 is the
+machine this kernel is proven on, and the MSI-unavailable evidence uses a device tree without the
+GICv2m frame instead. No PCIe hotplug, no ACPI, no MSI remapping, no INTx sharing beyond one
+function per pin, and no userspace access to configuration space.
 
 ### Phase 33 — Virtio transport `[ ]`
 **Goal:** One transport for block, net, input and GPU.
