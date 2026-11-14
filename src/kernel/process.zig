@@ -19,6 +19,7 @@ const store = @import("image.zig");
 const elf = @import("elf.zig");
 const dump = @import("dump.zig");
 const account = @import("account.zig");
+const sandbox = @import("sandbox.zig");
 
 pub const State = enum { free, running, exited, killed };
 
@@ -34,6 +35,13 @@ pub const Process = struct {
     state: State = .free,
     exit_code: i64 = 0,
     fault: ?Fault = null,
+    /// The policy this process was born under: its capabilities and its allowed
+    /// system calls (phase 30). Checked on every EL0 call.
+    sandbox: sandbox.Id = .harness,
+    /// How many times this process asked for something its sandbox refused. The
+    /// kernel counts every refusal but only logs the first few, so a compromised
+    /// process cannot turn a denial into a console flood.
+    sandbox_denials: u32 = 0,
 };
 
 pub const max_processes: usize = 8;
@@ -178,7 +186,7 @@ pub fn refusalLabel(r: Refusal) []const u8 {
 /// the stack before the thread is admitted — so the program's very first
 /// instruction runs with a complete environment.
 pub fn spawnElf(name: []const u8, argv: []const []const u8, envp: []const []const u8) ?*Process {
-    return spawnElfInner(name, argv, envp, null);
+    return spawnElfInner(name, argv, envp, null, .service);
 }
 
 /// Launch a program whose quota must be in force from its very first
@@ -186,10 +194,16 @@ pub fn spawnElf(name: []const u8, argv: []const []const u8, envp: []const []cons
 /// which the child is already runnable on another core — the ledger has to be
 /// attached with the right budget before the thread is admitted, not after.
 pub fn spawnElfQuota(name: []const u8, argv: []const []const u8, envp: []const []const u8, quota: account.Quota) ?*Process {
-    return spawnElfInner(name, argv, envp, quota);
+    return spawnElfInner(name, argv, envp, quota, .service);
 }
 
-fn spawnElfInner(name: []const u8, argv: []const []const u8, envp: []const []const u8, quota: ?account.Quota) ?*Process {
+/// Launch a program under a named sandbox. The manifest decides both the
+/// capabilities it is born with and the system calls it may make.
+pub fn spawnElfSandbox(name: []const u8, argv: []const []const u8, envp: []const []const u8, quota: account.Quota, id: sandbox.Id) ?*Process {
+    return spawnElfInner(name, argv, envp, quota, id);
+}
+
+fn spawnElfInner(name: []const u8, argv: []const []const u8, envp: []const []const u8, quota: ?account.Quota, id: sandbox.Id) ?*Process {
     const file = store.find(name) orelse {
         exec_failures += 1;
         last_refusal = .not_found;
@@ -232,16 +246,14 @@ fn spawnElfInner(name: []const u8, argv: []const []const u8, envp: []const []con
 
     const pid = next_pid;
     next_pid += 1;
-    slot.* = .{ .pid = pid, .thread_id = t.id, .state = .running };
-    // An ELF process is a process: it is born with the same four bootstrap
-    // handles as the demo image, so capability-mediated facilities (shared
-    // memory, endpoints) work without inventing ambient authority. Grants happen
-    // before the ledger is attached, so the birth handles are the floor a quota
-    // is measured against rather than a surprise charge.
-    if (cap.grantForProcess(slot.pid)) |c| {
-        user_space.setHandles(as, c.console, c.ledger, c.supervisor, c.page);
+    slot.* = .{ .pid = pid, .thread_id = t.id, .state = .running, .sandbox = id };
+    // Born with exactly the capabilities its manifest names — no more, and none
+    // that the machine has not declared. Grants happen before the ledger is
+    // attached, so the birth handles are the floor a quota is measured against.
+    if (cap.grantSpecs(slot.pid, sandbox.of(id).caps)) |_| {
+        // The handles are in the table; an ELF program finds them by number.
     } else {
-        klog.warn("proc", "pid {d}: could not build a capability table", .{slot.pid});
+        klog.warn("proc", "pid {d}: could not build a capability table for sandbox '{s}'", .{ slot.pid, sandbox.of(id).name });
     }
     _ = account.attach(slot.pid, quota orelse .{});
     sched.admit(t);

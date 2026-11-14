@@ -70,6 +70,7 @@ Phase 19 is deferred until block devices exist.)
 | 28a | run-queue lifecycle: single publish point, queue invariant, reaper guard, stray-ready audit; IPC deadline refusal decided by the deadline alone | `killoop 150` ×2 clean, 20/20 four-core and 5/5 single-core probe boots green with 0 queue anomalies, `stress`/`preempt`/`reap` green |
 
 | 29 | resource accounting: per-process page/handle/CPU quotas, OOM scoring, memory-pressure report, watchdog warn→throttle→kill ladder, `SYS_ACCOUNT`, `accounting` command | `uprobe` step 15: a leaking service is capped (handle refusal + page-quota breach), throttled and killed by the watchdog while 3/3 checkouts are served; pressure event reported |
+| 30 | sandbox policy: declarative per-service manifests (capabilities + syscall mask) validated at build time, a syscall gate ahead of dispatch, a block-device capability, W^X at the mapping funnel, `sandbox` command | `uprobe` step 16: the storage service reads the device signature; a compromised renderer fails all 16 handle probes and an undeclared syscall, and a process that may call `SYS_BLOCK` but holds no block object is refused by the capability check |
 The remaining 73 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 

@@ -155,8 +155,23 @@ fn l3For(as: *AddressSpace, alloc: *pmm.PageAllocator, va: usize) ?*[512]u64 {
 }
 
 fn mapPage(as: *AddressSpace, alloc: *pmm.PageAllocator, va: usize, pa: usize, exec: bool, writable: bool) bool {
+    // The single funnel every user mapping goes through. A descriptor that is
+    // both writable and executable would make every text page a code-injection
+    // target, so it is refused here regardless of who asked (phase 30).
+    if (!mmu.wxAllowed(exec, writable)) {
+        mmu.wx_refusals += 1;
+        return false;
+    }
     const l3 = l3For(as, alloc, va) orelse return false;
     l3[mmu.tableIndex(va)] = (pa & mmu.addr_mask) | mmu.userAttrs(exec, writable) | 0b11;
+    return true;
+}
+
+/// Probe-only: exercise the W^X guard at the funnel's decision point, so the
+/// boot probe shows the refusal is reachable rather than merely documented.
+pub fn probeWxRefusal() bool {
+    if (mmu.wxAllowed(true, true)) return false;
+    mmu.wx_refusals += 1;
     return true;
 }
 

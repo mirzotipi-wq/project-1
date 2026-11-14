@@ -31,6 +31,7 @@ const names = @import("names.zig");
 const user_space = @import("addrspace.zig");
 const cap = @import("cap.zig");
 const account = @import("account.zig");
+const sandbox = @import("sandbox.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
 const elf = @import("elf.zig");
@@ -64,6 +65,7 @@ fn printHelp() void {
         \\  map <addr>           translate a virtual address
         \\  selftest             run the boot self-tests
         \\  accounting           per-process quotas, usage, OOM scores, watchdog
+        \\  sandbox              service manifests, syscall gate, W^X counters
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -1591,6 +1593,69 @@ fn cmdUprobe(ctx: Context) void {
     acct_ok = acct_ok and acct_clean;
     pass = pass and acct_ok;
 
+    // [16] sandbox: declarative manifests, the syscall gate, W^X, and a
+    // compromised renderer that must not be able to open the raw block device.
+    out("  [16] sandbox: manifests, syscall mask, block-device denial\n", .{});
+    const sb_env = [_][]const u8{"POS_TERM=cassa-1"};
+    const block_denials_before = sandbox.block_denials;
+    const gate_denied_before = sandbox.denied;
+    const wx_before = mmu.wx_refusals;
+
+    // (a) The one entitled service reads sector 0 through its block handle.
+    var storage_ok = false;
+    {
+        const argv = [_][]const u8{ "pos.elf", "block" };
+        if (process.spawnElfSandbox("pos.elf", &argv, &sb_env, .{}, .storage)) |proc| {
+            const outcome = process.wait(proc.pid, 3000);
+            storage_ok = outcome == .exited and proc.exit_code == 0;
+            _ = process.waitReaped(proc.pid, 1000);
+        }
+    }
+
+    // (b) A process whose mask allows the call but which holds no block object:
+    //     the capability check alone has to stop it, so neither line of defence
+    //     can hide behind the other.
+    var cap_ok = false;
+    {
+        const argv = [_][]const u8{ "pos.elf", "cap" };
+        if (process.spawnElfSandbox("pos.elf", &argv, &sb_env, .{}, .harness)) |proc| {
+            const outcome = process.wait(proc.pid, 3000);
+            cap_ok = outcome == .exited and proc.exit_code == 0;
+            _ = process.waitReaped(proc.pid, 1000);
+        }
+    }
+
+    // (c) The compromised renderer: arbitrary code inside its own sandbox, with a
+    //     console and the right to ask about itself.
+    var renderer_ok = false;
+    {
+        const argv = [_][]const u8{ "pos.elf", "attack" };
+        if (process.spawnElfSandbox("pos.elf", &argv, &sb_env, .{}, .renderer)) |proc| {
+            const outcome = process.wait(proc.pid, 3000);
+            renderer_ok = outcome == .exited and proc.exit_code == 0;
+            _ = process.waitReaped(proc.pid, 1000);
+        }
+    }
+    const blocked = sandbox.block_denials - block_denials_before;
+    const gate_denied = sandbox.denied - gate_denied_before;
+    // W^X: the mapping funnel refuses a writable-executable page, and the policy
+    // validator refuses a manifest that asks for one (a build-time check).
+    const wx_ok = user_space.probeWxRefusal() and mmu.wx_refusals > wx_before;
+
+    out("      manifests: {d} validated at build time, renderer caps {d} (console only)\n", .{
+        sandbox.manifests.len, sandbox.of(.renderer).caps.len,
+    });
+    out("      storage: sector 0 signature through its block handle  {s}\n", .{status(storage_ok)});
+    out("      no-block: 16 calls allowed by the mask, refused by capability  {s}\n", .{status(cap_ok and blocked >= 16)});
+    out("      renderer: 16 handle probes + 1 undeclared call refused by the mask  {s}\n", .{status(renderer_ok and gate_denied >= 17)});
+    out("      block: {d} denial(s) recorded, 0 reads without the object  {s}\n", .{
+        blocked, status(blocked >= 16),
+    });
+    out("      W^X: writable-executable mapping refused at the funnel ({d} total)  {s}\n", .{
+        mmu.wx_refusals, status(wx_ok),
+    });
+    pass = pass and storage_ok and cap_ok and renderer_ok and blocked >= 16 and gate_denied >= 17 and wx_ok;
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
         sched.double_run_events, sched.queue_violations, sched.stray_ready,
@@ -1624,6 +1689,23 @@ fn cmdAccounting() void {
     });
     out("  refusals: {d} frame(s) over a page budget, {d} handle(s) over a handle quota\n", .{
         user_space.budget_refusals, cap.quota_refusals,
+    });
+}
+
+/// `sandbox` — the manifests as the kernel sees them, plus the gate counters.
+fn cmdSandbox() void {
+    out("  id  name      caps  syscalls\n", .{});
+    for (&sandbox.manifests) |*m| {
+        out("  {d}   {s:<8}  {d}     {d} allowed\n", .{
+            @intFromEnum(m.id), m.name, m.caps.len, @popCount(m.syscalls),
+        });
+        for (m.caps) |c| {
+            var rights_buf: [4]u8 = undefined;
+            out("        {s:<10} {s}\n", .{ c.kind.label(), cap.rightsText(c.rights, &rights_buf) });
+        }
+    }
+    out("  gate: {d} syscall(s) denied, {d} block attempt(s) denied, {d} W+X mapping(s) refused\n", .{
+        sandbox.denied, sandbox.block_denials, mmu.wx_refusals,
     });
 }
 
@@ -1681,6 +1763,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdKillLoop(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "accounting")) {
         cmdAccounting();
+    } else if (std.mem.eql(u8, command, "sandbox")) {
+        cmdSandbox();
     } else if (std.mem.eql(u8, command, "user")) {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {

@@ -24,6 +24,7 @@ const shm = @import("shm.zig");
 const registry = @import("registry.zig");
 const names = @import("names.zig");
 const account = @import("account.zig");
+const sandbox = @import("sandbox.zig");
 
 /// System calls a process may make from EL0. Deliberately small: each one is a
 /// place where the kernel acts with its own authority, so the surface is the
@@ -69,6 +70,11 @@ pub const UserNr = enum(u64) {
     // its own usage, its own quota's verdict and whether the machine reported
     // memory pressure. There is no way to name another process.
     account = 39,
+
+    // Raw block device (phase 30). A read of eight bytes at a byte offset, on a
+    // handle that names the block object. Reaching the disk is therefore a
+    // capability question, and a sandbox without the handle cannot ask at all.
+    block = 40,
 };
 
 /// Rejected user pointers, counted so the probe can prove the kernel refused to
@@ -243,6 +249,18 @@ test "syscall numbers stay out of the signal-handler range" {
 /// EL0 entry point. Every argument is untrusted: numbers are matched against a
 /// fixed table, and every pointer is validated against the calling process's own
 /// regions *and* its live page tables before the kernel touches it.
+/// A block-device attempt that did not reach the object. Counted every time,
+/// logged a few times (see `Process.sandbox_denials`).
+fn denyBlock(pid: u32) void {
+    sandbox.block_denials += 1;
+    if (process.processOfPid(pid)) |p| {
+        p.sandbox_denials +|= 1;
+        if (p.sandbox_denials <= 4) {
+            klog.warn("sandbox", "pid {d}: block device refused — no such capability", .{pid});
+        }
+    }
+}
+
 pub fn handleUser(number: u64, frame: *trap.Frame) Action {
     user_calls += 1;
     const t = sched.running();
@@ -251,6 +269,22 @@ pub fn handleUser(number: u64, frame: *trap.Frame) Action {
         frame.x[0] = errno(.invalid);
         return .keep;
     };
+
+    // Phase 30: the manifest is checked before dispatch, not inside each call.
+    // A process that never declared a facility cannot reach it even if it runs
+    // arbitrary code — the table entry, not the program, decides.
+    const caller = process.currentPid();
+    if (!sandbox.allowsForPid(caller, number)) {
+        sandbox.denied += 1;
+        if (process.processOfPid(caller)) |p| {
+            p.sandbox_denials +|= 1;
+            if (p.sandbox_denials <= 4) {
+                klog.warn("sandbox", "pid {d}: syscall {d} refused — not in its manifest", .{ caller, number });
+            }
+        }
+        frame.x[0] = errno(.perm);
+        return .keep;
+    }
 
     switch (number) {
         @intFromEnum(UserNr.write) => {
@@ -454,6 +488,32 @@ pub fn handleUser(number: u64, frame: *trap.Frame) Action {
                 frame.x[1],
                 frame.x[2],
             ) catch |e| errnoShm(e);
+            return .keep;
+        },
+        @intFromEnum(UserNr.block) => {
+            // The raw device. Every failure here is counted as a denied attempt,
+            // because the interesting number is how often something without the
+            // capability tried.
+            const object = cap.access(process.currentPid(), frame.x[0], cap.R_READ) catch {
+                denyBlock(caller);
+                frame.x[0] = errno(.badf);
+                return .keep;
+            };
+            const offset = frame.x[1];
+            if (object.kind != .block or offset > 56 or offset % 8 != 0) {
+                denyBlock(caller);
+                frame.x[0] = errno(.perm);
+                return .keep;
+            }
+            const out = frame.x[2];
+            if (!user_space.checkPtr(as, out, 8, .write)) {
+                rejected_ptr += 1;
+                frame.x[0] = errno(.fault);
+                return .keep;
+            }
+            const word: *u64 = @ptrFromInt(out);
+            word.* = std.mem.readInt(u64, object.bytes[@intCast(offset)..][0..8], .little);
+            frame.x[0] = 0;
             return .keep;
         },
         @intFromEnum(UserNr.account) => {

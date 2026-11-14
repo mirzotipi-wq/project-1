@@ -1074,11 +1074,72 @@ return only when their owner dies, and the shared-memory pool is still monotonic
 gives pages back), which is why the leak probe exercises its cap through authority. `SYS_ACCOUNT` is
 a poll, not a push: no process is interrupted by a notification.
 
-### Phase 30 — Sandbox policy `[ ]`
+### Phase 30 — Sandbox policy `[x]`
 **Goal:** Least privilege by construction.
 **Build:** Declarative per-service syscall and capability manifests, W^X enforcement, no
 ambient authority, policy validation at build time.
 **Done when:** A deliberately compromised renderer cannot open a raw block device.
+
+**Shipped.** `sandbox.zig` holds the policy as data: a `Manifest` is a name, the capabilities a
+process is born with, and a 64-bit mask of the system calls it may make. Four are shipped —
+`harness` (everything, for the test image), `service` (a POS service: console, ledger, supervisor,
+page, IPC and shared memory), `storage` (console, page, **block**) and `renderer` (a console and the
+right to ask about itself, nothing else). `validate` rejects a duplicate id or name, an empty
+capability list, a duplicate capability kind, a right bit that does not exist, an empty right mask,
+a capability kind that cannot be granted at birth (endpoints and shared memory are minted by their
+users), a syscall bit that names nothing, a page declared writable **and** executable, a block
+object outside the storage manifest, and a renderer that holds anything but its console. It is
+called from a `comptime` block, so a policy mistake fails `zig build` — the check runs on the
+machine that compiles, not on the till.
+
+Authority is now granted from the manifest and nowhere else. `cap.Kind.block` is a real object
+created at boot whose first sector carries a signature and the sector size; `cap.grantSpecs` grants
+exactly the capabilities a manifest lists, in declaration order, and `process.spawnElfInner` uses it
+for every ELF launch (the demo harness keeps its four fixed handles, which the `harness` manifest
+mirrors). A service's `manifest` sits next to its `quota`, so a supervisor restart cannot escape
+either one.
+
+Enforcement has three independent layers, and the probe measures them separately:
+
+  * **The gate** — `syscall.handleUser` checks `sandbox.allowsForPid` before dispatch, not inside
+    each call. A refusal is `E_PERM`, bumps a global counter and a per-process counter, and is
+    logged only for the first four refusals of a process so a compromised program cannot turn a
+    denial into a console flood.
+  * **The object** — `SYS_BLOCK` (40) reads eight bytes at a byte offset from a `block` handle and
+    requires `R_READ` on an object whose kind really is `block`. A process whose mask *does* name
+    the call but which holds no such capability is refused here, and every failed attempt is
+    counted (`sandbox.block_denials`).
+  * **The mapping funnel** — `mmu.wxAllowed` refuses a writable-executable page, `addrspace.mapPage`
+    asks it before building a descriptor and counts the refusal (`mmu.wx_refusals`), and the
+    manifest validator refuses a policy that would ask for one. The ELF loader already refuses a
+    segment that is both writable and executable.
+
+`sandbox` prints the manifests and the counters from the shell; probe step [16] is the acceptance
+test.
+
+**Measured (final build).** Step [16] prints on every probe boot:
+`manifests: 4 validated at build time, renderer caps 1 (console only)  OK`,
+`storage: sector 0 signature through its block handle  OK`,
+`no-block: 16 calls allowed by the mask, refused by capability  OK`,
+`renderer: 16 handle probes + 1 undeclared call refused by the mask  OK`,
+`block: 18 denial(s) recorded, 0 reads without the object  OK`,
+`W^X: writable-executable mapping refused at the funnel (1 total)  OK`. The storage service reads
+`0xB10CCA55A0B10030` from the device and exits 0; the compromised renderer tries every handle 1..16
+for the raw device, tries to create shared memory it never declared, and exits 0 only if all 17
+attempts were refused and it still holds exactly one handle. Two of the eighteen denials are the
+storage service probing console and page before it finds its own block handle — the scan is part of
+the program, and it is counted like any other refused attempt.
+
+**Deferred (open items).** Manifests are compile-time data: changing a service's policy is a
+rebuild, and there is no signed-manifest store or runtime policy editor (the `sandbox` command is
+read-only). Masks are per-sandbox, not per-service-instance, so two services sharing `service` share
+one table entry; per-instance manifests need the policy store above. The block object is a 64-byte
+in-memory sector rather than a virtio-blk device — `SYS_BLOCK` is the ABI that driver will keep, and
+the entitlement question will not change when the bytes become real. A transferred block handle is
+not re-checked against the receiver's manifest (transfer moves an existing capability, and the
+receiver's mask still gates the call), there is no revocation sweep that kills a live holder, and
+denials are counted and logged to the console but never written to an audit log on disk. W^X covers
+every user mapping but there is no guard-page policy around them yet.
 
 ---
 

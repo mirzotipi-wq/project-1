@@ -52,6 +52,9 @@ pub const Kind = enum {
     endpoint,
     /// A shared-memory object two processes map into their own spaces (phase 25).
     shm,
+    /// The raw storage device (phase 30). Exactly one manifest may name it, so
+    /// "open the disk" is a capability question with a single answer.
+    block,
 
     pub fn label(self: Kind) []const u8 {
         return switch (self) {
@@ -61,6 +64,7 @@ pub const Kind = enum {
             .page => "page",
             .endpoint => "endpoint",
             .shm => "shm",
+            .block => "block",
         };
     }
 };
@@ -199,7 +203,44 @@ pub fn boot(alloc: *pmm.PageAllocator) void {
     page.magic = 0xCA55_A0B1_0000_0023;
     const words: [*]u64 = @ptrFromInt(pa);
     words[0] = page.magic;
+
+    // The raw device exists from boot, whether or not anyone is entitled to it.
+    // Its first sector carries a signature and the sector size, so a holder can
+    // prove it read the real object and a non-holder can prove it could not.
+    const block = create(.block, "block") orelse return;
+    block.magic = 0xB10C_CA55_A0B1_0030;
+    std.mem.writeInt(u64, block.bytes[0..8], block.magic, .little);
+    std.mem.writeInt(u64, block.bytes[8..16], 512, .little);
 }
+
+/// A set of handles granted from a manifest, in declaration order.
+pub const max_grants: usize = 8;
+pub const GrantSet = struct {
+    handles: [max_grants]u64 = [_]u64{0} ** max_grants,
+    count: u8 = 0,
+};
+
+/// Grant exactly the capabilities a manifest names. There is no other way for a
+/// process to be born with authority, so the manifest is the whole story.
+pub fn grantSpecs(pid: u32, specs: []const CapSpec) ?GrantSet {
+    _ = createTable(pid) orelse return null;
+    var set = GrantSet{};
+    for (specs) |spec| {
+        if (set.count >= max_grants) break;
+        const object = findByName(spec.kind.label()) orelse return null;
+        const handle = grant(pid, object.id, spec.rights) catch return null;
+        set.handles[set.count] = handle;
+        set.count += 1;
+    }
+    return set;
+}
+
+/// A capability declaration, shape-identical to the policy module's so the two
+/// do not have to import each other.
+pub const CapSpec = struct {
+    kind: Kind,
+    rights: u32,
+};
 
 // ---------------------------------------------------------------------------
 // Tables

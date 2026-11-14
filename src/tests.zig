@@ -22,6 +22,7 @@ test {
     _ = @import("kernel/names.zig");
     _ = @import("kernel/thread.zig");
     _ = @import("kernel/quota.zig");
+    _ = @import("kernel/sandbox.zig");
 }
 
 test "seeded prng is deterministic across runs" {

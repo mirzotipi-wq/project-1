@@ -19,6 +19,7 @@ const restart = @import("restart.zig");
 const timer = @import("../arch/aarch64/timer.zig");
 const klog = @import("klog.zig");
 const account = @import("account.zig");
+const sandbox = @import("sandbox.zig");
 
 pub const max_services = 4;
 pub const max_argv = 3;
@@ -45,6 +46,9 @@ pub const Service = struct {
     /// What this service is allowed to use. Applied on every launch, so a
     /// restart cannot escape the budget the first incarnation had (phase 29).
     quota: account.Quota = .{},
+    /// The policy the service runs under: its capabilities and its system calls
+    /// (phase 30). Applied at spawn, so a restart cannot escape it either.
+    manifest: sandbox.Id = .service,
 };
 
 var table: [max_services]Service = [_]Service{.{}} ** max_services;
@@ -81,7 +85,7 @@ pub fn register(name: []const u8, image: []const u8, argv: []const []const u8) ?
 }
 
 fn launch(s: *Service) bool {
-    const p = process.spawnElfQuota(s.image, s.argv[0..s.argc], &env, s.quota) orelse {
+    const p = process.spawnElfSandbox(s.image, s.argv[0..s.argc], &env, s.quota, s.manifest) orelse {
         s.state = .failed;
         return false;
     };

@@ -336,6 +336,16 @@ pub fn translateFrom(root_ptr: *const [entries]u64, va: usize) ?usize {
 /// with UXN=0 so EL0 may execute it and PXN=1 so the kernel never executes user
 /// bytes. Data needs 0b01 with PXN+UXN. That is W^X in the page tables rather
 /// than in the loader.
+/// W^X is a policy of this kernel, not a property of one caller: no user page may
+/// be writable and executable at the same time. The mapping funnel asks this
+/// before it builds any descriptor, and manifests are validated against it.
+pub fn wxAllowed(exec: bool, writable: bool) bool {
+    return !(exec and writable);
+}
+
+/// User mappings refused because they asked to be writable and executable.
+pub var wx_refusals: u64 = 0;
+
 pub fn userAttrs(exec: bool, writable: bool) u64 {
     var a: u64 = attrIndex(.normal) << 2;
     a |= AF | SH_INNER;

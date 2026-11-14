@@ -25,6 +25,8 @@ const SYS_SLEEP_MS = 5;
 const SYS_RESOLVE = 38;
 const SYS_CAP_QUERY = 20;
 const SYS_CAP_DERIVE = 21;
+const SYS_SHM_CREATE = 33;
+const SYS_BLOCK = 40;
 const SYS_ACCOUNT = 39;
 
 fn syscall3(n: u64, a: u64, b: u64, c: u64) u64 {
@@ -180,6 +182,68 @@ export fn _start(argc: usize, argv: [*][*:0]u8, envp: [*][*:0]u8) callconv(.C) n
     if (equal(mode, "serve")) {
         write("[user] pos: serve ok\n");
         exit(0);
+    }
+    if (equal(mode, "block")) {
+        // The storage service, the one manifest that names the raw device. It
+        // finds its block handle the same way every program finds a handle: by
+        // asking the kernel with a number it holds.
+        var word: u64 = 0;
+        var found: u64 = 0;
+        var h: u64 = 1;
+        while (h <= 8) : (h += 1) {
+            if (syscall3(SYS_BLOCK, h, 0, @intFromPtr(&word)) == 0) {
+                found = word;
+                break;
+            }
+        }
+        write("[user] pos: storage: sector 0 word ");
+        printNum(found);
+        write("\n");
+        exit(if (found != 0) 0 else 9);
+    }
+    if (equal(mode, "cap")) {
+        // A process whose syscall mask *allows* SYS_BLOCK but which holds no
+        // block object: the gate lets the call through and the capability check
+        // is what refuses it. This is the second line of defence, measured on
+        // its own so neither line can hide behind the other.
+        var word: u64 = 0;
+        var refused: u64 = 0;
+        var h: u64 = 1;
+        while (h <= 16) : (h += 1) {
+            if (syscall3(SYS_BLOCK, h, 0, @intFromPtr(&word)) != 0) refused += 1;
+        }
+        write("[user] pos: no-block: attempts refused by the capability check ");
+        printNum(refused);
+        write("\n");
+        exit(if (refused == 16) 0 else 9);
+    }
+    if (equal(mode, "attack")) {
+        // A compromised renderer: arbitrary code, a console, and nothing else.
+        // It tries every handle number for the raw device and a facility its
+        // manifest never declared. Success is *every* attempt being refused, and
+        // holding exactly one handle.
+        write("[user] pos: renderer: compromised, probing every handle\n");
+        var word: u64 = 0;
+        var refused: u64 = 0;
+        var read_ok: u64 = 0;
+        var h: u64 = 1;
+        while (h <= 16) : (h += 1) {
+            if (syscall3(SYS_BLOCK, h, 0, @intFromPtr(&word)) == 0) read_ok += 1 else refused += 1;
+        }
+        const shm = syscall3(SYS_SHM_CREATE, 1, 0, 0);
+        const mask_denied = shm >= 0x8000_0000_0000_0000;
+        var acct: [6]u64 = [_]u64{0} ** 6;
+        _ = syscall3(SYS_ACCOUNT, @intFromPtr(&acct), 48, 0);
+        write("[user] pos: renderer: block attempts refused ");
+        printNum(refused);
+        write(", reads ");
+        printNum(read_ok);
+        write(", mask denied ");
+        printNum(if (mask_denied) 1 else 0);
+        write(", handles ");
+        printNum(acct[1]);
+        write("\n");
+        exit(if (read_ok == 0 and refused == 16 and mask_denied and acct[1] == 1) 0 else 9);
     }
     if (equal(mode, "leak")) {
         // A service that leaks on purpose. The four bootstrap handles are granted
