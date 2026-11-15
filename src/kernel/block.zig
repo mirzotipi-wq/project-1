@@ -93,6 +93,19 @@ pub fn capacityBytes() u64 {
     return capacitySectors() * sector_size;
 }
 
+/// True when a request of `len` bytes starting at `lba` fits inside a device
+/// with `capacity_sectors` sectors.
+///
+/// The length is in bytes and the capacity is in sectors, and phase 35 found
+/// what happens when those are compared directly: `lba + len > capacity` made
+/// the last `len` sectors of every disk unreadable, so a GPT's backup header at
+/// the final LBA could never be verified. One conversion, one comparison.
+pub fn fits(capacity_sectors: u64, lba: u64, len: u32) bool {
+    if (lba >= capacity_sectors) return false;
+    const sectors: u64 = (@as(u64, len) + sector_size - 1) / sector_size;
+    return sectors <= capacity_sectors - lba;
+}
+
 /// Sort each run of non-flush requests by LBA. Returns how many requests moved.
 fn insertionSort(items: []Request) usize {
     var moved: usize = 0;
@@ -220,6 +233,16 @@ pub const Scheduler = struct {
 fn noRead(_: u64, _: [*]u8, _: u32) Error!void {}
 fn noWrite(_: u64, _: [*]const u8, _: u32) Error!void {}
 fn noFlush() Error!void {}
+
+test "a request at the end of the disk fits, one past it does not" {
+    try std.testing.expect(fits(100, 99, sector_size));
+    try std.testing.expect(fits(100, 98, 2 * sector_size));
+    try std.testing.expect(!fits(100, 99, 2 * sector_size));
+    try std.testing.expect(!fits(100, 100, sector_size));
+    try std.testing.expect(fits(100, 0, 100 * sector_size));
+    try std.testing.expect(!fits(100, 0, 101 * sector_size));
+    try std.testing.expect(!fits(0, 0, sector_size));
+}
 
 test "the elevator sorts a run by starting LBA" {
     var scheduler = Scheduler{};

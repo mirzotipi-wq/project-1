@@ -565,8 +565,11 @@ fn ipcServer() u32 {
             rep[1] = @bitCast(read);
             _ = ipcSys(SYS_IPC_REPLY, h_ep, @intFromPtr(&rep), 0, 0, 0);
         } else if (tag == TAG_SLOW) {
-            // Deliberately answer late: by then the caller has timed out.
-            sleepMs(30);
+            // Deliberately answer late: by then the caller has timed out. The
+            // sleep is much longer than the caller's deadline on purpose — the
+            // test is the refusal, and it must not depend on whether this
+            // thread was scheduled inside a 10 ms window.
+            sleepMs(300);
             rep[0] = TAG_SLOW;
             const late = ipcSys(SYS_IPC_REPLY, h_ep, @intFromPtr(&rep), 0, 0, 0);
             reply_again = late.r == E_AGAIN;
@@ -688,17 +691,21 @@ fn ipcClient(secret: u64) u32 {
     report(16, ok16);
 
     // 17 -- a deadline that passes returns ETIMEDOUT, and the channel survives.
+    // The deadline is generous enough that the server, already parked in recv,
+    // is certain to take the request before it expires: otherwise the caller
+    // withdraws the request and there is no late reply to refuse, which is a
+    // different situation from the one this case exists to prove.
     m[0] = TAG_SLOW;
-    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 10, 0);
+    call = ipcSys(SYS_IPC_CALL, h_ep, @intFromPtr(&m), @intFromPtr(&rep), 100, 0);
     const ok17 = call.r == E_TIMEOUT;
     if (!ok17) failures += 1;
     report(17, ok17);
 
     // Give the server time to answer the call we abandoned, so its reply is
-    // refused rather than handed to the next caller. The window is generous
-    // because the machine now runs a supervisor and the server may be scheduled
-    // late; what is being tested is the refusal, not the latency.
-    sleepMs(200);
+    // refused rather than handed to the next caller. The server sleeps 300 ms
+    // before answering, so this wait outlasts it even if it was scheduled late;
+    // what is being tested is the refusal, not the latency.
+    sleepMs(500);
 
     // 18 -- the next call still works, and the server confirms its late reply
     // was refused with EAGAIN.

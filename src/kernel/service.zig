@@ -43,6 +43,12 @@ pub const Service = struct {
     /// restart a service the caller just stopped. The supervisor snapshots this
     /// epoch and refuses to publish (or kills what it started) if it moved.
     stop_epoch: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Bumped by `stop` alone. The supervisor re-reads it immediately before a
+    /// restart launch and again after it: a stop that landed while the switch
+    /// was already inside the `.restarting` arm must still win. The epoch above
+    /// cannot do that job because `start` bumps it too, and killing a process a
+    /// `start` just launched would be wrong.
+    stop_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     started_ms: u64 = 0,
     next_restart_ms: u64 = 0,
     last_code: i64 = 0,
@@ -123,6 +129,7 @@ pub fn kill(name: []const u8) bool {
 pub fn stop(name: []const u8) bool {
     const s = find(name) orelse return false;
     _ = s.stop_epoch.fetchAdd(1, .seq_cst);
+    _ = s.stop_seq.fetchAdd(1, .seq_cst);
     if (s.state == .running) _ = process.kill(s.pid);
     s.state = .stopped;
     s.next_restart_ms = 0;
@@ -176,9 +183,15 @@ pub fn poll() void {
             },
             .restarting => {
                 if (now >= s.next_restart_ms) {
-                    const epoch = s.stop_epoch.load(.seq_cst);
+                    const seq = s.stop_seq.load(.seq_cst);
+                    // The switch matched `.restarting` before a stop could have
+                    // landed; re-read the state after the sequence, in this
+                    // order, so a stop that happened in between is seen by one
+                    // of the two checks and a stop that happens during the
+                    // launch is seen by the third.
+                    if (s.state != .restarting) continue;
                     if (launch(s)) {
-                        if (s.stop_epoch.load(.seq_cst) != epoch) {
+                        if (s.stop_seq.load(.seq_cst) != seq) {
                             // A stop landed while this launch was in flight: the
                             // service must end stopped, not running.
                             _ = process.kill(s.pid);

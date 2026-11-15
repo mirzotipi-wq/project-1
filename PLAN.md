@@ -1559,11 +1559,155 @@ while requests are in flight is not exercised; detach is only at teardown. No fi
 table or `fsck` yet — `src/kernel/block.zig` is the seam those phases build on, and the durability
 evidence above is the block layer's own.
 
-### Phase 35 — Partition tables `[ ]`
+### Phase 35 — Partition tables `[x]`
 **Goal:** Find our data on any disk layout.
 **Build:** GPT primary/backup parsing with CRC validation, MBR compatibility, partition
 iteration, protective-MBR handling.
 **Done when:** Images produced by the installer, `sgdisk` and Windows all enumerate correctly.
+
+**Shipped.** `src/kernel/partition.zig` sits directly on the phase-34 block layer and answers the
+question above the sectors: which ranges belong to a partition, and which writer produced the table.
+A `part` shell command prints the attached disk's table, and probe step **[21]** exercises the
+parser against real device I/O, including the negative cases.
+
+What it does:
+
+  * **GPT.** The header at LBA 1 and the backup at the last LBA are both read. Each is validated by
+    its own CRC32 (the header's CRC field zeroed for the computation) and by the CRC32 of the
+    partition entry array it names; the header is also checked against the LBA it was read from
+    (`my_lba`), so a header cannot be believed in the wrong place. The primary is authoritative. If
+    it is damaged the backup is read and the result is marked `backup_used` — the two copies are
+    never mixed. A sound primary with a damaged backup still enumerates, and reports
+    `backup_ok == false` instead of pretending.
+  * **Entry iteration.** Type GUID, unique GUID, first/last LBA (inclusive, as the format stores
+    them), attributes and the 36-unit UTF-16LE name are decoded; non-ASCII becomes `?` because a
+    POS screen needs printable text. Entries with a zero type, inverted bounds or LBAs past the end
+    of the disk are counted in `skipped`, never returned as valid partitions.
+  * **MBR.** The four 16-byte entries at offset 446, including the bootable flag and the type byte.
+    An extended container (0x05/0x0F/0x85) is followed through its EBR chain: each EBR's first entry
+    is a logical partition relative to that EBR, its second entry links to the next EBR relative to
+    the extended partition's start. The chain is bounded at 32 EBRs and rejects a repeat, so a
+    corrupt table returns an error instead of spinning the kernel.
+  * **Protective MBR.** The 0xEE entry every GPT disk carries is recognised and handed to the GPT
+    parser. A protective MBR with no readable GPT (both copies bad) is reported as a refusal, not
+    enumerated as one giant partition.
+  * **A formatter for the fixture.** `writeGpt` writes a protective MBR, the primary entry array and
+    header, the backup entry array and header, in an order a crash cannot make inconsistent (entries
+    and the backup before the primary header, with flushes between) and computes all three CRCs.
+    The installer does not exist yet — it is a later phase — so this is the installer-side primitive
+    and the probe's fixture, not a user-facing `mkfs`.
+
+**How phase 35 was verified.** Step [21] runs on the attached 64 MiB virtio disk on every probe
+boot. It writes a self-produced GPT over scratch LBA 20 000 (outside the block layer's generation
+region, so the phase-34 unclean-quit check is untouched), parses it back, then damages it
+deliberately:
+
+`[21] partitions: GPT primary/backup CRCs, MBR/EBR walk, protective MBR`
+`disk: no MBR signature at LBA 0 (unformatted)  OK`
+`gpt: wrote 3 partition(s), header CRC 0x12a89a41, entries CRC 0x58538193  OK`
+`parse: 3 partition(s), primary and backup valid, names and LBAs match  OK`
+`fallback: primary entries corrupt -> backup answered, 3 partition(s)  OK`
+`reject: both copies corrupt -> BadEntryCrc, no table invented  OK`
+`restore: fixture rewritten, 3 partition(s) again  OK`
+`mbr: 2 primary + 1 logical via 1 EBR, extended container not listed  OK`
+`leak: 127111 page(s) before, 127111 after  OK`
+
+The interop evidence is a foreign formatter's images, both 64 MiB, made by GNU `parted` (libparted)
+and booted as the attached disk with `part` at the shell. `sgdisk`/`gdisk` are not installed on this
+machine and Windows cannot be run here, so the claim is exactly what was observed: parted's GPT and
+parted's MBR enumerate field for field, and a Windows-style MBR (type 0x07 NTFS primary among four
+primary slots) is exercised through parted's `ntfs` flag. GPT:
+
+`scheme: GPT, 131072 sector(s), base LBA 0, protective MBR yes`
+`disk 1223ec13-818e-4523-a6db-50e9e6a1f908, revision 0x00010000, header CRC 0xad144c8a, entries CRC 0xc24b5d3f`
+`primary valid, backup valid (128 entries of 128 bytes at LBA 2)`
+`1   primary  Linux fs        2048         18431            8 MiB  primary`
+`2   primary  Microsoft data  18432        34815            8 MiB  primary`
+`3   primary  Linux swap      34816        43007            4 MiB  primary`
+
+MBR:
+
+`scheme: MBR, 131072 sector(s), base LBA 0, protective MBR no`
+`1   primary  NTFS/HPFS       2048         18431            8 MiB`
+`2   primary  Linux           18432        34815            8 MiB`
+`3   logical  Linux           36864        45055            4 MiB`
+`4   logical  Linux           47104        55295            4 MiB`
+
+Both match `parted -s ... unit s print` exactly, including the logical partitions reached through the
+EBR chain. The unclean-quit pair from phase 34 still passes on the same image with step [21] in the
+boot — `restart: generation 1 read back after an unclean quit, digest 0xf7c1084666c80b64 match` and
+`parse: 3 partition(s), primary and backup valid` — so the fixture's writes do not disturb the
+generation marker.
+
+On the final build: clean `rm -rf .zig-cache zig-out && zig build` with 0 errors and 0 warnings;
+**102/102** host tests, eleven of them new (ten for the parser: CRC check value, write/read round
+trip, primary-entry fallback, header-CRC fallback, both-copies refusal, unformatted disk, MBR+EBR,
+protective-only, runaway EBR chain, GUID rendering; one for the byte/sector bounds helper); **20/20**
+four-core probe boots `RESULT: PASS`; **5/5** single-core probe boots; `killoop 150` twice at 150/150
+with 128135 → 128135 pages and 0 leaked; `stress 4 20000` exact (80000/80000); `reap 8` 0 leaked;
+`preempt 1000` PASS; zero panics and zero hangs.
+
+**Six real bugs the verification found, all fixed at the source:**
+
+  * **The block driver compared bytes with sectors.** `request()` tested `lba + len > capacity`, where
+    `len` is bytes and `capacity` is sectors. Everything near the end of a disk was refused with
+    `NoSpace` once `len` exceeded the remaining sector count: the last 16 KiB of a 64 MiB disk became
+    unreadable. Phase 34 never noticed because its writes stop at LBA 10008; a GPT backup header at
+    LBA 131071 did, and step [21]'s backup verification failed with `Io` until the units were
+    converted. `block.fits` is now the one place that converts, with a host test covering the last
+    sector, the first sector and one-past-the-end.
+  * **A table returned by value overflowed the shell's stack.** `read()` returned a three-kilobyte
+    `Table`; with the fixture's own copy the probe's frame grew enough that the scheduler caught a
+    corrupt thread frame for `wd` (the phase-33 signature) and the kernel panicked. The parser now
+    fills a caller-owned table, `max_partitions` is 16 with the excess counted in `skipped`, and the
+    shell keeps its table in statics. A partition table larger than 16 entries is reported, not
+    truncated silently.
+  * **GPT entries were decoded at the wrong offsets.** The parser read the unique partition GUID's
+    bytes as the first and last LBA, so every entry failed the bounds check and a valid table
+    enumerated as zero partitions (`skipped = 3`). Fixed to the format's layout: type GUID 0, unique
+    GUID 16, first LBA 32, last LBA 40, attributes 48, name 56.
+  * **Verifying the backup overwrote the primary's facts.** The backup header was parsed into the same
+    table with `verify_only`, which still stored the backup's header CRC and entry-array LBA. The
+    primary's CRC was therefore reported as the backup's. Verification no longer writes any field.
+  * **A stopped service could still be restarted by a supervisor already inside its decision.** Phase
+    34 guarded the publication of `.restarting`, but the supervisor could have matched that state
+    before the stop landed and then launched anyway: step [13] failed with `stop: services
+    restarting`. A `stop_seq`, bumped by `stop` alone, is now read before and after the launch: a stop
+    that lands between the state read and the launch is caught by the state re-check, and one that
+    lands during the launch is caught by the post-launch check, which kills the new process and
+    leaves the service stopped.
+  * **The IPC late-reply test measured scheduling, not the refusal.** Cases 17/18/24 used a 10 ms
+    deadline for a call the server answers 30 ms later. If the server had not been scheduled inside
+    those 10 ms, the caller withdrew the request before it was ever received, so there was no late
+    reply to refuse and the cases failed even though the kernel's refusal was correct. The deadline is
+    now 100 ms, the server sleeps 300 ms and the client waits 500 ms: the server is already parked in
+    `recv` when the call arrives, so it takes the request, and the late reply is refused by the
+    deadline rule the case exists to test.
+
+**The phase-34 comparison anomaly, root-caused.** Phase 34 left an explicit byte loop (`sameSector`)
+after `std.mem.eql` reported byte-identical 512-byte sectors as different. The cause is in the
+toolchain, not in memory: a temporary in-kernel diagnostic compared two identical buffers over 44
+size/offset combinations and got `true` for every aligned case and **`false` for every case whose
+first slice started 8 mod 16** — sizes 16 through 4096, independent of the data. `SCTLR_EL1.A` is
+clear (the MMU enables alignment checking off), so this is not an alignment fault, and the host build
+returns true for the same comparisons. `std.mem.eql`'s byte path (`eqlBytes`) scans 16-byte chunks
+through a NEON vector and reduces the per-byte inequality with `@reduce(.Or, ...)`; on this
+aarch64-freestanding build that path answers false for a byte-identical, 16-byte-misaligned first
+argument. The diagnostic was removed; the kernel's verification comparisons stay explicit byte loops,
+and the host test suite compares with `std.testing.expectEqual` on data where the host implementation
+is correct.
+
+**Deferred (open items).** The parser refuses an entry array larger than 16 KiB or more than 128
+entries (the standard 128 × 128 layout is fine; 256-byte entries are not), and returns at most 16
+partitions with the rest counted in `skipped`. A hybrid MBR's non-0xEE entries are not merged with
+the GPT: the GPT wins and the MBR copies are ignored. The extended container itself is not listed as
+a partition (its logicals are), and there is no repair path: a damaged primary is read from the
+backup, but the primary is not rewritten. Nothing consumes the tables yet — no offset view for a
+partition, no filesystem, no mount, no `fsck`; those are later phases. The writer exists for the
+fixture and as the installer primitive, not as a user command, and there is no hotplug re-read of a
+table when a disk is replaced. Integration was verified against GNU parted; `sgdisk` and Windows
+images were named by the plan but are not available in this environment, and the record says so
+rather than claiming them.
 
 ### Phase 36 — Interrupt-driven console `[ ]`
 **Goal:** A real terminal, not polling.

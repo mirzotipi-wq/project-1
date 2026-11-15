@@ -28,6 +28,7 @@ test {
     _ = @import("kernel/pci.zig");
     _ = @import("kernel/virtio.zig");
     _ = @import("kernel/block.zig");
+    _ = @import("kernel/partition.zig");
 }
 
 test "seeded prng is deterministic across runs" {

@@ -36,6 +36,7 @@ const driver = @import("driver.zig");
 const pci = @import("pci.zig");
 const virtio = @import("virtio.zig");
 const block = @import("block.zig");
+const partition = @import("partition.zig");
 const virtio_blk = @import("../devices/virtio_blk.zig");
 const virtio_mmio = @import("../devices/virtio_mmio.zig");
 const pl031 = @import("../devices/pl031.zig");
@@ -1919,6 +1920,67 @@ fn cmdUprobe(ctx: Context) void {
     }
     pass = verdict(pass, disk_ok, "[20]");
 
+    // 21 -- partitions: GPT primary/backup CRCs, MBR and EBR enumeration, and
+    // the negative cases a table parser has to get right.
+    var disk_table: partition.Table = .{};
+    out("  [21] partitions: GPT primary/backup CRCs, MBR/EBR walk, protective MBR\n", .{});
+    const part_pages_before = ctx.pmm.stats().free_pages;
+    var part_ok = false;
+    if (!virtio_blk.present()) {
+        out("      FAIL: no block device — boot with -device virtio-blk-device\n", .{});
+    } else {
+        // The attached disk's own table. An unformatted disk is a legitimate
+        // answer; a refusal to read it is not.
+        var disk_answered = true;
+        if (partition.read(.{}, &disk_table)) |_| {
+            out("      disk: {s}, {d} partition(s), primary {s}, backup {s}  OK\n", .{
+                partition.schemeName(disk_table.scheme), disk_table.count,
+                if (disk_table.backup_used) "from backup" else if (disk_table.primary_ok) "valid" else "none",
+                if (disk_table.backup_ok) "valid" else "missing",
+            });
+        } else |err| {
+            if (err == error.NoTable) {
+                out("      disk: no MBR signature at LBA 0 (unformatted)  OK\n", .{});
+            } else {
+                disk_answered = false;
+                out("      disk: table read failed: {s}  FAIL\n", .{@errorName(err)});
+            }
+        }
+
+        const fx = partition.fixtureTest();
+        const parsed_ok = fx.present and fx.written and fx.parsed and fx.count == 3 and
+            fx.names_ok and fx.lbas_ok and fx.primary_ok and fx.backup_ok;
+        const fallback_ok = fx.fallback_ok and fx.fallback_count == 3;
+        const restore_ok = fx.restored and fx.restored_count == 3;
+        const mbr_ok = fx.mbr_ok and fx.mbr_count == 3 and fx.mbr_primary == 2 and fx.mbr_logical == 1;
+        part_ok = disk_answered and parsed_ok and fallback_ok and fx.rejected and restore_ok and mbr_ok and fx.errors == 0;
+
+        out("      gpt: wrote 3 partition(s), header CRC 0x{x:0>8}, entries CRC 0x{x:0>8}  {s}\n", .{
+            fx.header_crc, fx.entries_crc, status(fx.written),
+        });
+        out("      parse: {d} partition(s), primary and backup valid, names and LBAs match  {s}\n", .{
+            fx.count, status(parsed_ok),
+        });
+        out("      fallback: primary entries corrupt -> backup answered, {d} partition(s)  {s}\n", .{
+            fx.fallback_count, status(fallback_ok),
+        });
+        out("      reject: both copies corrupt -> {s}, no table invented  {s}\n", .{
+            if (fx.reject_error.len != 0) fx.reject_error else "refused", status(fx.rejected),
+        });
+        out("      restore: fixture rewritten, {d} partition(s) again  {s}\n", .{
+            fx.restored_count, status(restore_ok),
+        });
+        out("      mbr: {d} primary + {d} logical via {d} EBR, extended container not listed  {s}\n", .{
+            fx.mbr_primary, fx.mbr_logical, fx.mbr_ebrs, status(mbr_ok),
+        });
+    }
+    const part_pages_after = ctx.pmm.stats().free_pages;
+    const part_leak_ok = part_pages_before == part_pages_after;
+    out("      leak: {d} page(s) before, {d} after  {s}\n", .{
+        part_pages_before, part_pages_after, status(part_leak_ok),
+    });
+    pass = verdict(pass, part_ok and part_leak_ok, "[21]");
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
         sched.double_run_events, sched.queue_violations, sched.stray_ready,
@@ -1997,6 +2059,44 @@ fn cmdBlk() void {
         block.stats.sectors, block.stats.bytes, block.stats.errors,
     });
     out("  irq: {d} routed, {d} acknowledged\n", .{ virtio_blk.interruptId(), virtio_blk.interruptCount() });
+}
+
+/// `part` — the partition table of the attached disk, as the parser sees it.
+var part_cmd_table: partition.Table = .{};
+
+fn cmdPart() void {
+    const table = &part_cmd_table;
+    partition.read(.{}, table) catch |err| {
+        out("  no table: {s}\n", .{@errorName(err)});
+        return;
+    };
+    out("  scheme: {s}, {d} sector(s), base LBA {d}, protective MBR {s}\n", .{
+        partition.schemeName(table.scheme), table.disk_sectors, table.base_lba,
+        if (table.protective_mbr) "yes" else "no",
+    });
+    if (table.scheme == .gpt) {
+        var guid_buf: [36]u8 = undefined;
+        out("  disk {s}, revision 0x{x:0>8}, header CRC 0x{x:0>8}, entries CRC 0x{x:0>8}\n", .{
+            partition.formatGuid(&table.disk_guid, &guid_buf), table.revision, table.header_crc, table.entries_crc,
+        });
+        out("  primary {s}, backup {s} ({d} entries of {d} bytes at LBA {d})\n", .{
+            if (table.primary_ok) "valid" else if (table.backup_used) "from backup" else "invalid",
+            if (table.backup_ok) "valid" else "missing",
+            table.entry_capacity, table.entry_size, table.entry_array_lba,
+        });
+    }
+    out("  #   kind     type            first        last        size      name\n", .{});
+    for (table.entries[0..table.count]) |*e| {
+        const mib = (e.sectors() * partition.sector_size) / (1024 * 1024);
+        out("  {d:<3} {s:<8} {s:<15} {d:<12} {d:<11} {d:>6} MiB  {s}\n", .{
+            e.index, @tagName(e.kind), partition.typeName(e), e.first_lba, e.last_lba, mib, e.nameText(),
+        });
+    }
+    if (table.skipped != 0) {
+        out("  {d} entr(ies) skipped: out of bounds or beyond the {d}-partition limit\n", .{
+            table.skipped, partition.max_partitions,
+        });
+    }
 }
 
 /// `virtio` — every transport, whether it carries a device, and what the
@@ -2116,6 +2216,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdVirtio();
     } else if (std.mem.eql(u8, command, "blk")) {
         cmdBlk();
+    } else if (std.mem.eql(u8, command, "part")) {
+        cmdPart();
 
         cmdLspci();
     } else if (std.mem.eql(u8, command, "devices")) {

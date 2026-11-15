@@ -264,7 +264,7 @@ fn request(kind: ReqType, lba: u64, buf: ?[*]u8, len: u32) block_mod.Error!void 
     if (!ready) return error.NoDevice;
     const q = queue orelse return error.NoDevice;
     if (kind != .flush) {
-        if (lba >= capacity or lba + len > capacity) return error.NoSpace;
+        if (!block_mod.fits(capacity, lba, len)) return error.NoSpace;
     } else if (!flushSupported()) {
         return error.Unsupported;
     }
