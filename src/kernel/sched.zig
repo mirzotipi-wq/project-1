@@ -23,6 +23,7 @@ const mmu = @import("../arch/aarch64/mmu.zig");
 const user_space = @import("addrspace.zig");
 const thread_mod = @import("thread.zig");
 const sync = @import("sync.zig");
+const symbols = @import("symbols.zig");
 const klog = @import("klog.zig");
 const pmm = @import("pmm.zig");
 const smp = @import("smp.zig");
@@ -546,7 +547,12 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     // are legitimate; anything else is a corrupted stack.
     const elr = next_frame.elr;
     const kernel_frame = (next_frame.spsr & 0xF) != 0;
-    const in_kernel_text = elr >= 0x4008_0000 and elr < 0x401b_0000;
+    // The bounds come from the linker, not from a constant: a window written by
+    // hand goes stale as soon as the kernel grows, and a valid kernel frame then
+    // looks corrupt. (Phase 36 added ~200 KiB of static filesystem buffers and
+    // brought the old hardcoded window within 16 KiB of its end.)
+    const text = symbols.textRange();
+    const in_kernel_text = elr >= text.start and elr < text.end;
     const elr_ok = if (next.address_space != null)
         (in_kernel_text and kernel_frame) or
             (elr >= user_space.code_va and elr < user_space.window_end)

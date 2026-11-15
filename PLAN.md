@@ -1709,11 +1709,175 @@ table when a disk is replaced. Integration was verified against GNU parted; `sgd
 images were named by the plan but are not available in this environment, and the record says so
 rather than claiming them.
 
-### Phase 36 — Interrupt-driven console `[ ]`
-**Goal:** A real terminal, not polling.
-**Build:** RX interrupt ring buffer, line discipline (echo, backspace, Ctrl-C), UTF-8 decode,
-flow control.
-**Done when:** Typing at 115200 with heavy output loses no characters.
+### Phase 36 — FAT32 on a partition view `[x]`
+**Goal:** Consume the partition tables with a real filesystem, not just a parser.
+**Build:** an offset block view that maps a partition's first/last LBA onto the disk with the phase-34
+byte/sector bounds discipline; a pure-Zig FAT32 driver (BPB validation, FAT arithmetic, directory walk,
+read, create, grow, delete, both FAT copies, FSInfo tolerance, every structure bounds-checked); probe
+step [22] and a `fat` shell command; verification from both sides with a foreign formatter.
+**Done when:** a FAT32 partition is mounted through the view, a file is read, created, written and
+deleted by the kernel, and the same image is verified on the host with real FAT tools.
+
+**Shipped.** `src/kernel/block_view.zig` and `src/kernel/fat32.zig` sit between the phase-34 block
+layer and the shell. The plan's own phase-36 entry ("interrupt-driven console") was superseded by this
+scope at the project owner's direction; it is carried as an explicit open item below rather than
+silently renumbered or dropped, and phases 37+ keep their numbers.
+
+What it does:
+
+  * **Partition view.** `View` wraps the installed backend with `base_lba` and `sectors`, translating
+    every request and checking it with `block.fits` before the disk sees it: a request past the
+    partition's last sector, a zero-length or non-sector-multiple request, and a partition whose
+    bounds lie outside the disk are all typed errors. A filesystem bug becomes `NoSpace`, never a
+    write into the neighbouring partition. Tested on a recording backend for translation, the last
+    sector, one past it, misaligned lengths, and a backend error passed through unchanged.
+  * **Mount.** The BPB is validated field by field: sector size (512..4096, a multiple of 512),
+    power-of-two sectors per cluster within the 32 KiB buffer, reserved and FAT counts, 32-bit FAT
+    with a zero 16-bit field, total sectors within the view, data region arithmetic, root cluster in
+    range, and a FAT large enough for its own cluster count. FSInfo is a hint: a bad signature, an
+    unreadable sector or an impossible free count is ignored, the FAT stays authoritative. A volume
+    whose first FAT entry is not a media marker is refused.
+  * **FAT.** 28-bit entries, cached one sector at a time, written to *both* copies. Chain walks are
+    bounded by the cluster count and reject entries outside the data region; a self-loop is detected
+    while reading (the reader keeps the clusters it has seen and requires the chain to end exactly
+    where the directory's size says it does).
+  * **Directories.** 32-byte entries, 8.3 short names compared case-insensitively, LFN chunks decoded
+    for display (a file another OS named "LongFileName.txt" enumerates and is looked up by its long
+    name; the host test builds that entry by hand and reads it back). Creating writes an 8.3 short
+    name and validates it *before* anything is allocated, so a rejected name cannot leave an orphan.
+  * **Files.** Read by chain into a caller buffer; create, overwrite (the old entry is unpublished
+    and flushed, then its chain freed, then the new entry is written into the same slot), grow across
+    clusters, delete (entry first, then the chain, then the free counter). Write ordering is data →
+    flush → FAT chain → directory entry → flush: a crash can reach the disk as a consistent file or
+    as an allocated chain no directory entry references (an orphan that `fsck` reclaims), never as a
+    live file pointing at clusters the FAT calls free.
+  * **Allocation and counters.** First fit from a rotating hint, both FATs kept identical, FSInfo's
+    free count and next-free hints rewritten after every create and delete.
+  * **`check()`.** At-rest invariants, used by [22], by `fat check` and by the tests: no loops, no
+    orphans, every file's chain exactly as long as its size requires, every allocated entry either
+    free, EOC, marked bad or inside the data region, and the FSInfo counter equal to the FAT.
+  * **Formatter.** `mkfs` writes a spec FAT32 (reserved 32, two FATs, FSInfo and backup boot sector,
+    root cluster 2, zeroed FATs and root cluster, all three signatures) for the probe's scratch
+    volume and as the installer-side primitive. It refuses a volume below FAT32's own 65 525-cluster
+    minimum instead of producing a FAT16-shaped volume with a FAT32 BPB.
+  * **Shell.** `fat info | ls | cat <name> | put <name> <text> | rm <name> | check` mounts partition 1
+    of the attached disk through the view on first use and operates on that partition only.
+
+**How phase 36 was verified.** Step [22] formats and exercises a 39 MiB scratch region at LBA 40 000
+on the attached 64 MiB disk (outside the phase-34 generation region and the phase-35 fixtures), and
+every probe boot prints:
+
+`[22] filesystem: FAT32 over a partition view — mount, write, grow, read, delete`
+`view: partition 1 at LBA 40000..119999 (39 MiB) -> volume LBA 0, bounds checked`
+`format: 512 B/sector, 1 sector(s)/cluster, 78736 cluster(s), 2 FAT(s) of 616 sector(s), root 2  OK`
+`mount: 39 MiB, 78735 free cluster(s) from the FAT, FSInfo tolerated  OK`
+`write: SALE.TXT 2050 byte(s) in 5 cluster(s), free 78735 -> 78730  OK`
+`read: 2050 byte(s) back, digest 0xa8a8d2feb17f08e8, byte for byte  OK`
+`corrupt: chain loop -> Corrupt, chain restored, check clean  OK`
+`delete: 5 cluster(s) freed, entry gone, free back to 78735  OK`
+`check: 0 loop(s), 0 orphan(s), 0 size error(s)  OK`
+`leak: 127031 page(s) before, 127031 after  OK`
+
+**Foreign formatter, both directions.** This machine has no `mkfs.fat` or mtools installed and no
+usable root (`apt-get` cannot take the dpkg lock from this account), so the tools were taken from
+Debian packages and run out of a user directory: dosfstools 4.2 (`mkfs.fat`, `fsck.fat`) and mtools
+4.0.48 (`mcopy`, `mdir`, `mtype`), plus the distribution's GNU parted. Their versions are what
+`mkfs.fat`/`fsck.fat` print and what `mcopy --version` reports; no other tool was used, and nothing
+here is claimed for `sgdisk`.
+
+The image is 64 MiB with a parted GPT and one FAT32 partition at LBA 2048..131038, formatted with
+`mkfs.fat -F 32 -n CASSA36` (on a partition-sized slice, then written at sector 2048), and a file is
+placed with `mcopy -i /tmp/fatdisk.img@@1048576 /tmp/host.txt ::HOST.TXT`. Host view before the boot:
+
+`HOST     TXT        71 2026-11-15   4:48`
+`host-written file for phase 36 cross verification`
+`line two: 0123456789`
+`/tmp/part.img: 1 files, 1/126944 clusters            (fsck.fat -n, exit 0)`
+
+The same image is then booted as the attached disk and driven from the shell:
+
+`scheme: GPT, 131072 sector(s), base LBA 0, protective MBR yes`
+`1   primary  Microsoft data  2048         131038          62 MiB  primary`
+`view: partition 1 at LBA 2048..131038 (62 MiB) -> volume LBA 0, every request bounds-checked`
+`bpb: 512 B/sector, 1 sector(s)/cluster (512 B), 2 FAT(s) of 992 sector(s), 32 reserved`
+`geometry: 126944 cluster(s), root cluster 2, data at sector 2016, FSInfo sector 1`
+`HOST.TXT         file         71  3`
+`host-written file for phase 36 cross verification`
+`line two: 0123456789`
+`  71 byte(s), digest 0x0b54d41e90b90c16`
+`wrote SALE.TXT: 39 byte(s), 1 cluster(s), digest 0xbaec6dd09ba44080, 126941 free cluster(s)`
+`removed HOST.TXT: 1 cluster(s) freed`
+`1 file(s), 1 dir(s), 2 cluster(s) in use, 2 allocated`
+`0 loop(s), 0 orphan(s), 0 size error(s), free 126942, FSInfo 126942  counter agrees`
+`consistent`
+
+And read back on the host, from the same file:
+
+`SALE     TXT        39 1980-00-00   0:00`
+`cassa-pos-sale-0001 total=12.50 items=3`
+`mdir: File "::HOST.TXT" not found`
+`/tmp/part1-after.img: 2 files, 2/126944 clusters     (fsck.fat -n, exit 0)`
+
+`mtype`'s output is byte-identical to the text the kernel was handed (`cmp` clean, 39 bytes), the
+deleted file is gone for mtools, and `fsck.fat` accepts the result; its "2 files" is the volume label
+plus the one file, which the raw root directory confirms (label, deleted `HOST.TXT` slot, `SALE.TXT`
+at cluster 4, size 39; FAT entries 2 and 4 allocated, 3 free).
+
+**Bugs found and fixed in this phase.**
+
+  * **The first [22] run panicked the kernel** (`scheduler: corrupt thread frame`, thread 7 'wd',
+    `spsr=0x1`). Root cause: the fixture put two 4 KiB buffers on the shell thread's 32 KiB stack and
+    the overflow overwrote a neighbouring thread's saved trap frame — the same class as the phase-35
+    shell-stack bug. Both buffers are static now, with a comment saying why, and the probe is back to
+    127031 free pages before and after.
+  * **The scheduler's kernel-text window was a hardcoded constant** (`0x40080000..0x401b0000`).
+    Phase 36's static buffers moved `.text` to `..0x401ab000`, within 16 KiB of that guess; one more
+    phase of growth would have made every legitimate kernel frame look corrupt. The bounds now come
+    from the linker (`symbols.textRange()`), so they cannot go stale. (No host test: the symbols only
+    exist in the kernel image; the probe boots are the check.)
+  * **`readFile` did not detect a loop that happened to fit the file's size.** A self-looping chain
+    could satisfy a 2450-byte read by reading the same cluster five times and returning success. The
+    reader now rejects a repeated cluster and requires the chain to end exactly after the last cluster
+    the size needs; [22]'s corruption step and the host test both assert `error.Corrupt`.
+  * **`writeFile` validated the 8.3 name after allocating clusters**, so `writeFile("a-rather-long-name")`
+    returned `NameTooLong` but left an orphan chain behind (the next `check` caught it). Validation
+    moved ahead of every write; the "8.3 name" host test now ends with a clean `check()`.
+  * **A stray `cmdLspci()` sat in the `fat` dispatch branch** (left over from the phase-35 edit), so
+    every `fat` command printed the PCI table after its answer. Removed; a boot with `part` and
+    `fat ls` shows only those answers.
+  * The formatter's FAT zeroing asked for 16 sectors through an 8-sector buffer; the first host test
+    run caught the out-of-bounds index and it was cut to the buffer's size.
+
+**Verification matrix.** Clean `rm -rf .zig-cache zig-out && zig build`: exit 0, 0 errors, 0 warnings.
+`zig build test`: 112/112 host tests, including the new block-view tests and five FAT32 tests (mount
+geometry, create/grow/read/check/delete with free-space accounting, corrupt BPB refusal, LFN read-back,
+8.3 enforcement plus overwrite-slot reuse). Probe: 20/20 four-core and 5/5 single-core boots `RESULT:
+PASS`, no panics, no hangs. Unclean-quit pair: boot 1 is killed with `kill -9` at `RESULT`, boot 2 on
+the same image prints `restart: generation 1 read back after an unclean quit, digest
+0xf7c1084666c80b64 match  OK`. Soaks on the same kernel: `killoop 150` twice (128055 -> 128055 pages,
+0 leaked, PASS), `stress 4 20000` exact PASS, `reap 8` 0 pages leaked PASS, `preempt 1000` PASS.
+
+**Open items for phase 37 (not started).**
+
+  * **The deferred console phase.** The plan's original phase-36 work — RX interrupt ring buffer, line
+    discipline (echo, backspace, Ctrl-C), UTF-8 decode, flow control — is still to be scheduled
+    explicitly; the shell today is the phase-12/20 line reader. Phase 37's framebuffer work is the
+    next numbered phase as written.
+  * **Long names on create.** LFN entries are decoded but not written, so a kernel-created file needs
+    an 8.3 name; creating subdirectories and deleting them recursively is not implemented, and
+    `check`/traversal handle the root directory only (subdirectories are counted, not descended).
+  * **Crash window.** A crash between the FAT flush and the directory-entry flush can allocate a chain
+    no entry references. `check` counts such orphans and `fsck.fat` reclaims them, but the kernel has
+    no repair path and no journal; a POS deployment would want either.
+  * **Limits.** Filesystem reads/writes are capped at 64 KiB (a static shell buffer), clusters at
+    32 KiB, `check` at 1 048 576 clusters, and `mkdir`/FAT12/FAT16/exFAT, defragmentation, FSInfo
+    backup-sector maintenance, permission/attribute handling beyond the read-only bit, and real
+    timestamps (the driver stamps a fixed 2026-01-01) are all absent. The formatter writes the
+    primary BPB and FSInfo, not every reserved-sector backup.
+  * **Integration.** The installer does not call `mkfs` yet, the `fat` command always takes partition
+    1 (no selection or subdirectory paths), and a replaced disk is not re-read or re-mounted. The
+    phase-35 `part` command and this `fat` command are separate readers of the same table; a mount
+    API shared with a future VFS is the natural next step.
 
 ### Phase 37 — Framebuffer `[ ]`
 **Goal:** Pixels on the panel.

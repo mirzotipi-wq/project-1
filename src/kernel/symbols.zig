@@ -16,6 +16,10 @@ pub fn addr(sym: *anyopaque) usize {
     return @intFromPtr(sym);
 }
 
+pub fn textRange() struct { start: usize, end: usize } {
+    return .{ .start = @intFromPtr(&__text_start), .end = @intFromPtr(&__text_end) };
+}
+
 pub fn kernelRange() struct { start: usize, end: usize } {
     return .{ .start = @intFromPtr(&__kernel_start), .end = @intFromPtr(&__kernel_end) };
 }

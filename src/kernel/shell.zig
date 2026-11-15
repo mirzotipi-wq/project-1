@@ -37,6 +37,8 @@ const pci = @import("pci.zig");
 const virtio = @import("virtio.zig");
 const block = @import("block.zig");
 const partition = @import("partition.zig");
+const block_view = @import("block_view.zig");
+const fat32 = @import("fat32.zig");
 const virtio_blk = @import("../devices/virtio_blk.zig");
 const virtio_mmio = @import("../devices/virtio_mmio.zig");
 const pl031 = @import("../devices/pl031.zig");
@@ -75,6 +77,9 @@ fn printHelp() void {
         \\  accounting           per-process quotas, usage, OOM scores, watchdog
         \\  sandbox              service manifests, syscall gate, W^X counters
         \\  devices              driver model: devices, bindings, hotplug counters
+        \\  blk                  block device and elevator counters
+        \\  part                 partition table of the attached disk
+        \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -1981,6 +1986,65 @@ fn cmdUprobe(ctx: Context) void {
     });
     pass = verdict(pass, part_ok and part_leak_ok, "[21]");
 
+    // 22 -- filesystem: a real FAT32 volume, formatted by this kernel and
+    // mounted through a partition-offset view, then read, created, grown,
+    // corrupted on purpose, restored and deleted. The same driver is exercised
+    // from the host tests and, on a foreign-formatted partition, by `fat`.
+    out("  [22] filesystem: FAT32 over a partition view — mount, write, grow, read, delete\n", .{});
+    const fs_pages_before = ctx.pmm.stats().free_pages;
+    var fs_ok = false;
+    if (!virtio_blk.present()) {
+        out("      FAIL: no block device — boot with -device virtio-blk-device\n", .{});
+    } else {
+        var scratch = partition.Entry{ .scheme = .gpt, .index = 1, .first_lba = 40000, .last_lba = 119999 };
+        if (block_view.View.fromPartition(&scratch)) |view| {
+            out("      view: partition {d} at LBA {d}..{d} ({d} MiB) -> volume LBA 0, bounds checked\n", .{
+                scratch.index, scratch.first_lba, scratch.last_lba, view.capacityBytes() / (1024 * 1024),
+            });
+            if (fat32.exercise(view)) |e| {
+                const fmt_ok = e.clusters >= 65_525 and e.cluster_bytes == 512 and e.fat_sectors != 0;
+                const write_ok = e.created and e.written > 0 and e.clusters_used > 1;
+                const read_ok = e.written == e.read_back and e.round_trip;
+                const free_ok = e.free_before - e.free_after_write == e.clusters_used;
+                const corrupt_ok = e.loop_detected and e.restored;
+                const delete_ok = e.deleted and e.gone and e.freed == e.clusters_used and e.free_after_delete == e.free_before;
+                const check_ok = e.check_ok and e.orphans == 0 and e.loops == 0 and e.size_errors == 0;
+                fs_ok = fmt_ok and write_ok and read_ok and free_ok and corrupt_ok and delete_ok and check_ok;
+                out("      format: 512 B/sector, {d} sector(s)/cluster, {d} cluster(s), {d} FAT(s) of {d} sector(s), root 2  {s}\n", .{
+                    1, e.clusters, 2, e.fat_sectors, status(fmt_ok),
+                });
+                out("      mount: {d} MiB, {d} free cluster(s) from the FAT, FSInfo tolerated  {s}\n", .{
+                    e.bytes / (1024 * 1024), e.free_before, status(fmt_ok),
+                });
+                out("      write: SALE.TXT {d} byte(s) in {d} cluster(s), free {d} -> {d}  {s}\n", .{
+                    e.written, e.clusters_used, e.free_before, e.free_after_write, status(write_ok and free_ok),
+                });
+                out("      read: {d} byte(s) back, digest 0x{x:0>16}, byte for byte  {s}\n", .{
+                    e.read_back, e.digest, status(read_ok),
+                });
+                out("      corrupt: chain loop -> Corrupt, chain restored, check clean  {s}\n", .{
+                    status(corrupt_ok),
+                });
+                out("      delete: {d} cluster(s) freed, entry gone, free back to {d}  {s}\n", .{
+                    e.freed, e.free_after_delete, status(delete_ok),
+                });
+                out("      check: {d} loop(s), {d} orphan(s), {d} size error(s)  {s}\n", .{
+                    e.loops, e.orphans, e.size_errors, status(check_ok),
+                });
+            } else |err| {
+                out("      FAIL: {s}\n", .{@errorName(err)});
+            }
+        } else |err| {
+            out("      FAIL: view over the scratch region: {s}\n", .{@errorName(err)});
+        }
+    }
+    const fs_pages_after = ctx.pmm.stats().free_pages;
+    const fs_leak_ok = fs_pages_before == fs_pages_after;
+    out("      leak: {d} page(s) before, {d} after  {s}\n", .{
+        fs_pages_before, fs_pages_after, status(fs_leak_ok),
+    });
+    pass = verdict(pass, fs_ok and fs_leak_ok, "[22]");
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
         sched.double_run_events, sched.queue_violations, sched.stray_ready,
@@ -2037,6 +2101,135 @@ fn cmdSandbox() void {
     out("  gate: {d} syscall(s) denied, {d} block attempt(s) denied, {d} W+X mapping(s) refused\n", .{
         sandbox.denied, sandbox.block_denials, mmu.wx_refusals,
     });
+}
+
+/// `fat` — a FAT32 volume on partition 1 of the attached disk, reached through
+/// the partition-offset view. `uprobe` step 22 exercises the same driver on a
+/// scratch volume; these commands operate on a foreign-formatted partition, so
+/// a host tool can create, inspect and re-read exactly what the kernel wrote.
+var fat_cmd_table: partition.Table = .{};
+var fat_cmd_vol: fat32.Volume = undefined;
+var fat_cmd_mounted: bool = false;
+var fat_cmd_buf: [fat32.max_file_bytes]u8 = undefined;
+
+fn fatEnsureMounted() ?*fat32.Volume {
+    if (fat_cmd_mounted) return &fat_cmd_vol;
+    partition.read(.{}, &fat_cmd_table) catch |err| {
+        out("  no partition table: {s}\n", .{@errorName(err)});
+        return null;
+    };
+    if (fat_cmd_table.count == 0) {
+        out("  the disk has no partitions: attach one with a FAT32 partition\n", .{});
+        return null;
+    }
+    const entry = &fat_cmd_table.entries[0];
+    const view = block_view.View.fromPartition(entry) catch |err| {
+        out("  partition 1 lies outside the disk: {s}\n", .{@errorName(err)});
+        return null;
+    };
+    fat_cmd_vol = fat32.mount(view) catch |err| {
+        out("  partition 1 (LBA {d}..{d}, {d} MiB) is not a mountable FAT32: {s}\n", .{
+            entry.first_lba, entry.last_lba, entry.sectors() * partition.sector_size / (1024 * 1024), @errorName(err),
+        });
+        return null;
+    };
+    fat_cmd_mounted = true;
+    return &fat_cmd_vol;
+}
+
+fn cmdFat(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "";
+    const vol = fatEnsureMounted() orelse return;
+    const g = vol.geo;
+    if (sub.len == 0 or std.mem.eql(u8, sub, "info")) {
+        const entry = &fat_cmd_table.entries[0];
+        out("  view: partition {d} at LBA {d}..{d} ({d} MiB) -> volume LBA 0, every request bounds-checked\n", .{
+            entry.index, entry.first_lba, entry.last_lba, entry.sectors() * partition.sector_size / (1024 * 1024),
+        });
+        out("  bpb: {d} B/sector, {d} sector(s)/cluster ({d} B), {d} FAT(s) of {d} sector(s), {d} reserved\n", .{
+            g.bytes_per_sector, g.sectors_per_cluster, g.cluster_bytes, g.fat_count, g.fat_sectors, g.reserved_sectors,
+        });
+        out("  geometry: {d} cluster(s), root cluster {d}, data at sector {d}, FSInfo sector {d}\n", .{
+            g.clusters, g.root_cluster, g.data_start, g.fsinfo_sector,
+        });
+        const free = vol.freeCount() catch |err| {
+            out("  free space unreadable: {s}\n", .{@errorName(err)});
+            return;
+        };
+        out("  space: {d} free of {d} cluster(s) ({d} KiB)\n", .{
+            free, g.clusters, free * g.cluster_bytes / 1024,
+        });
+    } else if (std.mem.eql(u8, sub, "ls")) {
+        out("  name             attr    size      cluster\n", .{});
+        var count: usize = 0;
+        var it = vol.iterStart();
+        while (vol.nextItem(&it)) |maybe| {
+            const item = maybe orelse break;
+            count += 1;
+            out("  {s:<16} {s:<6} {d:>8}  {d}\n", .{
+                item.name(), if (item.isDir()) "dir" else "file", item.size, item.cluster,
+            });
+        } else |err| {
+            out("  directory read failed: {s}\n", .{@errorName(err)});
+            return;
+        }
+        const free = vol.freeCount() catch 0;
+        out("  {d} entr(ies), {d} free cluster(s)\n", .{ count, free });
+    } else if (std.mem.eql(u8, sub, "cat")) {
+        const name = tokens.next() orelse {
+            out("  usage: fat cat <name>\n", .{});
+            return;
+        };
+        const n = vol.readFile(name, &fat_cmd_buf) catch |err| {
+            out("  read failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        out("{s}", .{fat_cmd_buf[0..n]});
+        if (n == 0 or fat_cmd_buf[n - 1] != '\n') out("\n", .{});
+        out("  {d} byte(s), digest 0x{x:0>16}\n", .{ n, fat32.digest(fat_cmd_buf[0..n]) });
+    } else if (std.mem.eql(u8, sub, "put")) {
+        const name = tokens.next() orelse {
+            out("  usage: fat put <name> <text>\n", .{});
+            return;
+        };
+        const text = std.mem.trim(u8, tokens.rest(), " \r\n");
+        if (text.len == 0) {
+            out("  usage: fat put <name> <text>\n", .{});
+            return;
+        }
+        const r = vol.writeFile(name, text) catch |err| {
+            out("  write failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        out("  wrote {s}: {d} byte(s), {d} cluster(s), digest 0x{x:0>16}, {d} free cluster(s)\n", .{
+            name, r.size, r.clusters, fat32.digest(text), r.free_after,
+        });
+    } else if (std.mem.eql(u8, sub, "rm")) {
+        const name = tokens.next() orelse {
+            out("  usage: fat rm <name>\n", .{});
+            return;
+        };
+        const freed = vol.deleteFile(name) catch |err| {
+            out("  delete failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        out("  removed {s}: {d} cluster(s) freed\n", .{ name, freed });
+    } else if (std.mem.eql(u8, sub, "check")) {
+        const c = vol.check() catch |err| {
+            out("  check failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        out("  {d} file(s), {d} dir(s), {d} cluster(s) in use, {d} allocated\n", .{
+            c.files, c.dirs, c.clusters_used, c.clusters_allocated,
+        });
+        out("  {d} loop(s), {d} orphan(s), {d} size error(s), free {d}, FSInfo {d}  {s}\n", .{
+            c.loops, c.orphans, c.size_errors, c.free_count, c.fsinfo_free,
+            if (c.free_count_ok) "counter agrees" else "counter differs (tolerated)",
+        });
+        out("  {s}\n", .{if (c.ok) "consistent" else "INCONSISTENT"});
+    } else {
+        out("  usage: fat [info|ls|cat <name>|put <name> <text>|rm <name>|check]\n", .{});
+    }
 }
 
 /// `blk` — the block layer's view: the disk, the device counters, the
@@ -2218,8 +2411,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdBlk();
     } else if (std.mem.eql(u8, command, "part")) {
         cmdPart();
-
-        cmdLspci();
+    } else if (std.mem.eql(u8, command, "fat")) {
+        cmdFat(&tokens);
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();
     } else if (std.mem.eql(u8, command, "user")) {
