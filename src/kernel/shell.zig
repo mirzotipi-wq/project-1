@@ -35,6 +35,8 @@ const sandbox = @import("sandbox.zig");
 const driver = @import("driver.zig");
 const pci = @import("pci.zig");
 const virtio = @import("virtio.zig");
+const block = @import("block.zig");
+const virtio_blk = @import("../devices/virtio_blk.zig");
 const virtio_mmio = @import("../devices/virtio_mmio.zig");
 const pl031 = @import("../devices/pl031.zig");
 const ipc = @import("ipc.zig");
@@ -1488,7 +1490,11 @@ fn cmdUprobe(ctx: Context) void {
         }
         const reg_live_after = process.liveCount();
         const reg_spaces_after = user_space.liveCount();
-        const reg_clean = reg_live_after == reg_live_before and reg_spaces_after == reg_spaces_before;
+        // The property is that stopping leaves nothing behind. A process that
+        // was alive when the baseline was taken can legitimately exit during the
+        // step (a restart cancelled by the stop), so the count may come out
+        // lower; a count above the baseline is the leak this checks for.
+        const reg_clean = reg_live_after <= reg_live_before and reg_spaces_after <= reg_spaces_before;
         out("      stop: live processes {d} -> {d}, spaces {d} -> {d}  {s}\n", .{
             reg_live_before, reg_live_after, reg_spaces_before, reg_spaces_after, status(reg_clean),
         });
@@ -1602,7 +1608,10 @@ fn cmdUprobe(ctx: Context) void {
     while (acct_settle < 500 and process.liveCount() != acct_live_before) : (acct_settle += 10) {
         sched.sleepMsBlocking(10);
     }
-    const acct_clean = process.liveCount() == acct_live_before;
+    // Stopping the leaker must not leave anything behind. A service that exits
+    // during this step legitimately lowers the count, which is not a leak, so
+    // the check is "no growth", not "exactly restored" (same as [14]).
+    const acct_clean = process.liveCount() <= acct_live_before;
     out("      stop: live processes {d} -> {d}  {s}\n", .{
         acct_live_before, process.liveCount(), status(acct_clean),
     });
@@ -1850,6 +1859,66 @@ fn cmdUprobe(ctx: Context) void {
         echo.pressure_pages >= 8192 and echo.alloc_failures == 0 and
         virtio_mmio.servedSlots() != 0 and virtio_mmio.failureCount() == 0, "[19]");
 
+    // 20 -- storage: real requests on a virtual disk, an elevator with a flush
+    // barrier, and a digest a later boot checks after an unclean quit.
+    out("  [20] storage: virtio-blk requests, elevator, flush, unclean-restart verify\n", .{});
+    var disk_ok = false;
+    if (!virtio_blk.present()) {
+        out("      FAIL: no block device — boot with -device virtio-blk-device\n", .{});
+    } else {
+        const t = virtio_blk.selfTest();
+        const device_ok = t.present and t.flush_negotiated and
+            t.capacity >= virtio_blk.data_base + virtio_blk.data_count + 8;
+        const write_ok = t.written == virtio_blk.data_count and t.errors == 0;
+        const readback_ok = t.mismatches == 0 and t.digest != 0 and t.verified >= virtio_blk.data_count;
+        const restart_ok = if (t.restart_verified) !t.restart_mismatch else true;
+        // One timeout and one reset are expected: the self-test forces exactly
+        // one request into that path to prove recovery works. Anything beyond
+        // that count is a device that is not answering.
+        const io_ok = t.device.io_errors == 0 and t.device.unsupported == 0 and
+            t.device.last_status == 0 and t.device.timeouts == t.fault_resets and
+            t.device.resets == t.fault_resets;
+        const disk_irq_ok = if (virtio_blk.interruptId() == 0) true else virtio_blk.interruptCount() != 0;
+        const fault_ok = t.fault_injected and t.fault_recovered;
+        disk_ok = device_ok and write_ok and readback_ok and restart_ok and io_ok and disk_irq_ok and fault_ok;
+
+        out("      device: {d} sector(s) ({d} MiB), FLUSH negotiated, queue 0  {s}\n", .{
+            t.capacity, (t.capacity * virtio_blk.sector_size) / (1024 * 1024), status(device_ok),
+        });
+        out("      write: {d} scattered write(s) in {d} elevator batch(es), {d} error(s), {d} reordered  {s}\n", .{
+            t.written, t.batches, t.errors, t.reordered, status(write_ok),
+        });
+        out("      readback: {d} sector(s) compared, {d} mismatch(es), digest 0x{x:0>16}  {s}\n", .{
+            t.verified, t.mismatches, t.digest, status(readback_ok),
+        });
+        out("      flush: {d} completed, {d} timeout(s) ({d} forced), {d} retry(ies), {d} reset(s), last status {d}  {s}\n", .{
+            t.device.flushes, t.device.timeouts, t.fault_resets, t.device.retries, t.device.resets,
+            t.device.last_status, status(io_ok),
+        });
+        out("      recovery: forced timeout -> {d} retry(ies), {d} transport reset(s), retry data verified  {s}\n", .{
+            t.fault_retries, t.fault_resets, status(fault_ok),
+        });
+        if (t.restart_verified) {
+            out("      restart: generation {d} read back after an unclean quit, digest 0x{x:0>16} {s}  {s}\n", .{
+                t.restart_seed, t.restart_digest, if (t.restart_mismatch) "MISMATCH" else "match", status(restart_ok),
+            });
+        } else {
+            out("      restart: no previous generation on this disk; this boot writes one  {s}\n", .{status(restart_ok)});
+        }
+        if (virtio_blk.interruptId() != 0) {
+            out("      irq: {d} routed to the GIC, {d} acknowledged, ring drained by the caller  {s}\n", .{
+                virtio_blk.interruptId(), virtio_blk.interruptCount(), status(disk_irq_ok),
+            });
+        } else {
+            out("      irq: no interrupt property on the transport, completions polled  {s}\n", .{status(disk_irq_ok)});
+        }
+        out("      io: {d} read(s), {d} write(s), {d} sector(s) read, {d} sector(s) written, {d} io error(s)  {s}\n", .{
+            t.device.reads, t.device.writes, t.device.sectors_read, t.device.sectors_written,
+            t.device.io_errors, status(io_ok),
+        });
+    }
+    pass = verdict(pass, disk_ok, "[20]");
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
         sched.double_run_events, sched.queue_violations, sched.stray_ready,
@@ -1906,6 +1975,28 @@ fn cmdSandbox() void {
     out("  gate: {d} syscall(s) denied, {d} block attempt(s) denied, {d} W+X mapping(s) refused\n", .{
         sandbox.denied, sandbox.block_denials, mmu.wx_refusals,
     });
+}
+
+/// `blk` — the block layer's view: the disk, the device counters, the
+/// scheduler's counters. No test runs here; `uprobe` step 20 does that.
+fn cmdBlk() void {
+    if (!virtio_blk.present()) {
+        out("  no block device attached\n", .{});
+        return;
+    }
+    const d = virtio_blk.stats;
+    out("  disk: {d} sector(s), {d} MiB, features 0x{x}, flush {s}\n", .{
+        virtio_blk.capacitySectors(), virtio_blk.capacityBytes() / (1024 * 1024),
+        virtio_blk.deviceFeatures(), if (virtio_blk.flushSupported()) "negotiated" else "absent",
+    });
+    out("  device: reads {d}, writes {d}, flushes {d}, retries {d}, timeouts {d}, resets {d}, io errors {d}, unsupported {d}, last status {d}\n", .{
+        d.reads, d.writes, d.flushes, d.retries, d.timeouts, d.resets, d.io_errors, d.unsupported, d.last_status,
+    });
+    out("  layer: submitted {d}, dispatched {d}, reordered {d}, sectors {d}, bytes {d}, errors {d}\n", .{
+        block.stats.submitted, block.stats.dispatched, block.stats.reordered,
+        block.stats.sectors, block.stats.bytes, block.stats.errors,
+    });
+    out("  irq: {d} routed, {d} acknowledged\n", .{ virtio_blk.interruptId(), virtio_blk.interruptCount() });
 }
 
 /// `virtio` — every transport, whether it carries a device, and what the
@@ -2023,6 +2114,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdSandbox();
     } else if (std.mem.eql(u8, command, "virtio")) {
         cmdVirtio();
+    } else if (std.mem.eql(u8, command, "blk")) {
+        cmdBlk();
 
         cmdLspci();
     } else if (std.mem.eql(u8, command, "devices")) {

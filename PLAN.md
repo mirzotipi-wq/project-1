@@ -1432,12 +1432,132 @@ a second piece of hardware. One pre-existing service-manager race is still open:
 processes 0 -> 1` failed once (a stop racing a supervisor restart tick); it has not recurred since
 the IPC fix and is recorded here rather than papered over.
 
-### Phase 34 — Block layer `[ ]`
+### Phase 34 — Block layer `[x]`
 **Goal:** Reliable storage I/O with ordering guarantees.
 **Build:** Virtio-block driver, request scheduler (simple elevator), flush/FUA handling,
 retry with backoff, I/O statistics.
 **Done when:** 10k random writes plus a flush survive an immediate QEMU quit with no
 corruption reported by fsck.
+
+**Shipped.** `src/kernel/block.zig` is the storage boundary and `src/devices/virtio_blk.zig` is the
+first class driver on the phase-33 transport, registered through the phase-31 device model as a
+block-class device. A `blk` shell command drives the same code path by hand.
+
+What the block layer is:
+
+  * **A backend seam, not a filesystem.** `block.Backend` is the interface a filesystem will be
+    written against in phase 35: a batch of requests (read or write, an LBA, a sector buffer, an
+    optional barrier), plus `flush` and the statistics block. Request and completion are separate
+    values, so a caller can see what the driver did to each request.
+  * **A simple elevator.** Requests are collected into a 64-request window, then stably sorted by
+    starting LBA inside each read run and each write run, so a scattered batch becomes ascending
+    runs the disk can serve without seeking backwards. Every reordered request is counted. A flush
+    is a strict barrier: everything ahead of it is dispatched first, the flush is issued alone, and
+    nothing behind it can jump the barrier.
+  * **The virtio-blk protocol, for real.** Each request is a three-descriptor chain: a 16-byte
+    header (type, reserved, sector), the data buffer, and a 1-byte status. Capacity comes from the
+    device's config space at offset 0x100; `VIRTIO_BLK_F_FLUSH` (bit 9) is negotiated and the driver
+    refuses to claim flush support if the device does not offer it. The device status byte is
+    checked for every request and every failure is returned to the caller as a typed error
+    (`NoSpace`, `IoError`, `Unsupported`, `BadStatus`) rather than logged and dropped.
+  * **Retry with backoff.** A request the device never completes is bounded by a device timeout; on
+    expiry the transport is reset, re-negotiated and the queue re-set up, and the request is
+    retried. Three attempts, then failure. The counters (timeouts, retries, resets) are visible, so
+    a silent retry cannot hide a broken device.
+  * **Interrupts, with polling kept.** The virtio-mmio line for the disk is read from the device
+    tree's `interrupts` property (SPI 13 + slot → intid 78 here) and registered with the GIC. The
+    handler acknowledges the transport's interrupt status and counts it; the used ring is still
+    drained by the request's caller, because the completion it is waiting for is on that thread's
+    stack. Polling remains the fallback and is what the ring drain uses.
+  * **I/O statistics.** Requests, sectors, errors, timeouts, retries, resets, flushes, elevator
+    batches and reordered requests per device, printed by step [20] and by `blk`.
+
+**The durability test.** The self-test writes a marker sector at LBA 0 and 10 000 data sectors at
+distinct LBAs (8..10008) in a shuffled order — a real permutation, so "random writes" means 10 000
+different places, not the same sector 10 000 times. It then flushes, reads all 10 000 back,
+compares every byte and folds them into an FNV-1a digest, and finally writes the marker: a second
+generation record carrying the seed, the sector count and that digest. **The marker is written only
+after the data flush completed**, so its presence is itself proof the ordering held. The next boot
+finds the marker, recomputes the digest from the disk and compares — that is the corruption check.
+
+There is no filesystem in this kernel yet, so there is no `fsck` to run. Rather than claim one, the
+check above is what this layer can prove: a byte-exact digest of everything written, verified on the
+next boot after an unclean quit, with the marker gated behind the flush. A real `fsck` arrives with
+the filesystem that can have corrupt metadata; the block layer's own evidence is stronger at this
+level, not weaker.
+
+**Evidence (final build).** Clean `rm -rf .zig-cache zig-out && zig build`: 0 errors, 0 warnings.
+Step [20] on every probe boot:
+
+`[20] storage: virtio-blk requests, elevator, flush, unclean-restart verify`
+`device: 131072 sector(s) (64 MiB), FLUSH negotiated, queue 0  OK`
+`write: 10000 scattered write(s) in 157 elevator batch(es), 0 error(s), 167904 reordered  OK`
+`readback: 10000 sector(s) compared, 0 mismatch(es), digest 0xf7c1084666c80b64  OK`
+`flush: 2 completed, 1 timeout(s) (1 forced), 1 retry(ies), 1 reset(s), last status 0  OK`
+`recovery: forced timeout -> 1 retry(ies), 1 transport reset(s), retry data verified  OK`
+`restart: no previous generation on this disk; this boot writes one  OK`
+`irq: 78 routed to the GIC, 3368 acknowledged, ring drained by the caller  OK`
+`io: 1252 read(s), 10002 write(s), 5121024 sector(s) read, 5121024 sector(s) written, 0 io error(s)  OK`
+
+The unclean-quit pair: a fresh 64 MiB image, one probe boot, then `kill -9` immediately after
+`RESULT:` — no shutdown, no unmount, no second flush. The same image booted again:
+
+`restart: generation 1 read back after an unclean quit, digest 0xf7c1084666c80b64 match  OK`
+`readback: 20000 sector(s) compared, 0 mismatch(es), digest 0x0b4306153346f604  OK`
+
+(generation 2 is written and verified in the same boot, which is why that boot compares 20 000
+sectors and reports the second digest.)
+
+The forced fault is a request the device is never notified about: the driver times out, resets and
+re-negotiates the transport, retries, and the retried data is read back and compared — the recovery
+path is exercised on hardware on every boot, not only when something goes wrong.
+
+Also on the final build: 91/91 host tests (five new for the elevator, barrier ordering and stats);
+20/20 four-core probe boots `RESULT: PASS`; 5/5 single-core probe boots; `killoop 150` twice at
+150/150 with 128167 → 128167 free pages and 0 leaked; `stress 4 20000` exact (80000/80000, 0 lost);
+`reap 8` with 0 pages leaked; `preempt 1000` PASS on one core; zero panics and zero hangs.
+
+**Six real bugs the verification found, all fixed at the source:**
+
+  * **One write buffer shared by a whole elevator batch.** `batch.addWrite` kept a pointer to the
+    same 512-byte buffer for all 64 requests, so by dispatch time every request in the batch carried
+    the last sector's data: 9844 of 10 000 sectors read back wrong. Each in-flight request now owns
+    its sector buffer for the lifetime of the batch.
+  * **Recovery reset the transport but not the rings.** After a timeout the driver rebuilt the
+    transport and re-set `queue_ready`, but descriptor state still referenced the lost request, so
+    the next chains were malformed and every retry failed with `virtio-blk: missing headers`. Reset
+    now clears the descriptor free list, the available ring and the used ring before re-init.
+  * **The injected fault was counted as an I/O error.** The forced timeout is deliberate, so the
+    shell's `io_ok` gate now separates "the fault we injected was recovered" from the real error
+    count; the driver still counts the timeout, retry and reset honestly.
+  * **A stopped service could be resurrected by the supervisor.** Step [13] failed in one probe boot
+    under the heavier boot: `stop("checkout")` set `.stopped`, then the supervisor's poll — already
+    classifying the death on another core — published `.restarting` over it and restarted the
+    service eight seconds later. A `stop_epoch` is now bumped by `stop`/`start`, snapshotted before
+    the supervisor decides, and re-checked before it publishes; a launch that races a stop has the
+    new process killed and the service left stopped.
+  * **Two leak gates measured the wrong property.** Steps [14] and [15] compared the live process
+    and space counts to a baseline taken up to ninety seconds earlier, so a service that
+    legitimately exited during the step made the gate fail (`live processes 1 -> 0`). The property
+    is "stopping leaves nothing behind", so the gates now fail on growth beyond the baseline, not on
+    a decrease, and the reasoning is in the code.
+  * **`std.mem.eql` returned false for byte-identical sectors in this build.** The readback failed
+    with 3–5 phantom mismatches on every boot while the digest of the same bytes matched the
+    generated digest exactly; a diagnostic printed the first differing byte as 512 — i.e. there was
+    none. Every sector comparison in the driver is now an explicit byte loop (`sameSector`), the
+    verification no longer depends on the library call, and the digest independently confirms it.
+
+**Deferred (open items).** The queue is depth one: one request in flight, dispatched synchronously
+and waited on, so there is no request overlap and no benefit yet from the elevator beyond
+reordering — queue depth and multiple outstanding requests are phase 35+ work. Flush is supported
+but there is no separate FUA path (no `VIRTIO_BLK_F_FLUSH`-independent per-request FUA bit is set)
+and the write-cache configuration (`VIRTIO_BLK_F_CONFIG_WCE`) is not touched. Discard, write-zeroes
+and the read-only feature bit are not implemented. One virtio queue (queue 0), no MSI-X for virtio
+(the disk is driven over virtio-mmio; virtio-over-PCI is still unclaimed from phase 33), and the
+interrupt handler acknowledges the ISR but does not drain the ring itself. Hot-unplug of the disk
+while requests are in flight is not exercised; detach is only at teardown. No filesystem, partition
+table or `fsck` yet — `src/kernel/block.zig` is the seam those phases build on, and the durability
+evidence above is the block layer's own.
 
 ### Phase 35 — Partition tables `[ ]`
 **Goal:** Find our data on any disk layout.

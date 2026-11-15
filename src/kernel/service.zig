@@ -37,6 +37,12 @@ pub const Service = struct {
     /// Bumped on every launch. A caller that resolved a service can compare it
     /// after the fact and learn that the pid it holds belongs to an older run.
     generation: u32 = 0,
+    /// Bumped by `stop` and `start`. The supervisor decides what a death means
+    /// from several fields and then publishes `.restarting`; if a `stop` lands
+    /// between the decision and the publication, publishing would undo it and
+    /// restart a service the caller just stopped. The supervisor snapshots this
+    /// epoch and refuses to publish (or kills what it started) if it moved.
+    stop_epoch: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     started_ms: u64 = 0,
     next_restart_ms: u64 = 0,
     last_code: i64 = 0,
@@ -116,6 +122,7 @@ pub fn kill(name: []const u8) bool {
 /// Take a service down on purpose: no restart, and its child is reaped.
 pub fn stop(name: []const u8) bool {
     const s = find(name) orelse return false;
+    _ = s.stop_epoch.fetchAdd(1, .seq_cst);
     if (s.state == .running) _ = process.kill(s.pid);
     s.state = .stopped;
     s.next_restart_ms = 0;
@@ -129,6 +136,7 @@ pub fn poll() void {
         if (!s.used) continue;
         switch (s.state) {
             .running => {
+                const epoch = s.stop_epoch.load(.seq_cst);
                 const st = process.stateOf(s.pid);
                 if (st == .running) {
                     // A service that stayed up long enough is healthy again.
@@ -146,6 +154,14 @@ pub fn poll() void {
                 failures_total += 1;
                 s.failures += 1;
                 const d = restart.afterFailure(s.policy, s.failures);
+                if (s.stop_epoch.load(.seq_cst) != epoch) {
+                    // A stop (or a fresh start) happened while this death was
+                    // being classified. Its decision wins: do not publish a
+                    // restart over it.
+                    s.state = .stopped;
+                    s.next_restart_ms = 0;
+                    continue;
+                }
                 s.state = d.state;
                 s.last_delay_ms = d.delay_ms;
                 s.next_restart_ms = now + d.delay_ms;
@@ -160,7 +176,16 @@ pub fn poll() void {
             },
             .restarting => {
                 if (now >= s.next_restart_ms) {
+                    const epoch = s.stop_epoch.load(.seq_cst);
                     if (launch(s)) {
+                        if (s.stop_epoch.load(.seq_cst) != epoch) {
+                            // A stop landed while this launch was in flight: the
+                            // service must end stopped, not running.
+                            _ = process.kill(s.pid);
+                            s.state = .stopped;
+                            s.next_restart_ms = 0;
+                            continue;
+                        }
                         s.restarts += 1;
                         restarts_total += 1;
                         klog.info("svc", "'{s}' restarted, pid {d} (restart {d})", .{

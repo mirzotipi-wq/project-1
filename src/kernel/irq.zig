@@ -25,6 +25,14 @@ pub fn register(intid: u32, handler: Handler) void {
     gic.enableIrq(intid);
 }
 
+/// Remove a handler and mask the line. A driver that tears its device down must
+/// not leave a handler pointing at memory it no longer owns.
+pub fn unregister(intid: u32) void {
+    if (intid >= max_intid) return;
+    handlers[intid] = null;
+    gic.disableIrq(intid);
+}
+
 pub fn dispatch() void {
     const id = gic.acknowledge();
     if (id >= 1020) {

@@ -252,10 +252,13 @@ pub const Status = struct {
 /// transport, and a device that does not offer it is not one this kernel drives.
 pub const feature_version_1: u64 = 1 << 32;
 
-/// The subset of features this kernel knows how to keep: version 1 only. A
-/// device feature it does not understand is left off, never accepted blindly.
+/// The subset of features this kernel knows how to keep: what the caller asks
+/// for, intersected with what the device offers. A device feature nobody asked
+/// for is left off, never accepted blindly, and a feature set without
+/// `VIRTIO_F_VERSION_1` is not a modern transport at all.
 pub fn negotiate(device_features: u64, wanted: u64) u64 {
-    return device_features & wanted & feature_version_1;
+    if (wanted & feature_version_1 == 0) return 0;
+    return device_features & wanted;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +285,8 @@ pub const Mmio = struct {
         pub const interrupt_status: usize = 0x060;
         pub const interrupt_ack: usize = 0x064;
         pub const status: usize = 0x070;
+        /// Device-specific configuration space (virtio-blk's capacity is here).
+        pub const config: usize = 0x100;
         pub const queue_desc_lo: usize = 0x080;
         pub const queue_desc_hi: usize = 0x084;
         pub const queue_driver_lo: usize = 0x090;
@@ -297,32 +302,44 @@ pub const Mmio = struct {
     device_features: u64 = 0,
     driver_features: u64 = 0,
 
-    fn read(self: *const Mmio, off: usize) u32 {
+    pub fn readReg(self: *const Mmio, off: usize) u32 {
         const p: *volatile u32 = @ptrFromInt(self.base + off);
         return p.*;
     }
 
-    fn write(self: *const Mmio, off: usize, value: u32) void {
+    pub fn writeReg(self: *const Mmio, off: usize, value: u32) void {
         const p: *volatile u32 = @ptrFromInt(self.base + off);
         p.* = value;
     }
 
     pub fn status(self: *const Mmio) u32 {
-        return self.read(Reg.status);
+        return self.readReg(Reg.status);
     }
 
     pub fn setStatus(self: *const Mmio, value: u32) void {
-        self.write(Reg.status, value);
+        self.writeReg(Reg.status, value);
     }
 
-    /// Reset, acknowledge, read the feature words, and accept only version 1.
+    /// Device id straight out of the transport's registers, before a driver
+    /// commits to a feature set: a class driver knows which of its own features
+    /// it wants, and the transport needs the id to ask for them.
+    pub fn peekDeviceId(base: usize) u32 {
+        const p: *volatile u32 = @ptrFromInt(base + Reg.device_id);
+        return p.*;
+    }
+
+    /// Reset, acknowledge, read the feature words, and accept `wanted`.
     pub fn init(base: usize) !Mmio {
+        return initWith(base, feature_version_1);
+    }
+
+    pub fn initWith(base: usize, wanted: u64) !Mmio {
         var t = Mmio{ .base = base };
-        if (t.read(Reg.magic) != magic_value) return error.NotVirtio;
-        t.version = t.read(Reg.version);
+        if (t.readReg(Reg.magic) != magic_value) return error.NotVirtio;
+        t.version = t.readReg(Reg.version);
         if (t.version != 2) return error.UnsupportedVersion;
-        t.device_id = t.read(Reg.device_id);
-        t.vendor_id = t.read(Reg.vendor_id);
+        t.device_id = t.readReg(Reg.device_id);
+        t.vendor_id = t.readReg(Reg.vendor_id);
 
         // An empty transport has no device to negotiate a feature set with, and
         // a device that is not there cannot reject one. It is still a transport.
@@ -334,17 +351,17 @@ pub const Mmio = struct {
         st |= Status.driver;
         t.setStatus(st);
 
-        t.write(Reg.device_features_sel, 0);
-        const low: u64 = t.read(Reg.device_features);
-        t.write(Reg.device_features_sel, 1);
-        const high: u64 = t.read(Reg.device_features);
+        t.writeReg(Reg.device_features_sel, 0);
+        const low: u64 = t.readReg(Reg.device_features);
+        t.writeReg(Reg.device_features_sel, 1);
+        const high: u64 = t.readReg(Reg.device_features);
         t.device_features = (high << 32) | low;
 
-        t.driver_features = negotiate(t.device_features, feature_version_1);
-        t.write(Reg.driver_features_sel, 0);
-        t.write(Reg.driver_features, @truncate(t.driver_features));
-        t.write(Reg.driver_features_sel, 1);
-        t.write(Reg.driver_features, @truncate(t.driver_features >> 32));
+        t.driver_features = negotiate(t.device_features, wanted);
+        t.writeReg(Reg.driver_features_sel, 0);
+        t.writeReg(Reg.driver_features, @truncate(t.driver_features));
+        t.writeReg(Reg.driver_features_sel, 1);
+        t.writeReg(Reg.driver_features, @truncate(t.driver_features >> 32));
 
         t.setStatus(st | Status.features_ok);
         // The device clears FEATURES_OK when it cannot live with the subset.
@@ -359,43 +376,43 @@ pub const Mmio = struct {
     /// Point a queue at kernel memory and make it live. Addresses are written in
     /// two halves, which is the modern layout.
     pub fn setupQueue(self: *Mmio, q: *Queue, index: u16) !void {
-        self.write(Reg.queue_sel, index);
-        const max = self.read(Reg.queue_num_max);
+        self.writeReg(Reg.queue_sel, index);
+        const max = self.readReg(Reg.queue_num_max);
         if (max == 0) return error.NoQueue;
         const size: u32 = @min(max, ring_size);
-        self.write(Reg.queue_num, size);
+        self.writeReg(Reg.queue_num, size);
         q.size = @intCast(size);
         const desc_addr: u64 = @intFromPtr(q.desc);
         const avail_addr: u64 = @intFromPtr(q.avail);
         const used_addr: u64 = @intFromPtr(q.used);
-        self.write(Reg.queue_desc_lo, @truncate(desc_addr));
-        self.write(Reg.queue_desc_hi, @truncate(desc_addr >> 32));
-        self.write(Reg.queue_driver_lo, @truncate(avail_addr));
-        self.write(Reg.queue_driver_hi, @truncate(avail_addr >> 32));
-        self.write(Reg.queue_device_lo, @truncate(used_addr));
-        self.write(Reg.queue_device_hi, @truncate(used_addr >> 32));
+        self.writeReg(Reg.queue_desc_lo, @truncate(desc_addr));
+        self.writeReg(Reg.queue_desc_hi, @truncate(desc_addr >> 32));
+        self.writeReg(Reg.queue_driver_lo, @truncate(avail_addr));
+        self.writeReg(Reg.queue_driver_hi, @truncate(avail_addr >> 32));
+        self.writeReg(Reg.queue_device_lo, @truncate(used_addr));
+        self.writeReg(Reg.queue_device_hi, @truncate(used_addr >> 32));
         fence();
-        self.write(Reg.queue_ready, 1);
+        self.writeReg(Reg.queue_ready, 1);
     }
 
     pub fn notify(self: *const Mmio, q: *const Queue) void {
-        self.write(Reg.queue_notify, q.index);
+        self.writeReg(Reg.queue_notify, q.index);
     }
 
     /// Read and acknowledge the interrupt status: one acknowledgement covers
     /// every completion the device published, which is what makes draining the
     /// whole used ring the right response.
     pub fn takeInterrupt(self: *const Mmio) u32 {
-        const bits = self.read(Reg.interrupt_status);
-        if (bits != 0) self.write(Reg.interrupt_ack, bits);
+        const bits = self.readReg(Reg.interrupt_status);
+        if (bits != 0) self.writeReg(Reg.interrupt_ack, bits);
         return bits;
     }
 
     /// Reset the device: queue ready bits cleared, status 0, rings rebuilt by
     /// the caller. This is the recovery path, not a shutdown path.
     pub fn reset(self: *Mmio, q: *Queue) void {
-        self.write(Reg.queue_sel, q.index);
-        self.write(Reg.queue_ready, 0);
+        self.writeReg(Reg.queue_sel, q.index);
+        self.writeReg(Reg.queue_ready, 0);
         self.setStatus(0);
         q.resetRings();
     }
@@ -637,6 +654,10 @@ test "used ring wraps and drain reports the batch size" {
 test "negotiation accepts version 1 and refuses features it does not know" {
     const device: u64 = feature_version_1 | (1 << 5) | (1 << 9);
     try std.testing.expectEqual(feature_version_1, negotiate(device, feature_version_1));
+    // A class feature is only taken when the caller asks for it.
+    try std.testing.expectEqual(feature_version_1 | (1 << 9), negotiate(device, feature_version_1 | (1 << 9)));
     // A legacy-only device offers nothing this kernel accepts.
     try std.testing.expectEqual(@as(u64, 0), negotiate(1 << 5, feature_version_1));
+    // A moderm transport request that forgets VERSION_1 is not negotiated.
+    try std.testing.expectEqual(@as(u64, 0), negotiate(device, 1 << 9));
 }

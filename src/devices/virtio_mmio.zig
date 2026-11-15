@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const virtio = @import("../kernel/virtio.zig");
+const virtio_blk = @import("virtio_blk.zig");
 const driver = @import("../kernel/driver.zig");
 const klog = @import("../kernel/klog.zig");
 
@@ -115,7 +116,13 @@ pub fn probe(dev: *const driver.Device) !void {
     const base: usize = @intCast(dev.regs[0].base);
     const index = slot_count;
 
-    var t = virtio.Mmio.init(base) catch |err| {
+    // A class driver knows which of its own features it wants, so the device id
+    // is read before the feature set is committed to.
+    const device_id = virtio.Mmio.peekDeviceId(base);
+    const wanted: u64 = virtio.feature_version_1 |
+        (if (device_id == virtio_blk.block_device) virtio_blk.feature_flush else 0);
+
+    var t = virtio.Mmio.initWith(base, wanted) catch |err| {
         failures += 1;
         klog.warn("virtio", "{s}: {s} at 0x{x} — not driven", .{
             dev.name, switch (err) {
@@ -162,6 +169,17 @@ pub fn probe(dev: *const driver.Device) !void {
                 klog.warn("virtio", "{s}: entropy request failed ({s})", .{ dev.name, @errorName(err) });
                 return err;
             }
+        } else if (t.device_id == virtio_blk.block_device) {
+            virtio_blk.attach(t, q, dev.node_off, wanted) catch |err| {
+                failures += 1;
+                klog.warn("virtio", "{s}: block device did not attach ({s})", .{ dev.name, @errorName(err) });
+                return error.Unsupported;
+            };
+            slot.served = true;
+            served_count += 1;
+            klog.info("virtio", "{s}: block device ready, {d} sector(s), flush {s}", .{
+                dev.name, virtio_blk.capacitySectors(), if (virtio_blk.flushSupported()) "negotiated" else "absent",
+            });
         } else {
             klog.info("virtio", "{s}: {s} device (id {d}), queue 0 ready, protocol is a later phase", .{
                 dev.name, deviceName(t.device_id), t.device_id,
@@ -181,6 +199,7 @@ pub fn remove(dev: *const driver.Device) void {
     var i: usize = 0;
     while (i < slot_count) : (i += 1) {
         if (slots[i].base != dev.regs[0].base) continue;
+        if (slots[i].device_id == virtio_blk.block_device) virtio_blk.detach();
         var t = virtio.Mmio{ .base = @intCast(dev.regs[0].base) };
         t.reset(&queues[i]);
         if (slots[i].live) {
