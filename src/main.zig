@@ -21,6 +21,7 @@ const timer = @import("arch/aarch64/timer.zig");
 const uart = @import("devices/pl011.zig");
 const klog = @import("kernel/klog.zig");
 const machine = @import("kernel/machine.zig");
+const virtio = @import("kernel/virtio.zig");
 const driver = @import("kernel/driver.zig");
 const builtin_drivers = @import("devices/builtin.zig");
 const Pmm = @import("kernel/pmm.zig");
@@ -274,6 +275,7 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     // fails to probe can still be reported; the pl011 driver re-installs it from
     // the tree, which is why `console` appears in the bound set.
     driver.attachMachine(&g_machine);
+    virtio.setAllocator(&g_pmm);
     builtin_drivers.installAll();
     _ = driver.discover(&g_machine);
     driver.bindAll();

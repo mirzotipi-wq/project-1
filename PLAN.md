@@ -1335,11 +1335,102 @@ machine this kernel is proven on, and the MSI-unavailable evidence uses a device
 GICv2m frame instead. No PCIe hotplug, no ACPI, no MSI remapping, no INTx sharing beyond one
 function per pin, and no userspace access to configuration space.
 
-### Phase 33 — Virtio transport `[ ]`
+### Phase 33 — Virtio transport `[x]`
 **Goal:** One transport for block, net, input and GPU.
 **Build:** Split virtqueue implementation, descriptor chains, feature negotiation,
 interrupt coalescing, error recovery and queue reset.
 **Done when:** A virtqueue echo test passes 10^5 requests under memory pressure.
+
+**Shipped.** `src/kernel/virtio.zig` is the single transport every virtio class will share, and
+`src/devices/virtio_mmio.zig` is the driver that binds the machine's 32 `virtio,mmio` transports to
+it through the phase-31 device model. Each transport is a device object: claimed by compatible
+string, listed in `devices`, counted with everything else, and a new `virtio` command prints the
+table. The PCIe functions phase 32 publishes stay unbound by name.
+
+What the transport is:
+
+  * **Modern virtio-mmio (version 2) only.** Magic/version/device-id/vendor-id, the status
+    ladder ACK → DRIVER → FEATURES_OK → DRIVER_OK, four 32-bit queue address halves and
+    `queue_ready`. A version-1 (legacy) transport is refused by name and counted, never half-driven.
+  * **Feature negotiation.** Both device feature words are read and the driver accepts
+    `VIRTIO_F_VERSION_1` alone, then verifies the device kept FEATURES_OK. A feature this kernel
+    does not understand is left off, never accepted blindly.
+  * **Split virtqueues.** 64 descriptors, available ring and used ring in kernel memory — identity
+    mapped, so the addresses written into the transport are the addresses the device reads and
+    writes. Descriptor chains come off a free list and go back onto it; the available index is
+    published exactly once, behind a barrier (`dsb sy` on the target, an atomic on the host tests).
+  * **Completion draining and coalescing.** `drain` takes every completion the used ring holds, so
+    one interrupt — or one poll — empties it, and any drain that returns more than one element
+    counts as a coalesced batch. The interrupt status/ack registers are driven by `takeInterrupt`.
+  * **Queue reset and recovery.** A request with no completion is detected by a bounded wait; the
+    transport is reset (`queue_ready` 0, status 0), the ring rebuilt, and the request retried once.
+    A second failure is reported as a failure, not hidden.
+  * **A real device, end to end.** The entropy device takes a writable buffer through a split queue
+    and the driver reads back the 64 bytes the device wrote: the first virtio request this kernel
+    completes on hardware rather than on a model of one.
+
+The echo self-test drives the same ring code from a software device that answers correctly, while
+the page allocator is held down and churned. Step [19] on every probe boot:
+
+`[19] virtio: negotiation, split queues, echo under pressure, recovery`
+`transports: 32 slot(s), 1 with a device, 31 empty  OK`
+`negotiate: version 2, VIRTIO_F_VERSION_1 acked by 1 device(s)  OK`
+`queue: 1 live split queue(s), descriptor/available/used rings  OK`
+`echo: 100000 request(s), 0 error(s), 25000 coalesced drain(s), 127175 page(s) before, 127175 after  OK`
+`pressure: 8192 page(s) held (32768 KiB), 782 churn cycle(s), 0 allocation failure(s)  OK`
+`recovery: 1 reset(s), timeout detected, retry completed  OK`
+`served: 1 device(s) answered real requests; block/net/input/gpu protocols are later phases  OK`
+
+32 MiB of pages are held for the whole run and one allocate/free cycle runs per 32 batches; the
+free-page count is identical before and after, and fewer than 8192 held pages fails the step. The
+machine's own accounting noticed the pressure without being told: `memory pressure: 127175 pages
+free (< 127176) -> 1 event(s), 0 victims`.
+
+The boot line matters: QEMU's virtio-mmio defaults to the **legacy** transport. The matrix boots
+with `-global virtio-mmio.force-legacy=false -device virtio-rng-device`; without the flag every
+transport is refused with `legacy or unknown transport version ... not driven` and [19] fails
+loudly. That absence is detected and logged, never worked around.
+
+**Four real bugs the verification found, all fixed at the source:**
+
+  * **An empty transport was treated as a device that rejected the feature set.** Negotiation ran
+    before the device id was inspected, so 31 empty slots reported `FeaturesRejected` and were
+    marked failed. An empty slot is a transport with no device: it is now returned untouched and
+    reported as empty.
+  * **The available index was published twice.** The volatile store and the struct increment
+    addressed the same word, so the device saw a gap, skipped the request, and the first real
+    entropy request timed out twice. One writer, one increment. The echo device had the same
+    mistake on the used ring; both now go through a single completion helper.
+  * **The churn leaked the page it replaced** (3125 pages over one run), and the first pressure
+    scale-up put 64 KiB of page addresses on the shell's stack — the scheduler caught it as
+    `corrupt thread frame ... thread 7 'wd'`. The pressure array is static now and the free-page
+    count is asserted, so a leak fails the step instead of passing quietly.
+  * **A pre-existing IPC race, surfaced by the extra boot-time work:** a late reply to an abandoned
+    call was judged against the endpoint's *current* deadline, which the next call had already
+    replaced. The caller was protected by the call sequence, but the server was told its answer had
+    been delivered, so cases 18 and 24 failed in two probe boots. The deadline of the call being
+    answered is now recorded with its sequence when the request is taken
+    (`recv_call_deadline`), and lateness is judged against that.
+
+On the final build: clean `rm -rf .zig-cache zig-out && zig build` with 0 errors and 0 warnings;
+86/86 host tests (four new: chain allocation/release, chain flags, used-ring wrap and batch size,
+feature negotiation); 20/20 four-core probe boots `RESULT: PASS`; 5/5 single-core probe boots;
+`killoop 150` twice at 150/150 with 0 pages leaked; `stress 4 20000` exact; `reap 8` with 0 pages
+leaked; `preempt 1000` PASS on one core; zero panics and zero hangs.
+
+**Deferred (open items).** There is no virtio-pci transport, so the virtio function phase 32 finds
+on the bus stays unclaimed — modern virtio-over-PCI needs its own capability walk. There are no
+device-class drivers: block, net, input and GPU protocols are phases 34, 37 and 38, so "one
+transport for block, net, input and GPU" is the transport's design and not yet four working device
+classes; only entropy is exercised end to end. Split rings only: no packed rings, no indirect
+descriptors, no event suppression (the driver always notifies and drains by polling), one queue per
+device (queue 0), and the queue size is 64 clamped to the device's maximum. The virtio-mmio
+interrupt line is not routed to the GIC yet, so no virtio interrupt is taken: the coalescing rule
+and ISR acknowledgement exist and are counted, but the completions in this phase are polled. The
+echo device is software inside the kernel — it exercises the driver side of the ring protocol, not
+a second piece of hardware. One pre-existing service-manager race is still open: `stop: live
+processes 0 -> 1` failed once (a stop racing a supervisor restart tick); it has not recurred since
+the IPC fix and is recorded here rather than papered over.
 
 ### Phase 34 — Block layer `[ ]`
 **Goal:** Reliable storage I/O with ordering guarantees.

@@ -87,6 +87,13 @@ const Endpoint = struct {
     req_seq: u32 = 0,
     recv_seq: u32 = 0,
     rep_seq: u32 = 0,
+    /// The deadline of the call whose request the receiver is holding, recorded
+    /// with its sequence when the request is taken. `reply_deadline` follows
+    /// the *latest* call, so judging a late answer by it would accept an answer
+    /// to an abandoned call whenever a new caller is already waiting — the
+    /// answer's sequence keeps it away from the new caller, but the sender must
+    /// still be told its answer was refused.
+    recv_call_deadline: u64 = 0,
 
     /// Reply in flight: receiver back to the caller.
     rep_valid: bool = false,
@@ -403,6 +410,7 @@ pub fn recv(
                 ep.reply_owed = true;
                 ep.reply_target = caller;
                 ep.recv_seq = ep.req_seq;
+                ep.recv_call_deadline = ep.reply_deadline;
             }
             receives += 1;
             // The request slot is free again: whoever was blocked on it may go.
@@ -467,10 +475,11 @@ pub fn reply(
     // A call whose deadline passed is over even if its caller has not run yet:
     // it will return ETIMEDOUT, and handing it this answer would turn that into
     // a success. Decided by the deadline alone, never by which thread runs first.
-    if (ep.reply_deadline != 0 and expired(ep.reply_deadline)) {
-        klog.debug("ipc", "reply refused as late: deadline {d} now {d}, seq {d}", .{ ep.reply_deadline, timer.uptimeMs(), ep.recv_seq });
+    if (ep.recv_call_deadline != 0 and expired(ep.recv_call_deadline)) {
+        klog.debug("ipc", "reply refused as late: call deadline {d} now {d}, seq {d}", .{ ep.recv_call_deadline, timer.uptimeMs(), ep.recv_seq });
         ep.reply_owed = false;
         ep.reply_target = null;
+        ep.recv_call_deadline = 0;
         if (ep.reply_thread == target) {
             ep.reply_thread = null;
         }
@@ -479,6 +488,7 @@ pub fn reply(
         lock.release(flags);
         return Error.Again;
     }
+    ep.recv_call_deadline = 0;
     ep.reply_owed = false;
     ep.reply_target = null;
     ep.rep = msg;

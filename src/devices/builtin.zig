@@ -10,6 +10,7 @@ const timer = @import("../arch/aarch64/timer.zig");
 const uart = @import("pl011.zig");
 const pl031 = @import("pl031.zig");
 const pci = @import("../kernel/pci.zig");
+const virtio_mmio = @import("virtio_mmio.zig");
 const klog = @import("../kernel/klog.zig");
 
 fn probeConsole(dev: *driver.Device) driver.ProbeError!void {
@@ -131,6 +132,18 @@ const rtc_driver = driver.Driver{
     .remove = removeRtc,
 };
 
+fn probeVirtioMmio(dev: *driver.Device) driver.ProbeError!void {
+    virtio_mmio.probe(dev) catch |err| return switch (err) {
+        error.NoRegion => error.NoRegion,
+        error.NoMemory => error.NoMemory,
+        else => error.Unsupported,
+    };
+}
+
+fn removeVirtioMmio(dev: *driver.Device) void {
+    virtio_mmio.remove(dev);
+}
+
 const pci_host_driver = driver.Driver{
     .name = "pci-host",
     .compat = &.{"pci-host-ecam-generic"},
@@ -140,6 +153,15 @@ const pci_host_driver = driver.Driver{
     .deps = &.{"gic"},
     .probe = probePciHost,
     .remove = removePciHost,
+};
+
+const virtio_driver = driver.Driver{
+    .name = "virtio",
+    // One transport for block, net, input and GPU: the device tree's virtio
+    // transports, not the PCI functions (those need the modern PCI layout).
+    .compat = &.{"virtio,mmio"},
+    .probe = probeVirtioMmio,
+    .remove = removeVirtioMmio,
 };
 
 const broken_driver = driver.Driver{
@@ -154,6 +176,7 @@ pub const all = [_]*const driver.Driver{
     &timer_driver,
     &rtc_driver,
     &pci_host_driver,
+    &virtio_driver,
     &broken_driver,
 };
 

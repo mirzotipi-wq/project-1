@@ -34,6 +34,8 @@ const account = @import("account.zig");
 const sandbox = @import("sandbox.zig");
 const driver = @import("driver.zig");
 const pci = @import("pci.zig");
+const virtio = @import("virtio.zig");
+const virtio_mmio = @import("../devices/virtio_mmio.zig");
 const pl031 = @import("../devices/pl031.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
@@ -1803,6 +1805,51 @@ fn cmdUprobe(ctx: Context) void {
     });
     pass = verdict(pass, root_ok and ecam_ok and walk_ok and bars_ok and irq_ok, "[18]");
 
+    out("  [19] virtio: negotiation, split queues, echo under pressure, recovery\n", .{});
+    const slots = virtio_mmio.info();
+    const claimed_slots = driver.countCompat("virtio,mmio");
+    const live = virtio_mmio.liveSlots();
+    var empty: usize = 0;
+    for (slots) |slot| {
+        if (!slot.live) empty += 1;
+    }
+    const transport_ok = slots.len != 0 and slots.len == claimed_slots and live != 0;
+    var negotiate_ok = true;
+    var queue_ok = true;
+    for (slots) |slot| {
+        if (!slot.live) continue;
+        if (slot.version != 2 or slot.negotiated & virtio.feature_version_1 == 0) negotiate_ok = false;
+        if (slot.queue_size == 0) queue_ok = false;
+    }
+    const echo = virtio.echoTest(100_000);
+    const echo_ok = echo.rounds == 100_000 and echo.errors == 0 and echo.coalesced != 0;
+    const leak_ok = echo.pages_before == echo.pages_after;
+    const recovery_ok = echo.resets >= 1 and echo.recovered;
+    out("      transports: {d} slot(s), {d} with a device, {d} empty  {s}\n", .{
+        slots.len, live, empty, status(transport_ok),
+    });
+    out("      negotiate: version 2, VIRTIO_F_VERSION_1 acked by {d} device(s)  {s}\n", .{
+        live, status(negotiate_ok),
+    });
+    out("      queue: {d} live split queue(s), descriptor/available/used rings  {s}\n", .{
+        live, status(queue_ok),
+    });
+    out("      echo: {d} request(s), {d} error(s), {d} coalesced drain(s), {d} page(s) before, {d} after  {s}\n", .{
+        echo.rounds, echo.errors, echo.coalesced, echo.pages_before, echo.pages_after, status(echo_ok and leak_ok),
+    });
+    out("      pressure: {d} page(s) held ({d} KiB), {d} churn cycle(s), {d} allocation failure(s)  {s}\n", .{
+        echo.pressure_pages, echo.pressure_pages * 4, echo.churn_cycles, echo.alloc_failures, status(echo.pressure_pages >= 8192 and echo.alloc_failures == 0),
+    });
+    out("      recovery: {d} reset(s), timeout detected, retry completed  {s}\n", .{
+        echo.resets, status(recovery_ok),
+    });
+    out("      served: {d} device(s) answered real requests; block/net/input/gpu protocols are later phases  {s}\n", .{
+        virtio_mmio.servedSlots(), status(virtio_mmio.servedSlots() != 0 and virtio_mmio.failureCount() == 0),
+    });
+    pass = verdict(pass, transport_ok and negotiate_ok and queue_ok and echo_ok and leak_ok and recovery_ok and
+        echo.pressure_pages >= 8192 and echo.alloc_failures == 0 and
+        virtio_mmio.servedSlots() != 0 and virtio_mmio.failureCount() == 0, "[19]");
+
     out("  ------------------------------------------------------------------\n", .{});
     out("  scheduler: {d} double-run guard(s), {d} queue violation(s), {d} stray ready\n", .{
         sched.double_run_events, sched.queue_violations, sched.stray_ready,
@@ -1858,6 +1905,21 @@ fn cmdSandbox() void {
     }
     out("  gate: {d} syscall(s) denied, {d} block attempt(s) denied, {d} W+X mapping(s) refused\n", .{
         sandbox.denied, sandbox.block_denials, mmu.wx_refusals,
+    });
+}
+
+/// `virtio` — every transport, whether it carries a device, and what the
+/// negotiation left on the table.
+fn cmdVirtio() void {
+    out("  slot  base        device      version  queue  features            negotiated\n", .{});
+    for (virtio_mmio.info()) |slot| {
+        out("  {d:<4}  0x{x:<9} {s:<11} {d:<8} {d:<6} 0x{x:<17} 0x{x}\n", .{
+            slot.index, slot.base, virtio_mmio.deviceName(slot.device_id), slot.version,
+            slot.queue_size, slot.features, slot.negotiated,
+        });
+    }
+    out("  {d} transport(s), {d} with a device, {d} refused\n", .{
+        virtio_mmio.info().len, virtio_mmio.liveSlots(), virtio_mmio.failureCount(),
     });
 }
 
@@ -1959,7 +2021,9 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdAccounting();
     } else if (std.mem.eql(u8, command, "sandbox")) {
         cmdSandbox();
-    } else if (std.mem.eql(u8, command, "lspci")) {
+    } else if (std.mem.eql(u8, command, "virtio")) {
+        cmdVirtio();
+
         cmdLspci();
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();

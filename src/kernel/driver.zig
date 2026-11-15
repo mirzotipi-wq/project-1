@@ -228,6 +228,16 @@ pub fn unpublish(prefix: []const u8) usize {
 
 /// Functions published by the PCIe bus: a tree node called `pcie@...` must not
 /// be mistaken for one, so this counts the devices that carry PCI identity.
+/// How many devices the tree gave a particular compatible string. Used by the
+/// probe steps to compare what a driver reported against what the machine says.
+pub fn countCompat(compatible: []const u8) usize {
+    var n: usize = 0;
+    for (devices[0..device_count]) |*dev| {
+        if (dev.claims(compatible)) n += 1;
+    }
+    return n;
+}
+
 pub fn countPci() usize {
     var n: usize = 0;
     for (devices[0..device_count]) |*dev| {
