@@ -14,6 +14,7 @@
 const std = @import("std");
 const virtio = @import("../kernel/virtio.zig");
 const virtio_blk = @import("virtio_blk.zig");
+const virtio_input = @import("virtio_input.zig");
 const driver = @import("../kernel/driver.zig");
 const klog = @import("../kernel/klog.zig");
 
@@ -29,6 +30,9 @@ pub const Slot = struct {
     features: u64 = 0,
     negotiated: u64 = 0,
     queue_size: u16 = 0,
+    /// Second queue (virtio-input's status queue). Zero for device classes
+    /// that only use queue 0.
+    queue_size_alt: u16 = 0,
     /// A transport carrying a device (id != 0).
     live: bool = false,
     /// The device answered a real request in this boot.
@@ -48,6 +52,13 @@ var queues: [max_slots]virtio.Queue = [_]virtio.Queue{.{}} ** max_slots;
 var descriptors: [max_slots][virtio.ring_size]virtio.Descriptor align(16) = undefined;
 var avail_rings: [max_slots]virtio.Avail align(16) = undefined;
 var used_rings: [max_slots]virtio.Used align(16) = undefined;
+
+/// Queue 1 storage. Only virtio-input (phase 38) runs two queues today, but the
+/// arrays exist for every slot so a class driver never allocates a ring.
+var queues_alt: [max_slots]virtio.Queue = [_]virtio.Queue{.{}} ** max_slots;
+var descriptors_alt: [max_slots][virtio.ring_size]virtio.Descriptor align(16) = undefined;
+var avail_alt: [max_slots]virtio.Avail align(16) = undefined;
+var used_alt: [max_slots]virtio.Used align(16) = undefined;
 var rng_buffer: [64]u8 align(16) = undefined;
 
 pub fn info() []const Slot {
@@ -125,11 +136,13 @@ pub fn probe(dev: *const driver.Device) !void {
     var t = virtio.Mmio.initWith(base, wanted) catch |err| {
         failures += 1;
         klog.warn("virtio", "{s}: {s} at 0x{x} — not driven", .{
-            dev.name, switch (err) {
+            dev.name,
+            switch (err) {
                 error.NotVirtio => "no virtio magic",
                 error.UnsupportedVersion => "legacy or unknown transport version",
                 error.FeaturesRejected => "device rejected the feature subset",
-            }, base,
+            },
+            base,
         });
         return error.Unsupported;
     };
@@ -156,7 +169,24 @@ pub fn probe(dev: *const driver.Device) !void {
         t.driverOk();
         slot.queue_size = q.size;
 
-        if (t.device_id == rng_device) {
+        if (t.device_id == virtio_input.input_device) {
+            // Two queues: events in on queue 0, LED/feedback out on queue 1.
+            var status_q = &queues_alt[index];
+            status_q.init(1, &descriptors_alt[index], &avail_alt[index], &used_alt[index]);
+            t.setupQueue(status_q, 1) catch {
+                failures += 1;
+                klog.warn("virtio", "{s}: input device has no status queue", .{dev.name});
+                return error.Unsupported;
+            };
+            slot.queue_size_alt = status_q.size;
+            virtio_input.attach(t, q, status_q, dev.node_off) catch |err| {
+                failures += 1;
+                klog.warn("virtio", "{s}: input device did not attach ({s})", .{ dev.name, @errorName(err) });
+                return error.Unsupported;
+            };
+            slot.served = true;
+            served_count += 1;
+        } else if (t.device_id == rng_device) {
             if (entropyRequest(&t, q)) |bytes| {
                 slot.served = true;
                 slot.request_bytes = bytes;
@@ -200,6 +230,7 @@ pub fn remove(dev: *const driver.Device) void {
     while (i < slot_count) : (i += 1) {
         if (slots[i].base != dev.regs[0].base) continue;
         if (slots[i].device_id == virtio_blk.block_device) virtio_blk.detach();
+        if (slots[i].device_id == virtio_input.input_device) virtio_input.detach(dev.regs[0].base);
         var t = virtio.Mmio{ .base = @intCast(dev.regs[0].base) };
         t.reset(&queues[i]);
         if (slots[i].live) {

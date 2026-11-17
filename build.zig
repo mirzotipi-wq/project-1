@@ -278,9 +278,16 @@ pub fn build(b: *std.Build) void {
         "-nographic",
         "-serial", "mon:stdio",
         "-nic",    "none",
+        // Every virtio-mmio transport must present the modern (version 2)
+        // interface; QEMU still defaults to legacy for old guest compatibility.
+        "-global", "virtio-mmio.force-legacy=false",
         // Phase 37's panel. `romfile=` skips the VGA BIOS: the kernel programs
         // the bochs dispi registers itself and never calls firmware.
         "-device", "bochs-display,romfile=,xres=1280,yres=800",
+        // Phase 38's input hardware: a virtio keyboard and an absolute
+        // pointer (tablet), both on virtio-mmio like every other device here.
+        "-device", "virtio-keyboard-device",
+        "-device", "virtio-tablet-device",
         "-no-reboot",
     });
     run_cmd.addArg("-kernel");
@@ -298,9 +305,16 @@ pub fn build(b: *std.Build) void {
         "-nographic",
         "-serial", "mon:stdio",
         "-nic",    "none",
+        // Every virtio-mmio transport must present the modern (version 2)
+        // interface; QEMU still defaults to legacy for old guest compatibility.
+        "-global", "virtio-mmio.force-legacy=false",
         // Phase 37's panel. `romfile=` skips the VGA BIOS: the kernel programs
         // the bochs dispi registers itself and never calls firmware.
         "-device", "bochs-display,romfile=,xres=1280,yres=800",
+        // Phase 38's input hardware: a virtio keyboard and an absolute
+        // pointer (tablet), both on virtio-mmio like every other device here.
+        "-device", "virtio-keyboard-device",
+        "-device", "virtio-tablet-device",
         "-no-reboot",
     });
     run_elf.addArg("-kernel");

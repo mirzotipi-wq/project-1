@@ -1943,11 +1943,74 @@ blob, no runtime panel hotplug beyond driver unbind/rebind, and the bitmap font 
 the vector font engine (phase 53). Big-endian scanout is detected and refused rather than drawn with
 swapped channels.
 
-### Phase 38 — Input subsystem `[ ]`
+### Phase 38 — Input subsystem `[x]`
 **Goal:** Keys, touch, scanner.
 **Build:** Event queue, virtio-keyboard, USB HID boot keyboard, absolute-pointer touch,
 barcode-scanner HID fast path with prefix/suffix parsing, key remapping.
 **Done when:** A scanned barcode reaches the POS app as one atomic event in < 20 ms.
+
+**Shipped.** Input is one subsystem with one ordering contract, and every source feeds it: a
+hardware keyboard, a touch panel and a barcode scanner are all the same thing to the POS app,
+which sees typed characters, pointer positions and one atomic scan event in the order they
+happened.
+
+  * **Key tables (`src/lib/keymap.zig`).** The full evdev code map used by the drivers (letters,
+    digits, punctuation, keypad, navigation, function keys, modifiers), the HID usage-id to
+    evdev translation that phase 39's USB stack will reuse, modifier state with the desktop
+    rule that shift and caps cancel for letters but not digits, and a 32-entry remap table so a
+    terminal can turn a damaged or remapped key into the one the layout expects (`keymap map`,
+    `keymap reset`, hit counters).
+  * **Scanner state machine (`src/lib/scanner.zig`).** Hold-and-decide: a digit burst is held
+    until it is unambiguous, then emitted as one `barcode` with its payload intact. Every rule
+    is configurable — charset (digits or alphanumeric), prefix, suffix, minimum and maximum
+    length, inter-key gap (40 ms) and whole-scan window (500 ms). A burst that breaks a rule is
+    *released* keystroke by keystroke, in order, so a cashier typing a quantity or a command
+    never loses characters. Prefixed scans match and swallow the prefix without leaking it into
+    the payload. Statistics cover scans, releases, short scans, timeouts and overflows.
+  * **Event core (`src/kernel/input.zig`).** One IRQ-safe ring of 256 ordered events with
+    monotonically increasing sequence numbers and a drop-oldest policy that counts what it
+    dropped, a 16-event recent ring for diagnostics, a device registry (name, kind, absolute
+    range, IRQ, per-device counters), a separate console mirror for line editing, and a barcode
+    notice queue so the shell can announce a scan without stealing it from the POS queue.
+    `waitPop` blocks a thread on the queue; `describe` renders any event for the shell.
+  * **USB HID decoders (`src/lib/input_hid.zig`).** Boot-keyboard reports are diffed against
+    the previous report, so a held key produces one press and a release only when it disappears,
+    rollover (usage 0x01) is ignored rather than invented, and both keys in a two-key report are
+    reported. Boot mouse (signed motion, buttons, wheel) and an absolute pointer/touch report are
+    decoded too. The USB host stack is phase 39; the report format and the translation are not
+    waiting for it.
+  * **virtio-input (`src/devices/virtio_input.zig`, `src/devices/virtio_mmio.zig`).** The first
+    two-queue device in the tree: queue 0 for events, queue 1 for LED/feedback. Sixteen 64-byte
+    buffers are posted and re-posted from the interrupt handler, so the device always has room;
+    a polled fallback covers a device without an interrupt property. The device is classified
+    from its own config space (`EV_BITS`, `ABS_INFO`): a keyboard, a relative pointer or an
+    absolute tablet, with the tablet's 0..32767 axes scaled to the actual panel resolution
+    (1280x800 here). SYN_REPORT commits a pointer position, buttons map to the three POS buttons,
+    and wheel motion becomes scroll events. The transport is now explicitly modern:
+    QEMU defaults virtio-mmio to legacy, so both run steps pass
+    `-global virtio-mmio.force-legacy=false`.
+  * **Shell.** `input` shows the queue, device list, scanner configuration and the last events;
+    `input dump <n>` drains events; `input scan <payload>` self-tests a scan with the latency
+    budget; `input viz [s]` is a live panel view with a crosshair (screenshot below);
+    `input prefix/suffix/minlen/gap/charset/reset` configure the scanner; `hid` runs the HID
+    decoders through the same queue. The console merges UART and keyboard characters, and a scan
+    prints an asynchronous `[scan]` line.
+
+**Evidence.** 162 host tests pass (32 of them added here). QEMU 8.2.2 with
+`virtio-keyboard-device` and `virtio-tablet-device`: both bind on virtio-mmio at IRQ 78/79,
+config space classifies them as `tablet` (abs 0..32767 on both axes) and `keyboard`, 72 key
+events arrive from `sendkey`, and QMP absolute input produces 11 tablet events including
+`pointer 351,146`, `button 1 down`, `pointer 702,292 buttons 0x01`, `button 1 up`. A scripted
+13-digit scan arrives as **one** barcode event in the queue (`input dump` shows
+`barcode '4006381333931' 13 chars`); the 269 ms figure is the HMP key-send window, while the
+kernel measures **0 ms** from the committing suffix key to the queued event (budget 20 ms).
+The HID self-test passes, `keymap map 30 31` is recorded and reset, and a boot without any input
+device reports none and keeps the self-tests green. Screenshot:
+`docs/screenshots/phase38-input-monitor.png`.
+
+**Limits.** The USB host controller is phase 39: the HID decoders are tested through the kernel
+queue, not through xHCI enumeration. The status queue is set up and idle; LEDs and force feedback
+are not written yet. Touch is single-contact. Scanners use one configured prefix and suffix.
 
 ### Phase 39 — USB host stack `[ ]`
 **Goal:** Real retail peripherals.
@@ -2357,4 +2420,5 @@ to the OS.
 |---|---|---|
 | 2026-11-13 | 1–12 (Stage A) | Clean `zig build`; 23 host unit tests green; QEMU `virt` boots, parses the device tree (`linux,dummy-virt`, 512 MiB and 1 GiB), reports `selftest … PASS`; timer PPI 30 fires at 1 kHz with zero spurious interrupts; `svc` round trip prints through the syscall path; `textwrite` traps in the MMU with a decoded fault; `panic` prints the captured kernel log. |
 | 2026-11-17 | 37 | EDID parsed from the panel's MMIO blob (`QEMU Monitor`, 1280x800); mode programmed, read back and mapped non-cacheable; framebuffer write/readback PASS; test-pattern, splash and panic-screen screendumps checked pixel for pixel; `fb mode 1024 768` re-modes; boot without a panel stays clean; 130 host tests pass; fixes the PCI command-register gap that left every BAR undecoded |
-| next | 13–20 (Stage B) | interrupt framework refinement, spinlocks, threads, preemptive scheduler, wait queues, SMP bring-up, workqueues, tracing |
+| 2026-11-17 | 38 | virtio keyboard and tablet on virtio-mmio (two queues, 16 posted buffers, IRQ drain and repost, config-space classification, absolute scaling to 1280x800); ordered IRQ-safe event queue with console mirror; HID boot-keyboard/mouse/absolute-pointer decoders; hold-and-decide scanner with prefix/suffix, gap/duration limits and ordered release; key remapping; `input`, `input viz`, `hid`, `keymap`; 162 host tests | QEMU 8.2.2: `QEMU Virtio Keyboard` and `QEMU Virtio Tablet` bind at irq 78/79, tablet abs 0..32767; 72 key events and 11 tablet events (pointer 351,146 → 702,292, button down/up) from `sendkey` and QMP absolute input; a 13-digit burst becomes one `barcode '4006381333931'` event with 0 ms suffix-to-queue delivery (269 ms HMP burst window); HID self-test PASS; boot without input devices clean; screenshot `docs/screenshots/phase38-input-monitor.png` |
+| next | 39 | USB host stack: xHCI init, port reset, enumeration, HID and CDC-ACM classes, hubs, hotplug |

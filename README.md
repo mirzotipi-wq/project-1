@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–37 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–38 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -84,6 +84,7 @@ goes to the serial console is now also on the screen. See
 | 35 | partition tables: GPT primary and backup headers with header and entry-array CRC32 validation and backup fallback, entry iteration with names and attributes, MBR primaries plus the extended/EBR chain with loop bounds, protective-MBR handling, a formatter used as the installer primitive, `part` command | `uprobe` step 21: a self-written GPT parses back with both copies valid, a corrupted primary falls back to the backup, two corrupted copies are refused with `BadEntryCrc`, a 2-primary + 1-logical MBR walks one EBR, and no page is leaked; a parted-made GPT (3 partitions) and a parted-made MBR (2 primaries + 2 logicals) enumerate field for field over the same device |
 | 36 | FAT32 filesystem on a partition-offset block view: BPB validation, FSInfo tolerance, directory walk with LFN read-back, create/read/write/grow/delete with both FAT copies and free-space accounting, at-rest consistency check, formatter, `fat` command | `uprobe` step 22: a 39 MiB scratch volume is formatted and mounted through a partition view, a 2050-byte file is written over 5 clusters, read back byte for byte, deliberately looped and caught, then deleted with 0 orphans and 0 pages leaked; a parted GPT + `mkfs.fat` volume cross-verified with mtools 4.0.48 and `fsck.fat 4.2` in both directions (kernel reads `HOST.TXT` byte-identically, host `mtype` reads the kernel's `SALE.TXT`, `fsck` clean) |
 | 37 | Framebuffer: bochs-display PCI driver (EDID parsed from the device, bochs-dispi mode programming), a non-cacheable VRAM mapping verified by pixel readback, a 5x7 bitmap font, a drawing core (rects, gradients, text, clipping), boot splash, panic-to-screen, `fb` command; also fixes the phase-32 bus gap that left every BAR undecoded | QEMU 8.2.2: EDID reads `QEMU Monitor`, 1280x800 preferred; the mode is programmed, read back and mapped (write/readback `PASS`); the test-pattern screendump was checked pixel for pixel (bars, grey ramp, RGB ramps, grid, four corner markers, mode label); `fb mode 1024 768` re-modes and the screendump is 1024x768; `fb crash` draws the panic screen; a boot without the device logs `no framebuffer` and still passes the self-tests |
+| 38 | Input: virtio keyboard and tablet over a two-queue virtio-mmio driver (16 posted buffers, IRQ drain/repost, EV_BITS/ABS_INFO classification, absolute scaling to the panel, wheel and three buttons), an ordered IRQ-safe event queue with console mirror, USB HID boot-keyboard/mouse/absolute-pointer decoders, a hold-and-decide barcode scanner with prefix/suffix and ordered release, key remapping, `input`, `input viz`, `hid`, `keymap` | QEMU 8.2.2: `QEMU Virtio Keyboard` and `QEMU Virtio Tablet` bind at irq 78/79 with tablet abs 0..32767; 72 key events and 11 tablet events (pointer 351,146 → 702,292 with button down/up) from `sendkey` and QMP absolute input; a 13-digit burst becomes exactly one barcode event with 0 ms suffix-to-queue delivery; HID self-test PASS; boot without input devices clean; 162 host tests |
 
 The remaining 63 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
@@ -118,6 +119,24 @@ The panel has its own command group: `fb` prints the mode, EDID and mapping, `fb
 self-test pattern, `fb mode <w> <h>` re-programs the panel, `fb check` proves the write path by
 reading pixels back through the MMU, and `fb crash` renders the panic screen. Screenshots of the
 splash, the test pattern and the panic screen are in [docs/screenshots](docs/screenshots).
+
+Input has its own command group too. `input` prints the event queue, every registered device
+(keyboard, tablet, absolute range, IRQ), the scanner rules and the last events; `input dump <n>`
+drains the queue; `input scan <payload>` runs a scan through the real state machine and reports
+the latency against the 20 ms budget; `input viz [seconds]` draws a live event monitor with a
+pointer crosshair on the panel; `input prefix`, `suffix`, `minlen`, `gap` and `charset` configure
+the scanner; `hid` decodes USB HID boot reports through the same queue; `keymap` lists, changes
+and resets key remappings. A barcode scanned while the shell is idle prints an asynchronous
+`[scan]` line, and a burst that is not a scan is released as ordinary keystrokes.
+
+The input path is real hardware, not a simulation. QEMU attaches a virtio keyboard and an
+absolute tablet on virtio-mmio; both are classified from their own config space, the tablet's
+0..32767 axes are scaled to the panel, and the keyboard shares one ordered event queue with the
+tablet and the USB HID decoders. The QEMU run steps pass `-global virtio-mmio.force-legacy=false`
+because QEMU still defaults the transport to legacy mode; the kernel only speaks modern virtio 1.0.
+A 13-digit scan arrives as one atomic barcode event with 0 ms from the committing suffix to the
+queued event. The monitor screenshot is
+[phase38-input-monitor.png](docs/screenshots/phase38-input-monitor.png).
 
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
 1 privileged-register attempt, 2 kernel-memory read, 3 two-process isolation, 4 the capability
@@ -170,10 +189,12 @@ src/devices/         PL011 UART
 src/user/            the EL0 demo program and its embedded image
 src/kernel/          logging, panic, pmm, heap, irq, sync, percpu, thread, sched,
                      smp, addrspace, process, uaccess, syscall, machine, shell, pci,
-                     virtio, block, partition, fat32, fb
-src/devices/         PL011, PL031, virtio-mmio, virtio-blk, bochs-display
-src/lib/             freestanding helpers (device tree, EDID, 5x7 font, display modes)
+                     virtio, block, partition, fat32, fb, input
+src/devices/         PL011, PL031, virtio-mmio, virtio-blk, virtio-input, bochs-display
+src/lib/             freestanding helpers (device tree, EDID, 5x7 font, display modes,
+                     keymap, scanner, USB HID decoders)
 tools/mkimage.zig    host-side Image wrapper used by the build
+tools/qemu_input_test.py  boots with virtio keyboard/tablet, drives them over HMP/QMP
 src/tests.zig        host unit-test root
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan

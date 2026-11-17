@@ -38,6 +38,7 @@ const cap = @import("kernel/cap.zig");
 const ipc = @import("kernel/ipc.zig");
 const service = @import("kernel/service.zig");
 const fb = @import("kernel/fb.zig");
+const input = @import("kernel/input.zig");
 
 /// Global kernel state. Single-core for now; phase 18 moves these per-CPU.
 var g_machine: machine.Machine = undefined;
@@ -275,6 +276,11 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     // console was installed above by the firmware handoff so that a driver that
     // fails to probe can still be reported; the pl011 driver re-installs it from
     // the tree, which is why `console` appears in the bound set.
+    // The input core must exist before any driver can publish a key: the
+    // driver model probes keyboard and pointer transports during binding.
+    input.init();
+    klog.info("input", "event queue ready: {d} events, {d} device slots", .{ input.ring_capacity, input.max_devices });
+
     driver.attachMachine(&g_machine);
     virtio.setAllocator(&g_pmm);
     builtin_drivers.installAll();

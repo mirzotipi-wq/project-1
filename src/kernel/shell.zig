@@ -43,7 +43,12 @@ const fb = @import("fb.zig");
 const bochs_display = @import("../devices/bochs_display.zig");
 const virtio_blk = @import("../devices/virtio_blk.zig");
 const virtio_mmio = @import("../devices/virtio_mmio.zig");
+const virtio_input = @import("../devices/virtio_input.zig");
 const pl031 = @import("../devices/pl031.zig");
+const input = @import("input.zig");
+const keymap = @import("../lib/keymap.zig");
+const scanner = @import("../lib/scanner.zig");
+const input_hid = @import("../lib/input_hid.zig");
 const ipc = @import("ipc.zig");
 const shm = @import("shm.zig");
 const elf = @import("elf.zig");
@@ -80,6 +85,9 @@ fn printHelp() void {
         \\  sandbox              service manifests, syscall gate, W^X counters
         \\  devices              driver model: devices, bindings, hotplug counters
         \\  fb [info|test|splash|mode <w> <h>|check]   panel, test pattern, mode
+        \\  input [info|dump <n>|scan <text>|viz <s>|prefix|suffix|minlen|gap|charset|reset]
+        \\  keymap [info|map <from> <to>|reset]        key remapping table
+        \\  hid                  decode USB HID boot reports through the same queue
         \\  blk                  block device and elevator counters
         \\  part                 partition table of the attached disk
         \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
@@ -2426,6 +2434,304 @@ fn cmdDevices() void {
 
 pub const build_version = "0.1.0-dev";
 
+// ---------------------------------------------------------------------------
+// Input subsystem (phase 38)
+// ---------------------------------------------------------------------------
+
+var scanner_prefix: [8]u8 = [_]u8{0} ** 8;
+
+fn parseNum(text: ?[]const u8) ?u32 {
+    const t = text orelse return null;
+    return std.fmt.parseInt(u32, t, 0) catch null;
+}
+
+fn parseChar(text: ?[]const u8) ?u8 {
+    const t = text orelse return null;
+    if (std.mem.eql(u8, t, "enter") or std.mem.eql(u8, t, "cr")) return '\r';
+    if (std.mem.eql(u8, t, "tab")) return '\t';
+    if (std.mem.eql(u8, t, "lf")) return '\n';
+    if (t.len > 2 and (std.mem.startsWith(u8, t, "0x") or std.mem.startsWith(u8, t, "0X"))) {
+        return std.fmt.parseInt(u8, t[2..], 16) catch null;
+    }
+    if (t.len == 1) return t[0];
+    return null;
+}
+
+fn describeScanner() void {
+    const cfg = input.scannerConfig();
+    const s = input.scannerStats();
+    out("  scanner    : suffix 0x{x:0>2}, min {d}, max {d}, gap {d} ms, charset {s}\n", .{
+        cfg.suffix, cfg.min_length, cfg.max_length, cfg.gap_timeout_ms, if (cfg.digits_only) "digits" else "alnum",
+    });
+    if (cfg.prefix.len > 0) out("  prefix      : '{s}'\n", .{cfg.prefix});
+    out("  scans       : {d} committed, {d} released, {d} short, {d} timeouts, {d} overflow\n", .{
+        s.scans, s.released, s.short_scans, s.timeouts, s.overflows,
+    });
+    out("  scan timing : burst last {d} ms, max {d} ms, holding {d} keys\n", .{
+        s.last_latency_ms, s.max_latency_ms, s.held_keys,
+    });
+    const core = input.snapshot();
+    out("  delivery    : last {d} ms, max {d} ms from the suffix key to the queued event (budget 20 ms)\n", .{
+        core.delivery_last_ms, core.delivery_max_ms,
+    });
+}
+
+/// Drop characters a debug view generated itself: typing into `input viz` or
+/// running the HID self-test must not leave a line for the shell to execute.
+fn drainConsole() void {
+    while (input.consoleGetc()) |_| {}
+}
+
+fn cmdInput(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "info";
+
+    if (std.mem.eql(u8, sub, "info")) {
+        const s = input.snapshot();
+        out("  queue       : {d}/{d} pending, {d} pushed, {d} dropped, high water {d}\n", .{
+            input.pending(), input.ring_capacity, s.pushed, s.dropped, s.high_water,
+        });
+        out("  events      : {d} keys, {d} pointers, {d} buttons, {d} scrolls, {d} barcodes, {d} characters\n", .{
+            s.keys, s.pointers, s.buttons, s.scrolls, s.barcodes, s.characters,
+        });
+        out("  console     : {d} pending, {d} dropped, {d} wait wakes\n", .{
+            input.consolePending(), s.console_dropped, s.wait_wakes,
+        });
+        var buf: [96]u8 = undefined;
+        for (input.devicesSlice(), 0..) |*dev, i| {
+            out("  device {d}    : {s}\n", .{ i, input.describeDevice(dev, &buf) });
+        }
+        if (input.devicesSlice().len == 0) out("  device      : none registered\n", .{});
+        describeScanner();
+        virtio_input.describe(out);
+
+        var recent: [input.recent_capacity]input.Event = undefined;
+        const n = input.recentEvents(&recent);
+        if (n > 0) {
+            out("  last {d} events:\n", .{n});
+            for (recent[0..n]) |*ev| {
+                out("    [{d:0>6}] {s}\n", .{ ev.seq, input.describe(ev, &buf) });
+            }
+        }
+    } else if (std.mem.eql(u8, sub, "dump")) {
+        const count = parseNum(tokens.next()) orelse 16;
+        var buf: [96]u8 = undefined;
+        var shown: u32 = 0;
+        while (shown < count) : (shown += 1) {
+            const ev = input.pop() orelse break;
+            out("  [{d:0>6}] {s}\n", .{ ev.seq, input.describe(&ev, &buf) });
+        }
+        if (shown == 0) out("  queue empty\n", .{});
+    } else if (std.mem.eql(u8, sub, "scan")) {
+        const payload = tokens.rest();
+        if (payload.len == 0) {
+            out("  usage: input scan <payload>   (suffix is added for you)\n", .{});
+            return;
+        }
+        const cfg = input.scannerConfig();
+        var text: [scanner.max_payload + 1]u8 = undefined;
+        var n: usize = 0;
+        while (n < payload.len and n < scanner.max_payload) : (n += 1) text[n] = payload[n];
+        text[n] = cfg.suffix;
+        n += 1;
+        const before = input.snapshot().barcodes;
+        const latency = input.feedText(0, text[0..n]);
+        const after = input.snapshot().barcodes;
+        if (latency) |ms| {
+            out("  barcode     : '{s}', {d} chars, one atomic event\n", .{ payload, payload.len });
+            out("  latency     : {d} ms (budget 20 ms) {s}\n", .{ ms, if (ms < 20) "PASS" else "OVER BUDGET" });
+            out("  queue       : {d} new barcode event(s)\n", .{after - before});
+        } else {
+            out("  no scan     : payload shorter than min length {d} (released as keystrokes)\n", .{cfg.min_length});
+        }
+    } else if (std.mem.eql(u8, sub, "viz")) {
+        cmdInputViz(parseNum(tokens.next()) orelse 8);
+    } else if (std.mem.eql(u8, sub, "prefix")) {
+        var cfg = input.scannerConfig();
+        const arg = tokens.next() orelse "";
+        if (arg.len == 0 or std.mem.eql(u8, arg, "-")) {
+            cfg.prefix = "";
+            out("  prefix      : cleared\n", .{});
+        } else {
+            const n = @min(arg.len, scanner_prefix.len);
+            @memcpy(scanner_prefix[0..n], arg[0..n]);
+            cfg.prefix = scanner_prefix[0..n];
+            out("  prefix      : '{s}'\n", .{cfg.prefix});
+        }
+        input.configureScanner(cfg);
+    } else if (std.mem.eql(u8, sub, "suffix")) {
+        var cfg = input.scannerConfig();
+        if (parseChar(tokens.next())) |ch| {
+            cfg.suffix = ch;
+            input.configureScanner(cfg);
+            out("  suffix      : 0x{x:0>2}\n", .{ch});
+        } else {
+            out("  usage: input suffix <char|enter|tab|0xNN>\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "minlen")) {
+        var cfg = input.scannerConfig();
+        const n = parseNum(tokens.next()) orelse 0;
+        cfg.min_length = @min(n, scanner.max_payload);
+        if (cfg.min_length == 0) cfg.min_length = 1;
+        cfg.max_length = @max(cfg.min_length, cfg.max_length);
+        input.configureScanner(cfg);
+        out("  min length  : {d}\n", .{cfg.min_length});
+    } else if (std.mem.eql(u8, sub, "gap")) {
+        var cfg = input.scannerConfig();
+        const n = parseNum(tokens.next()) orelse 0;
+        if (n == 0) {
+            out("  usage: input gap <ms>\n", .{});
+            return;
+        }
+        cfg.gap_timeout_ms = n;
+        input.configureScanner(cfg);
+        out("  max gap     : {d} ms\n", .{cfg.gap_timeout_ms});
+    } else if (std.mem.eql(u8, sub, "charset")) {
+        var cfg = input.scannerConfig();
+        const arg = tokens.next() orelse "";
+        if (std.mem.eql(u8, arg, "digits")) {
+            cfg.digits_only = true;
+        } else if (std.mem.eql(u8, arg, "alnum")) {
+            cfg.digits_only = false;
+        } else {
+            out("  usage: input charset <digits|alnum>\n", .{});
+            return;
+        }
+        input.configureScanner(cfg);
+        out("  charset     : {s}\n", .{if (cfg.digits_only) "digits" else "alnum"});
+    } else if (std.mem.eql(u8, sub, "reset")) {
+        input.resetCounters();
+        out("  counters    : cleared, scanner idle\n", .{});
+    } else {
+        out("  unknown input subcommand: {s}\n", .{sub});
+    }
+}
+
+fn cmdInputViz(seconds: u32) void {
+    const bounded: u32 = @min(seconds, 60);
+    const surface = fb.screen() orelse {
+        out("  viz         : no framebuffer; use 'input dump' instead\n", .{});
+        return;
+    };
+    out("  viz         : {d}s live monitor (events shown are consumed)\n", .{bounded});
+    const start = timer.uptimeMs();
+    var events: [input.recent_capacity]input.Event = undefined;
+    while (timer.uptimeMs() - start < @as(u64, bounded) * 1000) {
+        virtio_input.pollAll();
+        while (input.pop()) |ev| {
+            var shown: [96]u8 = undefined;
+            out("  {s}\n", .{input.describe(&ev, &shown)});
+        }
+        drainConsole();
+
+        const n = input.recentEvents(&events);
+        const cfg = input.scannerConfig();
+        const ss = input.scannerStats();
+        surface.clear(fb.Palette.background);
+        _ = surface.drawText(24, 20, "Cassa - input monitor", 2, fb.Palette.amber);
+        var header: [96]u8 = undefined;
+        const header_text = std.fmt.bufPrint(&header, "scans {d}  released {d}  last {d} ms  max {d} ms  holding {d}  gap {d} ms", .{
+            ss.scans, ss.released, ss.last_latency_ms, ss.max_latency_ms, ss.held_keys, cfg.gap_timeout_ms,
+        }) catch "scanner";
+        _ = surface.drawText(24, 56, header_text, 1, fb.Palette.text_dim);
+        surface.fillRect(24, 72, @intCast(surface.mode.width - 48), 1, fb.Palette.grid);
+
+        var y: i32 = 86;
+        var cursor_x: i32 = -1;
+        var cursor_y: i32 = -1;
+        for (events[0..n]) |*ev| {
+            var shown: [96]u8 = undefined;
+            const text = input.describe(ev, &shown);
+            const color = switch (ev.kind) {
+                .key => fb.Palette.text,
+                .barcode => fb.Palette.green,
+                .pointer, .button, .scroll => fb.Palette.blue,
+                .device => fb.Palette.amber,
+            };
+            _ = surface.drawText(24, y, text, 1, color);
+            y += 14;
+            if (ev.kind == .pointer) {
+                cursor_x = ev.value;
+                cursor_y = ev.aux;
+            }
+        }
+        if (cursor_x >= 0 and cursor_y >= 0) {
+            surface.fillRect(cursor_x - 9, cursor_y, 19, 1, fb.Palette.amber);
+            surface.fillRect(cursor_x, cursor_y - 9, 1, 19, fb.Palette.amber);
+            surface.fillRect(cursor_x - 2, cursor_y - 2, 5, 5, fb.Palette.red);
+        }
+        _ = surface.drawText(24, @as(i32, @intCast(surface.mode.height)) - 22, "panel live: move the pointer or type; the window closes after the set time", 1, fb.Palette.text_dim);
+        sched.sleepMsBlocking(33);
+    }
+    drainConsole();
+    out("  viz         : closed\n", .{});
+}
+
+fn cmdKeymap(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "info";
+    if (std.mem.eql(u8, sub, "info")) {
+        var chars: usize = 0;
+        var code: u16 = 1;
+        while (code < 128) : (code += 1) {
+            if (keymap.evdev(code).isCharacter()) chars += 1;
+        }
+        out("  layout      : evdev code -> US characters, {d} keys mapped\n", .{chars});
+        out("  remaps      : {d} of {d}, {d} hits\n", .{ keymap.remapCount(), 32, keymap.remapHits() });
+        var i: usize = 0;
+        while (keymap.remapAt(i)) |r| : (i += 1) {
+            out("    {d} ({s}) -> {d} ({s})\n", .{ r.from, keymap.evdev(r.from).name, r.to, keymap.evdev(r.to).name });
+        }
+    } else if (std.mem.eql(u8, sub, "map")) {
+        const from = parseNum(tokens.next()) orelse {
+            out("  usage: keymap map <from-code> <to-code>\n", .{});
+            return;
+        };
+        const to = parseNum(tokens.next()) orelse {
+            out("  usage: keymap map <from-code> <to-code>\n", .{});
+            return;
+        };
+        if (from > 0xffff or to > 0xffff) {
+            out("  codes must fit in 16 bits\n", .{});
+            return;
+        }
+        if (keymap.setRemap(@intCast(from), @intCast(to))) {
+            out("  remap       : {s} -> {s}\n", .{ keymap.evdev(@intCast(from)).name, keymap.evdev(@intCast(to)).name });
+        } else {
+            out("  remap table full\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "reset")) {
+        keymap.resetRemaps();
+        out("  remaps      : cleared\n", .{});
+    } else {
+        out("  unknown keymap subcommand: {s}\n", .{sub});
+    }
+}
+
+fn cmdHid() void {
+    var keyboard = input_hid.BootKeyboard{};
+    var changes: [12]input_hid.Change = undefined;
+    var report = [_]u8{0} ** 8;
+    report[2] = 0x0f; // 'l'
+    report[3] = 0x08; // 'e'
+    report[4] = 0x0a; // 'g'
+    report[5] = 0x0c; // 'i'
+    report[6] = 0x16; // 's'
+    const n = keyboard.decode(&report, &changes);
+    for (changes[0..n]) |change| {
+        input.keyEvent(0, input_hid.usageToEvdev(change.usage), change.pressed, keyboard.modifiers);
+    }
+    out("  boot keyboard: {d} transitions, modifiers 0x{x:0>2}\n", .{ n, keyboard.modifiers });
+
+    const mouse = input_hid.decodeBootMouse(&[_]u8{ 0x01, 0x03, 0xfe, 0x00 });
+    input.pointerMove(0, mouse.dx, mouse.dy, mouse.buttons);
+    out("  boot mouse   : buttons 0x{x}, dx {d}, dy {d}\n", .{ mouse.buttons, mouse.dx, mouse.dy });
+
+    const pointer = input_hid.decodeAbsolutePointer(&[_]u8{ 0x00, 0x10, 0x02, 0x20, 0x01 });
+    input.pointerMove(0, pointer.x, pointer.y, pointer.buttons);
+    out("  touch point  : {d},{d} contact {s}\n", .{ pointer.x, pointer.y, if (pointer.contact) "yes" else "no" });
+    drainConsole();
+    out("  HID path     : PASS (reports reach the same kernel queue as virtio)\n", .{});
+}
+
 fn execute(ctx: Context, line: []const u8) void {
     var tokens = std.mem.tokenizeScalar(u8, line, ' ');
     const command = tokens.next() orelse return;
@@ -2492,6 +2798,12 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdDevices();
     } else if (std.mem.eql(u8, command, "fb")) {
         cmdFb(&tokens);
+    } else if (std.mem.eql(u8, command, "input")) {
+        cmdInput(&tokens);
+    } else if (std.mem.eql(u8, command, "keymap")) {
+        cmdKeymap(&tokens);
+    } else if (std.mem.eql(u8, command, "hid")) {
+        cmdHid();
     } else if (std.mem.eql(u8, command, "user")) {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {
@@ -2548,7 +2860,20 @@ pub fn run(ctx: Context) noreturn {
     prompt();
 
     while (true) {
-        if (uart.tryGetc()) |c| {
+        // A device that could not allocate an interrupt is polled here, and
+        // polling also catches completions posted while interrupts were off.
+        virtio_input.pollAll();
+
+        // A barcode scanned while the console is idle is announced on its own
+        // line, so the cashier sees the scan even before the POS app draws it.
+        if (input.takeNotice()) |notice| {
+            // Async line, no prompt: reprinting the prompt here would make the
+            // console look like a command finished, which confuses scripts.
+            out("\n  [scan] {s} ({d} chars, {d} ms burst)\n", .{ notice.text[0..notice.len], notice.len, notice.latency_ms });
+        }
+
+        const received = uart.tryGetc() orelse input.consoleGetc();
+        if (received) |c| {
             switch (c) {
                 '\r', '\n' => {
                     out("\n", .{});

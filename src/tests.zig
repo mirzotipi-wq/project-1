@@ -32,6 +32,10 @@ test {
     _ = @import("kernel/block_view.zig");
     _ = @import("kernel/fat32.zig");
     _ = @import("lib/font5x7.zig");
+    _ = @import("lib/keymap.zig");
+    _ = @import("lib/scanner.zig");
+    _ = @import("lib/input_hid.zig");
+    _ = @import("kernel/input.zig");
     _ = @import("lib/edid.zig");
     _ = @import("lib/display_mode.zig");
     _ = @import("kernel/fb.zig");
