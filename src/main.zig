@@ -37,6 +37,7 @@ const account = @import("kernel/account.zig");
 const cap = @import("kernel/cap.zig");
 const ipc = @import("kernel/ipc.zig");
 const service = @import("kernel/service.zig");
+const fb = @import("kernel/fb.zig");
 
 /// Global kernel state. Single-core for now; phase 18 moves these per-CPU.
 var g_machine: machine.Machine = undefined;
@@ -280,6 +281,13 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     _ = driver.discover(&g_machine);
     driver.bindAll();
     driver.describe();
+    fb.describeInstalled();
+    if (fb.screen() != null) {
+        // A shop terminal must say it is alive the moment the panel is up: the
+        // splash is drawn before the scheduler exists, so a failure after this
+        // point is still visible on the screen, not only on the serial line.
+        fb.bootSplash(shell.build_version, "boot: kernel ready - starting services");
+    }
     if (!driver.isBound("timer")) {
         klog.err("boot", "no generic timer bound: the scheduler cannot run", .{});
         cpu.halt();

@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–28 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–37 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -37,6 +37,12 @@ answers with a reason (ok, unknown, not running, restarting, crash-loop parked) 
 ambient error, a stopped service can be started lazily by name, and a POS program that asks for
 an absent service gets a reason code it can branch on. (Phase 13 is partial: IRQ-safe locks and counters exist, storm throttling does not.
 Phase 19 is deferred until block devices exist.)
+
+The kernel also drives a panel. It reads the monitor's EDID over the bochs-display MMIO BAR,
+programs the preferred mode, maps VRAM as non-cacheable memory, verifies a pixel round trip, and
+draws the boot splash, a deterministic self-test pattern and kernel panics — the same fault that
+goes to the serial console is now also on the screen. See
+[docs/screenshots](docs/screenshots).
 
 | Phase | What exists | How it is verified |
 |---|---|---|
@@ -77,7 +83,9 @@ Phase 19 is deferred until block devices exist.)
 | 34 | block layer: virtio-blk requests (16-byte header, data descriptor, status byte) on the phase-33 split rings, a 64-request elevator that sorts LBA runs while a flush acts as a strict barrier, 3-attempt retry with transport reset and re-negotiation on timeout, the virtio-mmio interrupt routed through the GIC, per-device I/O statistics, `blk` command | `uprobe` step 20: 10000 scattered single-sector writes in 157 elevator batches with 0 errors, byte-exact readback (digest `0xf7c1084666c80b64`), 2 flushes, a forced timeout recovered by reset+retry with the retried data verified; the next boot after a `kill -9` reads generation 1 back and the digest matches |
 | 35 | partition tables: GPT primary and backup headers with header and entry-array CRC32 validation and backup fallback, entry iteration with names and attributes, MBR primaries plus the extended/EBR chain with loop bounds, protective-MBR handling, a formatter used as the installer primitive, `part` command | `uprobe` step 21: a self-written GPT parses back with both copies valid, a corrupted primary falls back to the backup, two corrupted copies are refused with `BadEntryCrc`, a 2-primary + 1-logical MBR walks one EBR, and no page is leaked; a parted-made GPT (3 partitions) and a parted-made MBR (2 primaries + 2 logicals) enumerate field for field over the same device |
 | 36 | FAT32 filesystem on a partition-offset block view: BPB validation, FSInfo tolerance, directory walk with LFN read-back, create/read/write/grow/delete with both FAT copies and free-space accounting, at-rest consistency check, formatter, `fat` command | `uprobe` step 22: a 39 MiB scratch volume is formatted and mounted through a partition view, a 2050-byte file is written over 5 clusters, read back byte for byte, deliberately looped and caught, then deleted with 0 orphans and 0 pages leaked; a parted GPT + `mkfs.fat` volume cross-verified with mtools 4.0.48 and `fsck.fat 4.2` in both directions (kernel reads `HOST.TXT` byte-identically, host `mtype` reads the kernel's `SALE.TXT`, `fsck` clean) |
-The remaining 64 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+| 37 | Framebuffer: bochs-display PCI driver (EDID parsed from the device, bochs-dispi mode programming), a non-cacheable VRAM mapping verified by pixel readback, a 5x7 bitmap font, a drawing core (rects, gradients, text, clipping), boot splash, panic-to-screen, `fb` command; also fixes the phase-32 bus gap that left every BAR undecoded | QEMU 8.2.2: EDID reads `QEMU Monitor`, 1280x800 preferred; the mode is programmed, read back and mapped (write/readback `PASS`); the test-pattern screendump was checked pixel for pixel (bars, grey ramp, RGB ramps, grid, four corner markers, mode label); `fb mode 1024 768` re-modes and the screendump is 1024x768; `fb crash` draws the panic screen; a boot without the device logs `no framebuffer` and still passes the self-tests |
+
+The remaining 63 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -105,6 +113,11 @@ generations and lookup counters), `resolve <name>` (ask the registry for a servi
 reason), `ensure <name>` (start it if it is stopped), `killoop [rounds]` (a launch/kill/reap
 relaunch ladder that hammers the run-queue lifecycle and reports any queue anomaly), and
 `svc`.
+
+The panel has its own command group: `fb` prints the mode, EDID and mapping, `fb test` draws the
+self-test pattern, `fb mode <w> <h>` re-programs the panel, `fb check` proves the write path by
+reading pixels back through the MMU, and `fb crash` renders the panic screen. Screenshots of the
+splash, the test pattern and the panic screen are in [docs/screenshots](docs/screenshots).
 
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
 1 privileged-register attempt, 2 kernel-memory read, 3 two-process isolation, 4 the capability
@@ -156,11 +169,13 @@ src/arch/aarch64/    cpu registers, MMU, exceptions/trap frames, GIC, timer
 src/devices/         PL011 UART
 src/user/            the EL0 demo program and its embedded image
 src/kernel/          logging, panic, pmm, heap, irq, sync, percpu, thread, sched,
-                     smp, addrspace, process, uaccess, syscall, machine, shell
-src/lib/             freestanding helpers (device-tree parser)
+                     smp, addrspace, process, uaccess, syscall, machine, shell, pci,
+                     virtio, block, partition, fat32, fb
+src/devices/         PL011, PL031, virtio-mmio, virtio-blk, bochs-display
+src/lib/             freestanding helpers (device tree, EDID, 5x7 font, display modes)
 tools/mkimage.zig    host-side Image wrapper used by the build
 src/tests.zig        host unit-test root
-docs/                subsystem documentation
+docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan
 ```
 

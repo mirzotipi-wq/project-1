@@ -71,6 +71,8 @@ pub const Function = struct {
     /// MSI: the vector allocated and whether the capability was enabled.
     msi_vector: u32 = 0,
     msi_on: bool = false,
+    /// Command register after the bus enabled decoding.
+    command: u16 = 0,
 };
 
 /// What the platform can do about message-signalled interrupts.
@@ -488,6 +490,47 @@ pub fn assignBars(root: *Root, functions: []Function) usize {
 // Interrupts: MSI first when the platform can, INTx otherwise
 // ---------------------------------------------------------------------------
 
+/// Let every function with a placed BAR actually claim its window.
+///
+/// The command register's memory-space bit is cleared at reset, and until the
+/// kernel sets it the function does not decode its BAR at all: every access
+/// returns all-ones, which looks exactly like a missing device. Phase 32 never
+/// noticed because its devices were reached through the device tree; the phase-37
+/// panel found it when its dispi ID read came back as `0xFFFF` and still passed a
+/// naive range check. Bus mastering is enabled on the same pass for memory-BAR
+/// functions, because the virtio transports and the panel's future DMA path need
+/// to fetch descriptors without a second enumeration walk.
+///
+/// Returns how many functions now decode.
+pub fn enableDecoding(root: *const Root, functions: []Function) usize {
+    var enabled: usize = 0;
+    for (functions) |*f| {
+        if (f.vendor == no_vendor) continue;
+        var has_memory_bar = false;
+        var has_io_bar = false;
+        var any_bar = false;
+        for (f.bars) |bar| {
+            if (bar.kind == .absent or bar.size == 0) continue;
+            any_bar = true;
+            switch (bar.kind) {
+                .mem32, .mem64 => has_memory_bar = true,
+                .io => has_io_bar = true,
+                .absent => {},
+            }
+        }
+        if (!any_bar) continue;
+
+        const command = read16(root, f.bus, f.dev, f.func, 0x04);
+        var want = command | 0x0002; // memory space enable
+        if (has_memory_bar) want |= 0x0004; // bus master
+        if (has_io_bar) want |= 0x0001; // I/O space enable
+        if (want != command) write16(root, f.bus, f.dev, f.func, 0x04, want);
+        f.command = want;
+        enabled += 1;
+    }
+    return enabled;
+}
+
 /// Resolve a legacy interrupt pin through the host bridge's `interrupt-map`.
 ///
 /// Layout, as the PCI binding defines it: the child specifier has as many cells
@@ -664,6 +707,7 @@ pub const Bus = struct {
     count: usize = 0,
     published: usize = 0,
     bars_placed: usize = 0,
+    decoding: usize = 0,
     /// Names and compatible strings live here: the device model keeps slices.
     names: [max_functions][12]u8 = std.mem.zeroes([max_functions][12]u8),
     compats: [max_functions][18]u8 = std.mem.zeroes([max_functions][18]u8),

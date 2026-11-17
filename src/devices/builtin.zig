@@ -11,6 +11,7 @@ const uart = @import("pl011.zig");
 const pl031 = @import("pl031.zig");
 const pci = @import("../kernel/pci.zig");
 const virtio_mmio = @import("virtio_mmio.zig");
+const bochs_display = @import("bochs_display.zig");
 const klog = @import("../kernel/klog.zig");
 
 fn probeConsole(dev: *driver.Device) driver.ProbeError!void {
@@ -58,6 +59,7 @@ fn probePciHost(dev: *driver.Device) driver.ProbeError!void {
     // is wrong; failing here is the loud diagnosis, not a quiet empty bus.
     if (bus.count == 0) return error.Unsupported;
     bus.bars_placed = pci.assignBars(&bus.root, bus.functions[0..bus.count]);
+    bus.decoding = pci.enableDecoding(&bus.root, bus.functions[0..bus.count]);
     pci.connectInterrupts(&bus.root, bus.functions[0..bus.count]);
     _ = pci.publishAll(bus.functions[0..bus.count]);
 
@@ -77,8 +79,8 @@ fn probePciHost(dev: *driver.Device) driver.ProbeError!void {
     if (bus.root.msi_fallbacks != 0) {
         klog.warn("pci", "{d} function(s) advertise MSI but are delivered by INTx: their vector table is not reachable until their transport is driven", .{bus.root.msi_fallbacks});
     }
-    klog.info("pci", "{d} function(s), {d} BAR(s) placed, {d} msi, {d} intx{s}", .{
-        bus.count, bus.bars_placed, msi_count, intx_count,
+    klog.info("pci", "{d} function(s), {d} BAR(s) placed, {d} decoding, {d} msi, {d} intx{s}", .{
+        bus.count, bus.bars_placed, bus.decoding, msi_count, intx_count,
         switch (bus.root.msi) {
             .none => " (no MSI controller: INTx fallback)",
             .its => " (ITS present, not programmed: INTx fallback)",
@@ -170,6 +172,25 @@ const broken_driver = driver.Driver{
     .probe = probeBroken,
 };
 
+/// The panel. Patch 37: the first driver on a PCI function, and the first one
+/// that publishes a framebuffer to the rest of the system. It depends on the
+/// host bridge because it needs its BARs placed before it can program a mode.
+fn probeDisplay(dev: *driver.Device) driver.ProbeError!void {
+    return bochs_display.probe(dev);
+}
+
+fn removeDisplay(dev: *driver.Device) void {
+    bochs_display.remove(dev);
+}
+
+const display_driver = driver.Driver{
+    .name = "display",
+    .compat = &.{"pci,1234:1111"},
+    .deps = &.{"pci-host"},
+    .probe = probeDisplay,
+    .remove = removeDisplay,
+};
+
 pub const all = [_]*const driver.Driver{
     &console_driver,
     &gic_driver,
@@ -177,6 +198,7 @@ pub const all = [_]*const driver.Driver{
     &rtc_driver,
     &pci_host_driver,
     &virtio_driver,
+    &display_driver,
     &broken_driver,
 };
 

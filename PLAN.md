@@ -1879,12 +1879,69 @@ the same image prints `restart: generation 1 read back after an unclean quit, di
     phase-35 `part` command and this `fat` command are separate readers of the same table; a mount
     API shared with a future VFS is the natural next step.
 
-### Phase 37 — Framebuffer `[ ]`
+### Phase 37 — Framebuffer `[x]`
 **Goal:** Pixels on the panel.
 **Build:** Bochs-display driver first (simple linear framebuffer), virtio-GPU second, HDMI
 modesetting later; EDID parsing, double buffering, panic-to-screen handoff.
 **Done when:** A test pattern renders at the panel's native resolution and panics are visible
 on screen, not just serial.
+
+**Shipped.** The first pixels are on a panel, and the path from a PCI function to a legible panic is
+complete end to end. Five pieces:
+
+  * **EDID (`src/lib/edid.zig`).** Base-block parser: header, manufacturer/product/serial, week/year,
+    physical size, eight standard timings, four 18-byte descriptors (detailed timing or display
+    descriptor), range limits, extension count and checksum. A detailed timing decodes
+    hactive/hblank/vactive/vblank, sync offsets and widths, polarity and interlacing, and reports a
+    refresh computed from the pixel clock rather than assumed. Errors are typed (`TooShort`,
+    `BadHeader`, `BadChecksum`, `NoTimings`), and a panel with only standard timings still yields a
+    usable mode.
+  * **Framebuffer core (`src/kernel/fb.zig`).** One pixel path for everything: rectangles with
+    clipping, gradients, `x8r8g8b8`/`r8g8b8`/`r5g6b5` formats, strided rows, bitmap text with
+    scaling and centring, the self-test pattern, the boot splash and the panic screen. Every write is
+    bounds-checked and allocation-free, so the same code is safe from a fault handler with no heap.
+    `verifyReadback()` writes a known colour, reads it back through the MMU and restores the original
+    pixel: proof that the mapping is the memory the device scans out.
+  * **Font (`src/lib/font5x7.zig`).** Printable ASCII as 95 hand-authored 5x7 row-major glyphs
+    (readable Zig literals, not an opaque blob), one blank column of advance, a fallback for anything
+    outside ASCII, and tests that the table is exactly 95 glyphs, that no glyph overflows five
+    columns, and that text metrics exclude the trailing column.
+  * **Bochs-display driver (`src/devices/bochs_display.zig`).** Claims `pci,1234:1111` behind
+    `pci-host`. Classifies the BARs by geometry (VRAM window vs the 4 KiB register page), checks the
+    dispi interface id (rejecting all-ones), reads the EDID blob at offset 0, chooses the preferred
+    mode when it fits VRAM, programs `XRES/YRES/BPP/VIRT_WIDTH/ENABLE` through the directly-addressed
+    bochs registers, reads the mode back, maps the visible VRAM as normal non-cacheable memory
+    (Device-nGnRnE would make every pixel an ordered transaction), publishes the surface, clears it
+    and verifies readback. `fb mode` re-programs and re-maps at runtime.
+  * **Panic-to-screen and splash.** `panic` and every fault now draw a red panic panel with the
+    header, the message wrapped to the panel width, and a footer pointing at the serial console —
+    before the CPU halts, with interrupts off and the other cores stopped. The boot splash is drawn as
+    soon as the driver binds, before the scheduler exists. `fb test` draws a deterministic pattern for
+    a screendump to be checked against.
+
+**A phase-32 bug found by this phase.** The PCI bus never set the command register's memory-space
+enable bit, so no function decoded its BAR: every MMIO read returned all-ones. The old `lspci` output
+looked healthy because nothing had ever read a BAR. The panel made it visible — its dispi id read
+`0xFFFF` and a naive range check accepted it. `pci.enableDecoding` now sets memory space and bus
+mastering per function after BAR placement, records the command word on the function, and the driver
+rejects an all-ones id. This also unblocks PCI-attached virtio transports in later phases.
+
+**Verification (QEMU 8.2.2, `bochs-display,romfile=,xres=1280,yres=800`).** EDID parses to
+manufacturer `EBI` (QEMU), name `QEMU Monitor`, preferred 1280x800; the mode is programmed and read
+back, the mapping covers 4000 KiB, and `fb check` reports readback `PASS`. The test-pattern screendump
+was checked pixel for pixel: eight colour bars, an 8-bit grey ramp, red/green/blue channel ramps, a
+64-pixel grid, one-pixel border, four corner markers naming the channel each corner tests, and the
+mode label. `fb mode 1024 768` re-modes, readback still passes, and the screendump is 1024x768.
+`fb crash` produces the panic screen on the panel with the same message the serial console prints. A
+boot without the device logs `no framebuffer installed` and still passes the boot self-tests. All 130
+host tests pass. Screenshots are in `docs/screenshots/`.
+
+**Limits.** One pixel format family in practice (`x8r8g8b8`; `r8g8b8`/`r5g6b5` exist in the core but
+no driver uses them yet), no double buffering, dirty rectangles or compositor (phase 54), no
+virtio-GPU or HDMI/CEA extension parsing, no DDC/I2C EDID fetch for a panel that does not expose a
+blob, no runtime panel hotplug beyond driver unbind/rebind, and the bitmap font is a placeholder for
+the vector font engine (phase 53). Big-endian scanout is detected and refused rather than drawn with
+swapped channels.
 
 ### Phase 38 — Input subsystem `[ ]`
 **Goal:** Keys, touch, scanner.
@@ -2299,4 +2356,5 @@ to the OS.
 | Date | Phases completed | Evidence |
 |---|---|---|
 | 2026-11-13 | 1–12 (Stage A) | Clean `zig build`; 23 host unit tests green; QEMU `virt` boots, parses the device tree (`linux,dummy-virt`, 512 MiB and 1 GiB), reports `selftest … PASS`; timer PPI 30 fires at 1 kHz with zero spurious interrupts; `svc` round trip prints through the syscall path; `textwrite` traps in the MMU with a decoded fault; `panic` prints the captured kernel log. |
+| 2026-11-17 | 37 | EDID parsed from the panel's MMIO blob (`QEMU Monitor`, 1280x800); mode programmed, read back and mapped non-cacheable; framebuffer write/readback PASS; test-pattern, splash and panic-screen screendumps checked pixel for pixel; `fb mode 1024 768` re-modes; boot without a panel stays clean; 130 host tests pass; fixes the PCI command-register gap that left every BAR undecoded |
 | next | 13–20 (Stage B) | interrupt framework refinement, spinlocks, threads, preemptive scheduler, wait queues, SMP bring-up, workqueues, tracing |

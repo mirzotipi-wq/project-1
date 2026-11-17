@@ -278,6 +278,9 @@ pub fn build(b: *std.Build) void {
         "-nographic",
         "-serial", "mon:stdio",
         "-nic",    "none",
+        // Phase 37's panel. `romfile=` skips the VGA BIOS: the kernel programs
+        // the bochs dispi registers itself and never calls firmware.
+        "-device", "bochs-display,romfile=,xres=1280,yres=800",
         "-no-reboot",
     });
     run_cmd.addArg("-kernel");
@@ -295,6 +298,9 @@ pub fn build(b: *std.Build) void {
         "-nographic",
         "-serial", "mon:stdio",
         "-nic",    "none",
+        // Phase 37's panel. `romfile=` skips the VGA BIOS: the kernel programs
+        // the bochs dispi registers itself and never calls firmware.
+        "-device", "bochs-display,romfile=,xres=1280,yres=800",
         "-no-reboot",
     });
     run_elf.addArg("-kernel");

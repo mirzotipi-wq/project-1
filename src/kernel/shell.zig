@@ -39,6 +39,8 @@ const block = @import("block.zig");
 const partition = @import("partition.zig");
 const block_view = @import("block_view.zig");
 const fat32 = @import("fat32.zig");
+const fb = @import("fb.zig");
+const bochs_display = @import("../devices/bochs_display.zig");
 const virtio_blk = @import("../devices/virtio_blk.zig");
 const virtio_mmio = @import("../devices/virtio_mmio.zig");
 const pl031 = @import("../devices/pl031.zig");
@@ -77,6 +79,7 @@ fn printHelp() void {
         \\  accounting           per-process quotas, usage, OOM scores, watchdog
         \\  sandbox              service manifests, syscall gate, W^X counters
         \\  devices              driver model: devices, bindings, hotplug counters
+        \\  fb [info|test|splash|mode <w> <h>|check]   panel, test pattern, mode
         \\  blk                  block device and elevator counters
         \\  part                 partition table of the attached disk
         \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
@@ -2316,6 +2319,78 @@ fn cmdLspci() void {
 
 /// `devices` — the driver model as the kernel sees it: every device the machine
 /// described, what claimed it, and everything that is still waiting.
+fn cmdFb(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "info";
+
+    if (std.mem.eql(u8, sub, "info")) {
+        bochs_display.describe(out);
+        if (fb.screen()) |surface| {
+            surface.describe(out);
+        } else {
+            out("  surface      : not installed\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "test")) {
+        if (fb.screen()) |surface| {
+            surface.drawTestPattern();
+            out("  test pattern drawn: {d}x{d}, {s}, stride {d}\n", .{
+                surface.mode.width, surface.mode.height, surface.mode.format.label(), surface.mode.stride,
+            });
+            out("  corner markers: red top-left, green top-right, blue bottom-left, white bottom-right\n", .{});
+        } else {
+            out("  no framebuffer: nothing to draw on\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "splash")) {
+        if (fb.screen() == null) {
+            out("  no framebuffer\n", .{});
+            return;
+        }
+        fb.bootSplash(build_version, "panel ready");
+        out("  splash drawn\n", .{});
+    } else if (std.mem.eql(u8, sub, "clear")) {
+        if (fb.screen()) |surface| {
+            surface.clear(fb.Palette.background);
+            out("  cleared to 0x{x:0>6}\n", .{fb.Palette.background});
+        } else {
+            out("  no framebuffer\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "check")) {
+        if (fb.screen()) |surface| {
+            const ok = surface.verifyReadback();
+            out("  framebuffer readback: {s} ({d}x{d}, {d} pixels/frame)\n", .{
+                if (ok) "PASS" else "FAIL", surface.mode.width, surface.mode.height, surface.mode.pixelCount(),
+            });
+        } else {
+            out("  no framebuffer\n", .{});
+        }
+    } else if (std.mem.eql(u8, sub, "mode")) {
+        const w_text = tokens.next() orelse {
+            out("  usage: fb mode <width> <height>\n", .{});
+            return;
+        };
+        const h_text = tokens.next() orelse {
+            out("  usage: fb mode <width> <height>\n", .{});
+            return;
+        };
+        const w = std.fmt.parseInt(u32, w_text, 10) catch {
+            out("  width must be a number\n", .{});
+            return;
+        };
+        const h = std.fmt.parseInt(u32, h_text, 10) catch {
+            out("  height must be a number\n", .{});
+            return;
+        };
+        bochs_display.setMode(w, h) catch |err| {
+            out("  mode change refused: {s}\n", .{@errorName(err)});
+            return;
+        };
+        out("  mode set to {d}x{d}\n", .{ w, h });
+    } else if (std.mem.eql(u8, sub, "crash")) {
+        @panic("panic-to-screen test requested from the shell");
+    } else {
+        out("  usage: fb [info|test|splash|clear|check|mode <w> <h>|crash]\n", .{});
+    }
+}
+
 fn cmdDevices() void {
     out("  device                      state    driver         compatible\n", .{});
     for (driver.allDevices()) |d| {
@@ -2415,6 +2490,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdFat(&tokens);
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();
+    } else if (std.mem.eql(u8, command, "fb")) {
+        cmdFb(&tokens);
     } else if (std.mem.eql(u8, command, "user")) {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {

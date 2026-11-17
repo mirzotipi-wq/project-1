@@ -12,6 +12,7 @@ const klog = @import("klog.zig");
 const symbols = @import("symbols.zig");
 const sched = @import("sched.zig");
 const smp = @import("smp.zig");
+const fb = @import("fb.zig");
 
 fn readSp() usize {
     return asm volatile ("mov %[out], sp"
@@ -58,6 +59,9 @@ pub fn hook(msg: []const u8, first_trace_addr: ?usize) noreturn {
     hexLine("kernel base", @intFromPtr(&symbols.__kernel_start));
     if (first_trace_addr) |addr|     hexLine("first frame", addr);
     uart.writeAll("===========================================================\n");
+    // Panic-to-screen: a store with no cashier at the console must still see
+    // what happened. Drawn through the same pixel path the UI uses.
+    fb.panicScreen("panic: kernel", msg);
     dumpSchedulerTrace();
     dumpCapturedLog();
     uart.writeAll("*** CPU halted ***\n");
@@ -82,6 +86,7 @@ pub fn faultReport(header: []const u8, body: []const u8) noreturn {
         uart.writeAll("\n");
     }
     uart.writeAll("===========================================================\n");
+    fb.panicScreen(header, body);
     dumpSchedulerTrace();
     dumpCapturedLog();
     uart.writeAll("*** CPU halted ***\n");
