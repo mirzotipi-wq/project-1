@@ -47,6 +47,11 @@ const virtio_input = @import("../devices/virtio_input.zig");
 const pl031 = @import("../devices/pl031.zig");
 const input = @import("input.zig");
 const usb_core = @import("usb.zig");
+const power = @import("power.zig");
+const thermal = @import("thermal.zig");
+const journal = @import("journal.zig");
+const wdt = @import("../devices/i6300esb.zig");
+const power_lib = @import("../lib/power.zig");
 const keymap = @import("../lib/keymap.zig");
 const scanner = @import("../lib/scanner.zig");
 const input_hid = @import("../lib/input_hid.zig");
@@ -91,6 +96,12 @@ fn printHelp() void {
         \\  hid                  decode USB HID boot reports through the same queue
         \\  usb [info|poll|selftest|serial <n> send <text>|serial <n> read]
         \\                       xHCI controller, attached USB devices, serial bridge
+        \\  power [info|journal|flush|brownout|poweroff|reboot|selftest|viz <s>|hang]
+        \\                       watchdog, journal, brown-out hooks, shutdown
+        \\  thermal [info|set <mC>|clear|selftest|bench]
+        \\                       thermal zone, throttle ladder, idle injection
+        \\  watchdog [info|kick|selftest]
+        \\                       i6300ESB hardware watchdog
         \\  blk                  block device and elevator counters
         \\  part                 partition table of the attached disk
         \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
@@ -114,7 +125,7 @@ fn printHelp() void {
         \\  reap [n]             spawn n short-lived threads and prove no leak
         \\  preempt              sample three CPU-bound threads (preemption proof)
         \\  logstorm [n]         concurrent logging from n threads / every core
-\\  killloop [rounds]    launch/kill/reap a program in a tight loop
+        \\  killloop [rounds]    launch/kill/reap a program in a tight loop
         \\
         \\  --- user mode (EL0) -----------------------------------------------
         \\  user [mode]          run the EL0 demo: 0 normal, 1 priv op, 2 kernel read, 3 isolation
@@ -537,8 +548,10 @@ fn cmdKillLoop(ctx: Context, tokens: *std.mem.TokenIterator(u8, .scalar)) void {
     });
     out("  threads      : {d} live, queues {d}/{d}/{d}/{d}\n", .{
         sched.threadCount(),
-        percpu.cpus[0].runq_len, percpu.cpus[1].runq_len,
-        percpu.cpus[2].runq_len, percpu.cpus[3].runq_len,
+        percpu.cpus[0].runq_len,
+        percpu.cpus[1].runq_len,
+        percpu.cpus[2].runq_len,
+        percpu.cpus[3].runq_len,
     });
     out("  scheduler    : {d} double-run, {d} invariant violation(s), {d} deferred reap(s), {d} stray ready\n", .{
         sched.double_run_events - dbl_before,
@@ -611,7 +624,6 @@ fn parseArg(tokens: *std.mem.TokenIterator(u8, .scalar), default: u32, min: u32,
     return @min(@max(value, min), max);
 }
 
-
 /// `caps` — the kernel's view of capability objects.
 fn cmdCaps(_: Context) void {
     out("  id  kind         refs  version  epoch  name\n", .{});
@@ -680,10 +692,8 @@ fn cmdElf(_: Context) void {
         while (i < img.count) : (i += 1) {
             const seg = img.segments[i];
             out("    seg {d}: 0x{x} + 0x{x}  {s}{s}{s}\n", .{
-                i, seg.vaddr, seg.memsz,
-                if (seg.read) "r" else "-",
-                if (seg.write) "w" else "-",
-                if (seg.exec) "x" else "-",
+                i,                          seg.vaddr,                   seg.memsz,
+                if (seg.read) "r" else "-", if (seg.write) "w" else "-", if (seg.exec) "x" else "-",
             });
         }
     } else |e| {
@@ -781,12 +791,12 @@ fn cmdService(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
             const s = service.at(i) orelse continue;
             const last = if (s.last_kind.len != 0) s.last_kind else "-";
             out("  {s:<9}  {s:<10}  {d:>4}   {d:>8}  {d:>8}  {d}/{d}   {s}\n", .{
-                s.name, service.stateLabel(s.state), s.pid, s.restarts, s.failures,
-                s.policy.max_restarts, s.policy.base_ms, last,
+                s.name,                service.stateLabel(s.state), s.pid, s.restarts, s.failures,
+                s.policy.max_restarts, s.policy.base_ms,            last,
             });
         }
         out("  {d} registered, {d} starts, {d} restarts, {d} failures, {d} crash loops, {d} reaps\n", .{
-            service.count(), service.starts, service.restarts_total, service.failures_total,
+            service.count(),     service.starts, service.restarts_total, service.failures_total,
             service.crash_loops, service.reaps,
         });
         return;
@@ -940,9 +950,10 @@ fn cmdUprobe(ctx: Context) void {
     const procs_ok = s_own == .exited and s_peer == .exited and s_str == .exited and
         c_own == 0 and c_peer == 0 and c_str == 0;
     out("      pids {d} owner / {d} peer / {d} outsider: {s}/{s}/{s}, codes {d}/{d}/{d}  {s}\n", .{
-        own_pid, peer_pid, str_pid,
-        @tagName(s_own), @tagName(s_peer), @tagName(s_str),
-        c_own, c_peer, c_str, status(procs_ok),
+        own_pid,          peer_pid,         str_pid,
+        @tagName(s_own),  @tagName(s_peer), @tagName(s_str),
+        c_own,            c_peer,           c_str,
+        status(procs_ok),
     });
 
     var objects: u32 = 0;
@@ -993,7 +1004,7 @@ fn cmdUprobe(ctx: Context) void {
     const refusals = elfRefusals();
     out("      refuses bad magic {s}, writable+executable {s}, bad entry {s}, truncated {s}\n", .{
         status(refusals.bad_magic), status(refusals.write_exec),
-        status(refusals.entry), status(refusals.truncated),
+        status(refusals.entry),     status(refusals.truncated),
     });
     const loader_ok = refusals.all();
     const pos_argv = [_][]const u8{ "pos.elf", "alpha", "beta" };
@@ -1214,9 +1225,10 @@ fn cmdUprobe(ctx: Context) void {
     const ipc_ok = s_cli == .exited and s_out == .exited and s_srv == .exited and
         c_cli == 0 and c_out == 0 and c_srv == 0;
     out("      pids {d} server / {d} client / {d} outsider: {s}/{s}/{s}, codes {d}/{d}/{d}  {s}\n", .{
-        srv_pid, cli_pid, out_pid,
+        srv_pid,         cli_pid,         out_pid,
         @tagName(s_cli), @tagName(s_out), @tagName(s_srv),
-        c_srv, c_cli, c_out, status(ipc_ok),
+        c_srv,           c_cli,           c_out,
+        status(ipc_ok),
     });
     out("      ipc: {d} sent, {d} received, {d} replied, {d} timeouts, {d} full, {d} transfers, {d} transfer failures, {d} late\n", .{
         ipc.sends, ipc.receives, ipc.replies, ipc.timeouts, ipc.full_events, ipc.transfers, ipc.transfer_failures, ipc.late_replies,
@@ -1280,7 +1292,7 @@ fn cmdUprobe(ctx: Context) void {
             delays[0] == 5 and delays[1] == 10 and delays[2] == 20 and delays[3] == 40 and
             delays[4] == 80 and delays[5] == 160 and delays[6] == 0;
         out("      killed {d}x: {d} restarts, backoff {d}/{d}/{d}/{d}/{d}/{d} ms, then parked {s}  {s}\n", .{
-            killed, printer.restarts, delays[0], delays[1], delays[2], delays[3], delays[4], delays[5],
+            killed,                            printer.restarts, delays[0], delays[1], delays[2], delays[3], delays[4], delays[5],
             service.stateLabel(printer.state), status(kills_ok),
         });
         out("      printer: {d} restarts, {d} failures, crash loop {d}  {s}\n", .{
@@ -1353,12 +1365,16 @@ fn cmdUprobe(ctx: Context) void {
             service.find("checkout").?.state == .stopped;
         out("      stop: services {s}, live processes {d} -> {d}, spaces {d} -> {d}  {s}\n", .{
             service.stateLabel(service.find("checkout").?.state),
-            live_before, live_after, spaces_before, spaces_after, status(orphan_ok),
+            live_before,
+            live_after,
+            spaces_before,
+            spaces_after,
+            status(orphan_ok),
         });
         lc_ok = lc_ok and orphan_ok;
         out("      services: {d} starts, {d} restarts, {d} failures, {d} crash loops, {d} dumps, {d} reaps\n", .{
-            service.starts, service.restarts_total, service.failures_total,
-            service.crash_loops, dump.total, service.reaps,
+            service.starts,      service.restarts_total, service.failures_total,
+            service.crash_loops, dump.total,             service.reaps,
         });
     }
     pass = verdict(pass, lc_ok, "[13]");
@@ -1378,7 +1394,7 @@ fn cmdUprobe(ctx: Context) void {
         const reg_names_ok = reg_co == .ok and reg_pr == .ok and reg_dup == .duplicate and
             reg_bad == .invalid_name and reg_ghost == .unknown;
         out("      register: {s}, {s}, duplicate {s}, invalid {s}, unknown target {s}  {s}\n", .{
-            names.reasonLabel(reg_co), names.reasonLabel(reg_pr), names.reasonLabel(reg_dup),
+            names.reasonLabel(reg_co),  names.reasonLabel(reg_pr),    names.reasonLabel(reg_dup),
             names.reasonLabel(reg_bad), names.reasonLabel(reg_ghost), status(reg_names_ok),
         });
         reg_ok = reg_ok and reg_names_ok;
@@ -1391,7 +1407,8 @@ fn cmdUprobe(ctx: Context) void {
             invalid.reason == .invalid_name and bare.reason == .invalid_name;
         out("      lookup: stopped {s}, unknown {s}, invalid {s}, bare scheme {s}  {s}\n", .{
             names.reasonLabel(stopped.reason), names.reasonLabel(unknown.reason),
-            names.reasonLabel(invalid.reason), names.reasonLabel(bare.reason), status(lookups_ok),
+            names.reasonLabel(invalid.reason), names.reasonLabel(bare.reason),
+            status(lookups_ok),
         });
         reg_ok = reg_ok and lookups_ok;
 
@@ -1449,7 +1466,8 @@ fn cmdUprobe(ctx: Context) void {
         const restart_ok = saw_restart and after == .ok and after_gen > live.generation;
         out("      restart: during backoff {s}, after {s} gen {d} -> {d}  {s}\n", .{
             if (saw_restart) "restarting" else "-", names.reasonLabel(after),
-            live.generation, after_gen, status(restart_ok),
+            live.generation,                        after_gen,
+            status(restart_ok),
         });
         reg_ok = reg_ok and restart_ok;
 
@@ -1519,7 +1537,7 @@ fn cmdUprobe(ctx: Context) void {
             reg_live_before, reg_live_after, reg_spaces_before, reg_spaces_after, status(reg_clean),
         });
         out("      registry: {d} names, {d} lookups, {d} hits, {d} refusals, {d} lazy starts\n", .{
-            registry.count(), registry.lookups, registry.hits, registry.refusals,
+            registry.count(),     registry.lookups, registry.hits, registry.refusals,
             registry.lazy_starts,
         });
         reg_ok = reg_ok and reg_clean;
@@ -1615,8 +1633,9 @@ fn cmdUprobe(ctx: Context) void {
     });
     out("      watchdog: warn {d}, throttle {d}, kill {d} (quota {d} pages, {d} handles, {d} ms/{d} ms)\n", .{
         account.warnings_total - warns_before, account.throttles_total - throttles_before,
-        account.kills_total - kills_before, leaker_quota.pages, leaker_quota.handles,
-        leaker_quota.cpu_ms, leaker_quota.window_ms,
+        account.kills_total - kills_before,    leaker_quota.pages,
+        leaker_quota.handles,                  leaker_quota.cpu_ms,
+        leaker_quota.window_ms,
     });
     out("      till: {d}/3 checkouts served while the leaker was capped  {s}\n", .{
         acct_served, status(acct_served == 3),
@@ -1636,7 +1655,7 @@ fn cmdUprobe(ctx: Context) void {
         acct_live_before, process.liveCount(), status(acct_clean),
     });
     out("      accounting: {d} samples, {d} warnings, {d} throttles, {d} kills, {d} pressure event(s), {d} victim(s)\n", .{
-        account.samples, account.warnings_total, account.throttles_total, account.kills_total,
+        account.samples,   account.warnings_total,   account.throttles_total, account.kills_total,
         account.pressures, account.pressure_victims,
     });
     acct_ok = acct_ok and acct_clean;
@@ -1825,7 +1844,7 @@ fn cmdUprobe(ctx: Context) void {
     });
     for (bus.functions[0..bus.count]) |*f| {
         out("        {d:0>2}:{d:0>2}.{d} {x:0>4}:{x:0>4} {s}: {s}\n", .{
-            f.bus, f.dev, f.func, f.vendor, f.device, pci.classLabel(f.class_code),
+            f.bus,                                                                         f.dev, f.func, f.vendor, f.device, pci.classLabel(f.class_code),
             if (f.msi_on) "msi" else if (f.intx_routed) "intx routed" else "no interrupt",
         });
     }
@@ -1912,7 +1931,7 @@ fn cmdUprobe(ctx: Context) void {
             t.verified, t.mismatches, t.digest, status(readback_ok),
         });
         out("      flush: {d} completed, {d} timeout(s) ({d} forced), {d} retry(ies), {d} reset(s), last status {d}  {s}\n", .{
-            t.device.flushes, t.device.timeouts, t.fault_resets, t.device.retries, t.device.resets,
+            t.device.flushes,     t.device.timeouts, t.fault_resets, t.device.retries, t.device.resets,
             t.device.last_status, status(io_ok),
         });
         out("      recovery: forced timeout -> {d} retry(ies), {d} transport reset(s), retry data verified  {s}\n", .{
@@ -1933,7 +1952,7 @@ fn cmdUprobe(ctx: Context) void {
             out("      irq: no interrupt property on the transport, completions polled  {s}\n", .{status(disk_irq_ok)});
         }
         out("      io: {d} read(s), {d} write(s), {d} sector(s) read, {d} sector(s) written, {d} io error(s)  {s}\n", .{
-            t.device.reads, t.device.writes, t.device.sectors_read, t.device.sectors_written,
+            t.device.reads,     t.device.writes, t.device.sectors_read, t.device.sectors_written,
             t.device.io_errors, status(io_ok),
         });
     }
@@ -1953,9 +1972,8 @@ fn cmdUprobe(ctx: Context) void {
         var disk_answered = true;
         if (partition.read(.{}, &disk_table)) |_| {
             out("      disk: {s}, {d} partition(s), primary {s}, backup {s}  OK\n", .{
-                partition.schemeName(disk_table.scheme), disk_table.count,
-                if (disk_table.backup_used) "from backup" else if (disk_table.primary_ok) "valid" else "none",
-                if (disk_table.backup_ok) "valid" else "missing",
+                partition.schemeName(disk_table.scheme),                                                       disk_table.count,
+                if (disk_table.backup_used) "from backup" else if (disk_table.primary_ok) "valid" else "none", if (disk_table.backup_ok) "valid" else "missing",
             });
         } else |err| {
             if (err == error.NoTable) {
@@ -2084,9 +2102,9 @@ fn cmdAccounting() void {
         const e = account.entryAt(i) orelse continue;
         shown += 1;
         out("  {d:<5}  {d:>3}/{d:<3}  {d:>3}/{d:<3}  {d:>4}/{d:<4}  {s:<5}  {d:>4}  {d:>3}    {d}/{d}/{d}\n", .{
-            e.pid, e.pages, e.quota.pages, e.handles, e.quota.handles,
-            e.cpu_window, e.quota.cpu_ms, account.levelLabel(e.level), e.score, e.strikes,
-            e.warnings, e.throttles, e.kills,
+            e.pid,        e.pages,        e.quota.pages,               e.handles, e.quota.handles,
+            e.cpu_window, e.quota.cpu_ms, account.levelLabel(e.level), e.score,   e.strikes,
+            e.warnings,   e.throttles,    e.kills,
         });
     }
     out("  {d} tracked process(es), {d} samples: {d} warning(s), {d} throttle(s), {d} kill(s)\n", .{
@@ -2151,9 +2169,23 @@ fn fatEnsureMounted() ?*fat32.Volume {
     return &fat_cmd_vol;
 }
 
+/// The power manager's shutdown path calls this before writing its final
+/// journal record. It is deliberately synchronous and idempotent: a shutdown
+/// may be requested while no FAT volume has ever been mounted.
+fn flushFatForPower() void {
+    if (!fat_cmd_mounted) return;
+    fat_cmd_vol.sync() catch |err| {
+        klog.warn("power", "FAT sync before shutdown failed: {s}", .{@errorName(err)});
+    };
+}
+
 fn cmdFat(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
     const sub = tokens.next() orelse "";
     const vol = fatEnsureMounted() orelse return;
+    vol.refresh() catch |err| {
+        out("  FAT refresh failed: {s}\n", .{@errorName(err)});
+        return;
+    };
     const g = vol.geo;
     if (sub.len == 0 or std.mem.eql(u8, sub, "info")) {
         const entry = &fat_cmd_table.entries[0];
@@ -2237,7 +2269,7 @@ fn cmdFat(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
             c.files, c.dirs, c.clusters_used, c.clusters_allocated,
         });
         out("  {d} loop(s), {d} orphan(s), {d} size error(s), free {d}, FSInfo {d}  {s}\n", .{
-            c.loops, c.orphans, c.size_errors, c.free_count, c.fsinfo_free,
+            c.loops,                                                                  c.orphans, c.size_errors, c.free_count, c.fsinfo_free,
             if (c.free_count_ok) "counter agrees" else "counter differs (tolerated)",
         });
         out("  {s}\n", .{if (c.ok) "consistent" else "INCONSISTENT"});
@@ -2256,14 +2288,14 @@ fn cmdBlk() void {
     const d = virtio_blk.stats;
     out("  disk: {d} sector(s), {d} MiB, features 0x{x}, flush {s}\n", .{
         virtio_blk.capacitySectors(), virtio_blk.capacityBytes() / (1024 * 1024),
-        virtio_blk.deviceFeatures(), if (virtio_blk.flushSupported()) "negotiated" else "absent",
+        virtio_blk.deviceFeatures(),  if (virtio_blk.flushSupported()) "negotiated" else "absent",
     });
     out("  device: reads {d}, writes {d}, flushes {d}, retries {d}, timeouts {d}, resets {d}, io errors {d}, unsupported {d}, last status {d}\n", .{
         d.reads, d.writes, d.flushes, d.retries, d.timeouts, d.resets, d.io_errors, d.unsupported, d.last_status,
     });
     out("  layer: submitted {d}, dispatched {d}, reordered {d}, sectors {d}, bytes {d}, errors {d}\n", .{
         block.stats.submitted, block.stats.dispatched, block.stats.reordered,
-        block.stats.sectors, block.stats.bytes, block.stats.errors,
+        block.stats.sectors,   block.stats.bytes,      block.stats.errors,
     });
     out("  irq: {d} routed, {d} acknowledged\n", .{ virtio_blk.interruptId(), virtio_blk.interruptCount() });
 }
@@ -2278,7 +2310,7 @@ fn cmdPart() void {
         return;
     };
     out("  scheme: {s}, {d} sector(s), base LBA {d}, protective MBR {s}\n", .{
-        partition.schemeName(table.scheme), table.disk_sectors, table.base_lba,
+        partition.schemeName(table.scheme),        table.disk_sectors, table.base_lba,
         if (table.protective_mbr) "yes" else "no",
     });
     if (table.scheme == .gpt) {
@@ -2289,7 +2321,9 @@ fn cmdPart() void {
         out("  primary {s}, backup {s} ({d} entries of {d} bytes at LBA {d})\n", .{
             if (table.primary_ok) "valid" else if (table.backup_used) "from backup" else "invalid",
             if (table.backup_ok) "valid" else "missing",
-            table.entry_capacity, table.entry_size, table.entry_array_lba,
+            table.entry_capacity,
+            table.entry_size,
+            table.entry_array_lba,
         });
     }
     out("  #   kind     type            first        last        size      name\n", .{});
@@ -2312,7 +2346,7 @@ fn cmdVirtio() void {
     out("  slot  base        device      version  queue  features            negotiated\n", .{});
     for (virtio_mmio.info()) |slot| {
         out("  {d:<4}  0x{x:<9} {s:<11} {d:<8} {d:<6} 0x{x:<17} 0x{x}\n", .{
-            slot.index, slot.base, virtio_mmio.deviceName(slot.device_id), slot.version,
+            slot.index,      slot.base,     virtio_mmio.deviceName(slot.device_id), slot.version,
             slot.queue_size, slot.features, slot.negotiated,
         });
     }
@@ -2716,6 +2750,225 @@ fn cmdKeymap(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
     }
 }
 
+fn printJournalRecord(index: usize, r: *const power_lib.JournalRecord) void {
+    var when_buf: [32]u8 = undefined;
+    const when = if (r.wall_sec != 0) pl031.format(pl031.civilFromUnix(r.wall_sec), &when_buf) else "epoch";
+    out("  #{d:<3} {s:<8} {s}  {s}  {d}.{d:0>3} C  {d}%  {s}\n", .{
+        index,                      when,                                      @as([]const u8, @tagName(r.kind)), power_lib.journalKindLabel(r.kind),
+        @divTrunc(r.temp_mc, 1000), @as(u32, @intCast(@mod(r.temp_mc, 1000))), r.throttle_permille / 10,          r.detailSlice(),
+    });
+}
+
+fn printPowerInfo() void {
+    const wi = power.snapshot();
+    const ws = wdt.status();
+    const js = journal.snapshot();
+    const ts = thermal.stats();
+    out("  power       : state {s}, PSCI off/reset available, test hang {s}\n", .{
+        @tagName(wi.state), if (wi.test_hang) "YES" else "no",
+    });
+    out("  watchdog    : {s}, {d} ms/stage ({d} ms total), {d} kick(s), {s}\n", .{
+        if (wdt.present()) "i6300ESB armed" else "absent (graceful fallback)",
+        ws.timeout_ms,
+        ws.timeout_ms * 2,
+        ws.kicks,
+        if (ws.locked) "locked" else "writable",
+    });
+    out("  last reset  : {s}\n", .{
+        if (wi.watchdog_reset) "hardware watchdog reset" else if (wi.had_history) (if (wi.boot_clean) "clean shutdown" else "unclean shutdown") else "first boot on this journal",
+    });
+    out("  journal     : {s}, {d} record(s), seq {d}, {d} flush(es)\n", .{
+        js.reason, js.count, js.seq, js.flushes,
+    });
+    if (journal.last()) |last| printJournalRecord(js.count - 1, last);
+    out("  thermal     : {d}.{d:0>3} C, {s}, throttle {d}%, idle {d}/4, {d} idle tick(s)\n", .{
+        @divTrunc(ts.temp_mc, 1000), @as(u32, @intCast(@mod(ts.temp_mc, 1000))), power_lib.thermalLabel(ts.state),
+        ts.throttle_percent,         thermal.idleQuarters(),                     ts.idle_ticks,
+    });
+    out("  brown-out   : {d} hook(s), {d} event(s), pending {s}\n", .{
+        wi.brownout_hooks, wi.brownout_events, if (power.brownoutPending()) "YES" else "no",
+    });
+    out("  flush path  : {d} filesystem hook(s), journal {s}, block {s}\n", .{
+        wi.storage_hooks,
+        if (js.active) "FAT-backed" else "memory-only",
+        if (block.present()) "attached" else "absent",
+    });
+}
+
+fn cmdPower(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "info";
+    if (std.mem.eql(u8, sub, "info")) {
+        printPowerInfo();
+    } else if (std.mem.eql(u8, sub, "journal")) {
+        const js = journal.snapshot();
+        out("  journal     : {s}, {d} record(s), {d} flush(es)\n", .{ js.reason, js.count, js.flushes });
+        var i: usize = 0;
+        while (i < js.count) : (i += 1) {
+            if (journal.recordAt(i)) |r| printJournalRecord(i, r);
+        }
+        if (js.count == 0) out("  journal     : no records yet\n", .{});
+    } else if (std.mem.eql(u8, sub, "flush")) {
+        const ok = power.flushNow(.maintenance, "manual flush");
+        out("  flush       : {s}\n", .{if (ok) "journal and device synced" else "completed with an error (see log)"});
+    } else if (std.mem.eql(u8, sub, "brownout") or std.mem.eql(u8, sub, "brown-out")) {
+        out("  brown-out   : asserting the detector hook, flushing and powering off\n", .{});
+        power.signalBrownout();
+        power.service();
+        out("  brown-out   : shutdown returned unexpectedly\n", .{});
+    } else if (std.mem.eql(u8, sub, "poweroff") or std.mem.eql(u8, sub, "off")) {
+        power.shutdown(.user);
+    } else if (std.mem.eql(u8, sub, "reboot")) {
+        power.reboot(.user);
+    } else if (std.mem.eql(u8, sub, "selftest")) {
+        out("  [23] power: watchdog, journal, hibernate-free shutdown, thermal throttle\n", .{});
+        const ok = power.selfTest(out);
+        out("  power selftest : {s}\n", .{if (ok) "PASS" else "FAIL"});
+    } else if (std.mem.eql(u8, sub, "hang")) {
+        if (!wdt.present()) {
+            out("  hang        : refused: no hardware watchdog is armed\n", .{});
+            return;
+        }
+        out("  hang        : suppressing scheduler heartbeats; the i6300ESB will reset the machine\n", .{});
+        power.forceHang();
+    } else if (std.mem.eql(u8, sub, "viz")) {
+        cmdPowerViz(parseNum(tokens.next()) orelse 8);
+    } else {
+        out("  usage: power [info|journal|flush|brownout|poweroff|reboot|selftest|viz <s>|hang]\n", .{});
+    }
+}
+
+fn cmdThermal(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "info";
+    if (std.mem.eql(u8, sub, "info")) {
+        const ts = thermal.stats();
+        out("  zone 0      : {d}.{d:0>3} C, {s}, sensor {s}\n", .{
+            @divTrunc(ts.temp_mc, 1000), @as(u32, @intCast(@mod(ts.temp_mc, 1000))), power_lib.thermalLabel(ts.state), ts.sensor_name,
+        });
+        out("  throttle    : {d}% of scheduler ticks to idle ({d}/4), {d} idle tick(s), {d} sample(s), {d} transition(s)\n", .{
+            ts.throttle_percent, thermal.idleQuarters(), ts.idle_ticks, ts.samples, ts.transitions,
+        });
+        out("  ladder      : >=70.000 warm 25%, >=82.000 hot 50%, >=92.000 critical 75%; exits 67/79/89\n", .{});
+        out("  policy      : duty-cycle idle injection; no DVFS assumption on AArch64\n", .{});
+    } else if (std.mem.eql(u8, sub, "set")) {
+        const mc = parseNum(tokens.next()) orelse {
+            out("  usage: thermal set <milli-C>\n", .{});
+            return;
+        };
+        thermal.setTemperature(@intCast(mc));
+        const ts = thermal.stats();
+        out("  zone 0      : {d}.{d:0>3} C, {s}, throttle {d}%\n", .{
+            @divTrunc(ts.temp_mc, 1000), @as(u32, @intCast(@mod(ts.temp_mc, 1000))), power_lib.thermalLabel(ts.state), ts.throttle_percent,
+        });
+    } else if (std.mem.eql(u8, sub, "clear") or std.mem.eql(u8, sub, "reset")) {
+        thermal.clear();
+    } else if (std.mem.eql(u8, sub, "selftest")) {
+        const ok = thermal.selfTest(out);
+        out("  thermal selftest : {s}\n", .{if (ok) "PASS" else "FAIL"});
+    } else if (std.mem.eql(u8, sub, "bench")) {
+        cmdThermalBench();
+    } else {
+        out("  usage: thermal [info|set <milli-C>|clear|selftest|bench]\n", .{});
+    }
+}
+
+fn cmdThermalBench() void {
+    const iterations: u64 = 120_000_000;
+    var acc: u64 = 0x9e37_79b9_7f4a_7c15;
+    const start = timer.uptimeMs();
+    var i: u64 = 0;
+    while (i < iterations) : (i += 1) {
+        acc = acc *% 6364136223846793005 +% 1442695040888963407;
+        if (i & 0x003f_ffff == 0) sched.yieldNow();
+    }
+    const elapsed = timer.uptimeMs() - start;
+    const ts = thermal.stats();
+    out("  bench       : {d} iteration(s) in {d} ms at {s}/{d}% (hash 0x{x:0>16})\n", .{
+        iterations, elapsed, power_lib.thermalLabel(ts.state), ts.throttle_percent, acc,
+    });
+}
+
+fn cmdWatchdog(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "info";
+    const ws = wdt.status();
+    if (std.mem.eql(u8, sub, "info")) {
+        out("  watchdog    : {s}, i6300ESB {s}, BAR 0x{x}, preload 0x{x}\n", .{
+            if (wdt.present()) "armed" else "absent", if (ws.present) "present" else "not probed", ws.mmio, ws.preload,
+        });
+        out("  timeout     : {d} ms per stage, {d} ms to reset, {d} kick(s), {d} disarm(s)\n", .{
+            ws.timeout_ms, ws.timeout_ms * 2, ws.kicks, ws.disarm_count,
+        });
+        out("  boot status : {s}\n", .{if (ws.last_reset_was_watchdog) "previous reset was the watchdog" else "no watchdog reset recorded"});
+    } else if (std.mem.eql(u8, sub, "kick")) {
+        const ok = wdt.kick();
+        out("  watchdog    : {s}, {d} kick(s)\n", .{ if (ok) "kicked" else "not armed", wdt.status().kicks });
+    } else if (std.mem.eql(u8, sub, "selftest")) {
+        const ok = wdt.selfTest();
+        out("  wdt selftest: {s}\n", .{if (ok) "PASS" else "FAIL"});
+    } else {
+        out("  usage: watchdog [info|kick|selftest]\n", .{});
+    }
+}
+
+fn cmdPowerViz(seconds: u32) void {
+    const bounded: u32 = @min(seconds, 60);
+    const surface = fb.screen() orelse {
+        out("  viz         : no framebuffer; use 'power info' instead\n", .{});
+        return;
+    };
+    out("  viz         : {d}s power/thermal dashboard\n", .{bounded});
+    const start = timer.uptimeMs();
+    while (timer.uptimeMs() - start < @as(u64, bounded) * 1000) {
+        power.service();
+        const wi = power.snapshot();
+        const ws = wdt.status();
+        const js = journal.snapshot();
+        const ts = thermal.stats();
+        surface.clear(fb.Palette.background);
+        _ = surface.drawText(24, 20, "Cassa - power and thermal", 2, fb.Palette.amber);
+        var line: [128]u8 = undefined;
+        const headline = std.fmt.bufPrint(&line, "{d}.{d:0>3} C  {s}  throttle {d}%  idle {d}/4", .{
+            @divTrunc(ts.temp_mc, 1000), @as(u32, @intCast(@mod(ts.temp_mc, 1000))), power_lib.thermalLabel(ts.state), ts.throttle_percent, thermal.idleQuarters(),
+        }) catch "thermal";
+        _ = surface.drawText(24, 64, headline, 3, if (ts.throttle_percent >= 50) fb.Palette.red else if (ts.throttle_percent > 0) fb.Palette.amber else fb.Palette.green);
+        const color = if (wdt.present()) fb.Palette.green else fb.Palette.amber;
+        const watchdog_text = if (wdt.present()) "HARDWARE WATCHDOG ARMED" else "NO WATCHDOG - GRACEFUL FALLBACK";
+        _ = surface.drawText(24, 112, watchdog_text, 2, color);
+        const wd = std.fmt.bufPrint(&line, "{d} ms/stage, {d} ms total, {d} kicks", .{ ws.timeout_ms, ws.timeout_ms * 2, ws.kicks }) catch "watchdog";
+        _ = surface.drawText(24, 140, wd, 1, fb.Palette.text_dim);
+        const jtext = std.fmt.bufPrint(&line, "JOURNAL  {s}  {d} records  {d} flushes", .{
+            if (js.active) "Power.JNL on FAT32" else "memory only", js.count, js.flushes,
+        }) catch "journal";
+        _ = surface.drawText(24, 172, jtext, 1, fb.Palette.text);
+        const last_text = if (journal.last()) |last| std.fmt.bufPrint(&line, "LAST  {s}  {s}  {d}.{d:0>3} C", .{
+            power_lib.journalKindLabel(last.kind), last.detailSlice(), @divTrunc(last.temp_mc, 1000), @as(u32, @intCast(@mod(last.temp_mc, 1000))),
+        }) catch "last" else "LAST  first boot";
+        _ = surface.drawText(24, 188, last_text, 1, fb.Palette.amber);
+        surface.fillRect(24, 210, @intCast(surface.mode.width - 48), 1, fb.Palette.grid);
+        _ = surface.drawText(24, 224, "RECENT POWER EVENTS", 1, fb.Palette.text_dim);
+        var y: i32 = 244;
+        const total = js.count;
+        const first = if (total > 5) total - 5 else 0;
+        var i = first;
+        while (i < total) : (i += 1) {
+            if (journal.recordAt(i)) |r| {
+                var when_buf: [32]u8 = undefined;
+                const when = if (r.wall_sec != 0) pl031.format(pl031.civilFromUnix(r.wall_sec), &when_buf) else "epoch";
+                const row = std.fmt.bufPrint(&line, "{s}  {s:<18}  {s}", .{ when, power_lib.journalKindLabel(r.kind), r.detailSlice() }) catch "record";
+                _ = surface.drawText(24, y, row, 1, fb.Palette.text);
+                y += 16;
+            }
+        }
+        const hooks = std.fmt.bufPrint(&line, "brown-out hooks {d}  events {d}  state {s}  fs hooks {d}", .{
+            wi.brownout_hooks, wi.brownout_events, @tagName(wi.state), wi.storage_hooks,
+        }) catch "hooks";
+        _ = surface.drawText(24, 348, hooks, 1, fb.Palette.text_dim);
+        _ = surface.drawText(24, @as(i32, @intCast(surface.mode.height)) - 22, "live dashboard: watchdog, thermal throttle, persistent power journal; closes after the set time", 1, fb.Palette.text_dim);
+        sched.sleepMsBlocking(100);
+    }
+    drainConsole();
+    out("  viz         : closed\n", .{});
+}
+
 /// `usb` — the host controller, the devices the class drivers bound, and the
 /// serial bridge. Enumeration happens on this thread when the loop polls; this
 /// command makes the current state visible and can force a poll.
@@ -2780,7 +3033,7 @@ fn cmdUsb(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
             }
         } else {
             out("  usb serial  : '{s}' [{s}], bulk in {d} out {d}, {s}\n", .{
-                dev.nameSlice(), @tagName(dev.kind), dev.cdc.?.bulk_in, dev.cdc.?.bulk_out,
+                dev.nameSlice(),                          @tagName(dev.kind), dev.cdc.?.bulk_in, dev.cdc.?.bulk_out,
                 if (dev.cdc.?.cdc) "CDC-ACM" else "FTDI",
             });
             out("  usage       : usb serial <n> send <text> | usb serial <n> read\n", .{});
@@ -2890,6 +3143,12 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdHid();
     } else if (std.mem.eql(u8, command, "usb")) {
         cmdUsb(&tokens);
+    } else if (std.mem.eql(u8, command, "power")) {
+        cmdPower(&tokens);
+    } else if (std.mem.eql(u8, command, "thermal")) {
+        cmdThermal(&tokens);
+    } else if (std.mem.eql(u8, command, "watchdog") or std.mem.eql(u8, command, "wdt")) {
+        cmdWatchdog(&tokens);
     } else if (std.mem.eql(u8, command, "user")) {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {
@@ -2927,7 +3186,9 @@ fn execute(ctx: Context, line: []const u8) void {
         @panic("panic requested from the kernel shell");
     } else if (std.mem.eql(u8, command, "reboot")) {
         out("  resetting...\n", .{});
-        cpu.systemReset();
+        power.reboot(.user);
+    } else if (std.mem.eql(u8, command, "poweroff")) {
+        power.shutdown(.user);
     } else if (std.mem.eql(u8, command, "halt")) {
         out("  halted\n", .{});
         cpu.halt();
@@ -2942,6 +3203,7 @@ pub fn run(ctx: Context) noreturn {
     var line: [160]u8 = undefined;
     var len: usize = 0;
 
+    _ = power.registerStorageFlusher(flushFatForPower);
     klog.info("shell", "thread {d} ready on core {d} (type 'help')", .{ sched.running().id, percpu.this().id });
     prompt();
 
@@ -2953,6 +3215,9 @@ pub fn run(ctx: Context) noreturn {
         // changes are consumed on this thread, so hotplug works with or without
         // a routed interrupt.
         usb_core.poll();
+        // Brown-out detectors only set a flag from interrupt context. This is
+        // the normal-context half: flush and power off before the rail falls.
+        power.service();
 
         // A barcode scanned while the console is idle is announced on its own
         // line, so the cashier sees the scan even before the POS app draws it.

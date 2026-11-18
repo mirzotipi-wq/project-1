@@ -40,6 +40,7 @@ const service = @import("kernel/service.zig");
 const fb = @import("kernel/fb.zig");
 const input = @import("kernel/input.zig");
 const usb = @import("kernel/usb.zig");
+const power = @import("kernel/power.zig");
 
 /// Global kernel state. Single-core for now; phase 18 moves these per-CPU.
 var g_machine: machine.Machine = undefined;
@@ -102,7 +103,11 @@ fn setupSp0() void {
     // stack, so SP_EL0 points at a small emergency stack.
     const top = @intFromPtr(&emergency_stack) + emergency_stack.len;
     asm volatile ("msr spsel, #0" ::: "memory");
-    asm volatile ("mov sp, %[top]" :: [top] "r" (top) : "memory");
+    asm volatile ("mov sp, %[top]"
+        :
+        : [top] "r" (top),
+        : "memory"
+    );
     asm volatile ("msr spsel, #1" ::: "memory");
 }
 
@@ -292,6 +297,11 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     _ = driver.discover(&g_machine);
     driver.bindAll();
     driver.describe();
+    // Power comes up after the driver model: the watchdog is a PCI function and
+    // the journal lives on the block device, so both have to be bound first.
+    // The scheduler tick starts kicking the watchdog as soon as interrupts are
+    // unmasked below.
+    power.init();
     fb.describeInstalled();
     if (fb.screen() != null) {
         // A shop terminal must say it is alive the moment the panel is up: the

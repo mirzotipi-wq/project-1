@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–39 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–40 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -86,8 +86,9 @@ goes to the serial console is now also on the screen. See
 | 37 | Framebuffer: bochs-display PCI driver (EDID parsed from the device, bochs-dispi mode programming), a non-cacheable VRAM mapping verified by pixel readback, a 5x7 bitmap font, a drawing core (rects, gradients, text, clipping), boot splash, panic-to-screen, `fb` command; also fixes the phase-32 bus gap that left every BAR undecoded | QEMU 8.2.2: EDID reads `QEMU Monitor`, 1280x800 preferred; the mode is programmed, read back and mapped (write/readback `PASS`); the test-pattern screendump was checked pixel for pixel (bars, grey ramp, RGB ramps, grid, four corner markers, mode label); `fb mode 1024 768` re-modes and the screendump is 1024x768; `fb crash` draws the panic screen; a boot without the device logs `no framebuffer` and still passes the self-tests |
 | 38 | Input: virtio keyboard and tablet over a two-queue virtio-mmio driver (16 posted buffers, IRQ drain/repost, EV_BITS/ABS_INFO classification, absolute scaling to the panel, wheel and three buttons), an ordered IRQ-safe event queue with console mirror, USB HID boot-keyboard/mouse/absolute-pointer decoders, a hold-and-decide barcode scanner with prefix/suffix and ordered release, key remapping, `input`, `input viz`, `hid`, `keymap` | QEMU 8.2.2: `QEMU Virtio Keyboard` and `QEMU Virtio Tablet` bind at irq 78/79 with tablet abs 0..32767; 72 key events and 11 tablet events (pointer 351,146 → 702,292 with button down/up) from `sendkey` and QMP absolute input; a 13-digit burst becomes exactly one barcode event with 0 ms suffix-to-queue delivery; HID self-test PASS; boot without input devices clean; 162 host tests |
 | 39 | USB host stack: xHCI over PCI (BAR mapping, controller reset, command/event/transfer rings, 64-entry DCBAA, slot and endpoint contexts, port reset), descriptor-driven enumeration, HID and CDC-ACM class drivers, FTDI serial bridge, hubs and child devices, unplug/replug, `usb`, `usb selftest`, `usb serial` | QEMU 8.2.2: keyboard slot 1 port 5 and tablet slot 2 port 6 enumerate; 12 key events and pointer 234,97 → 702,268 with button down/up; one `barcode '1234'` from a HID burst; two replug cycles on ports 7/8; a child keyboard behind an 8-port hub; FTDI `hello`/`world` payloads in both directions and across replug; no-controller boot and `usb selftest` PASS; 187 host tests; `tools/qemu_usb_test.py` |
+| 40 | Watchdog and power: real i6300ESB PCI watchdog with a two-stage 4 s reset and previous-reset flag, core-0 scheduler heartbeat, brown-out hooks and emergency service path, FAT32-backed `POWER.JNL` with 72-byte CRC32 records and a 96-record ring, thermal ladder with 0/25/50/75% idle injection, PSCI poweroff/reboot with storage flush, `power`, `thermal`, `watchdog`, `poweroff` | QEMU 8.2.2: forced hang resets in 4 s and the next boot reports `watchdog_boot` with an unclean journal and intact FAT32 file; poweroff and brownout exit 0 and the next boot is clean with the file intact; thermal benchmark 2212 → 3604 ms (1.63x) at critical/75% with 12,990 idle ticks; no-watchdog/no-disk boot PASS with two `OK (degraded)` and `power hang` refused; 197 host tests; `tools/qemu_power_test.py` |
 
-The remaining 61 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 60 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -106,6 +107,10 @@ zig build image     # only the flat arm64 Image container
 `zig build run` invokes `qemu-system-aarch64` from `$PATH` (override with
 `-Dqemu=/path/to/qemu-system-aarch64`) with `-smp 4` (override with `-Dsmp=N`) and attaches
 `qemu-xhci`, `usb-kbd` and `usb-tablet`; `run-nousb` is the same boot without any USB controller.
+The power and thermal paths have their own black-box run: `python3 tools/qemu_power_test.py` boots
+QEMU with an `i6300esb` watchdog and a generated FAT32 disk, then checks forced-hang reset,
+graceful poweroff, brownout shutdown, thermal throttling, the degraded no-hardware boot and the
+dashboard screenshot.
 The kernel
 console is the first PL011 UART; press Enter for a prompt and type `help`. Concurrency can be
 inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
@@ -154,6 +159,9 @@ re-enumerates on the next attach. `usb` prints the controller, rings, ports, dev
 `usb serial <n> read` drive a serial bridge. The live monitor's header names the USB device and
 HID/pointer counters. Screenshot:
 [phase39-usb-input.png](docs/screenshots/phase39-usb-input.png).
+
+Power is not a promise in a log line. QEMU attaches a real Intel 6300ESB watchdog over PCI; the scheduler kicks it every 250 ms on core 0, and `power hang` stops those kicks so the hardware resets the machine. The next boot reads the watchdog's reset flag, reports `previous boot was a watchdog reset`, and opens the FAT32-backed `POWER.JNL` to say whether the previous session ended cleanly. `power poweroff` and `power brownout` both run the same flush path: registered filesystems sync, a final journal record is written, the block device flushes, the watchdog is disarmed, and only then does PSCI power off. Thermal policy is visible in the scheduler: warm/hot/critical inject 25/50/75% idle ticks and `thermal bench` is measurably slower at critical, while `thermal clear` returns to 42 C and normal. `power`, `power journal`, `power selftest`, `thermal`, `watchdog` and the top-level `poweroff` expose all of it; `power viz` is the live dashboard. A machine with neither watchdog nor disk still boots, reports both limitations and passes the self-tests. Screenshot:
+[phase40-power.png](docs/screenshots/phase40-power.png).
 
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
 1 privileged-register attempt, 2 kernel-memory read, 3 two-process isolation, 4 the capability
@@ -206,13 +214,16 @@ src/devices/         PL011 UART
 src/user/            the EL0 demo program and its embedded image
 src/kernel/          logging, panic, pmm, heap, irq, sync, percpu, thread, sched,
                      smp, addrspace, process, uaccess, syscall, machine, shell, pci,
-                     virtio, block, partition, fat32, fb, input, usb
-src/devices/         PL011, PL031, virtio-mmio, virtio-blk, virtio-input, bochs-display, xhci
+                     virtio, block, partition, fat32, fb, input, usb, power,
+                     thermal, journal
+src/devices/         PL011, PL031, virtio-mmio, virtio-blk, virtio-input, bochs-display, xhci,
+                     i6300esb
 src/lib/             freestanding helpers (device tree, EDID, 5x7 font, display modes,
-                     keymap, scanner, USB descriptors/HID/xHCI arithmetic)
+                     keymap, scanner, USB descriptors/HID/xHCI arithmetic, power policy)
 tools/mkimage.zig    host-side Image wrapper used by the build
 tools/qemu_input_test.py  boots with virtio keyboard/tablet, drives them over HMP/QMP
 tools/qemu_usb_test.py    boots xHCI with HID/tablet/hub/FTDI, drives QMP and checks replug
+tools/qemu_power_test.py  watchdog hang/reset, poweroff, brownout, thermal and fallback
 src/tests.zig        host unit-test root
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan

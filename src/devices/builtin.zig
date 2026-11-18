@@ -13,6 +13,7 @@ const pci = @import("../kernel/pci.zig");
 const virtio_mmio = @import("virtio_mmio.zig");
 const bochs_display = @import("bochs_display.zig");
 const xhci_device = @import("xhci.zig");
+const i6300esb = @import("i6300esb.zig");
 const klog = @import("../kernel/klog.zig");
 
 fn probeConsole(dev: *driver.Device) driver.ProbeError!void {
@@ -207,6 +208,20 @@ const usb_driver = driver.Driver{
     .probe = probeUsb,
 };
 
+/// The i6300ESB is QEMU's PCI watchdog and the same programming model as the
+/// Intel 6300ESB south bridge. It depends only on the PCI bus having placed and
+/// enabled its BAR; no interrupt is used.
+fn probeWatchdog(dev: *driver.Device) driver.ProbeError!void {
+    try i6300esb.probe(dev);
+}
+
+const wdt_driver = driver.Driver{
+    .name = "wdt",
+    .compat = &.{"pci,8086:25ab"},
+    .deps = &.{"pci-host"},
+    .probe = probeWatchdog,
+};
+
 pub const all = [_]*const driver.Driver{
     &console_driver,
     &gic_driver,
@@ -216,6 +231,7 @@ pub const all = [_]*const driver.Driver{
     &virtio_driver,
     &display_driver,
     &usb_driver,
+    &wdt_driver,
     &broken_driver,
 };
 

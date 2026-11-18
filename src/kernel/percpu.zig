@@ -28,6 +28,9 @@ pub const Cpu = struct {
     need_resched: bool = false,
     /// Ticks remaining in the running thread's slice.
     slice_left: u32 = 0,
+    /// Set by the thermal governor in this tick: the next scheduling decision
+    /// must give this tick to the idle thread instead of more user work.
+    thermal_idle: bool = false,
     /// Physical address currently in TTBR0_EL1 (0 until the first switch).
     /// Cached so a context switch between threads that share an address space
     /// does not flush the TLB for nothing.

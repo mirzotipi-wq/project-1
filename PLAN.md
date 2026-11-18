@@ -2078,11 +2078,94 @@ device behind a high-speed hub. The device table holds 8 slots and 16 devices; c
 are limited to the 4 KiB scratch page. CDC-ACM is host-tested but not exercised against a real
 CDC-ACM peripheral; the FTDI bridge is the real serial proof.
 
-### Phase 40 — Watchdog and power `[ ]`
+### Phase 40 — Watchdog and power `[x]`
 **Goal:** Recover from hangs; behave on power loss.
 **Build:** Hardware watchdog kick from the scheduler, brown-out detection hooks, thermal
 throttling, graceful shutdown path that flushes the journal.
 **Done when:** A forced kernel hang resets the terminal and boots to a consistent state.
+
+**Shipped.** Power is a coordinator with four independently testable pieces: a real PCI
+watchdog, a scheduler heartbeat, a persistent event journal, and a thermal policy that changes
+what the scheduler does. The host-testable math and record format live in `src/lib/power.zig`;
+the devices and I/O live in the kernel.
+
+  * **i6300ESB watchdog (`src/devices/i6300esb.zig`, `src/devices/builtin.zig`).** The phase-32
+    PCI registry publishes QEMU's Intel 6300ESB function (`8086:25ab`) as a `wdt` driver. The driver
+    maps BAR0 as Device memory, programs the two-stage timer through PCI config 0x60/0x68 using
+    the direct ECAM byte/word accesses the part requires, preloads both stages for 2 s (4 s total),
+    kicks the reload register from the scheduler, reads the previous-reset flag before clearing it,
+    and disarms before a planned shutdown. A locked/nowayout configuration is reported, not hidden.
+  * **Scheduler heartbeat (`src/kernel/sched.zig`, `src/kernel/percpu.zig`).** The tick on core 0
+    kicks the watchdog every 250 ms. If the scheduler stops, the kicks stop with it; other cores
+    continuing to tick cannot keep the machine alive. `power hang` sets one atomic flag that
+    suppresses every heartbeat and then disables this core's interrupts, so the reset is caused by
+    the hardware timer rather than a software path. The next boot reads the watchdog's reset flag
+    and records why the previous session ended.
+  * **Power coordinator (`src/kernel/power.zig`).** Boot history, brown-out hooks, storage
+    flushers, journal boot/selftest records, `flushNow`, clean shutdown, reboot, forced hang and
+    the degraded-hardware self-test. Shutdown runs the same flush path as `power flush`: every
+    registered filesystem syncs, the journal gets its final record, the block device flushes, and
+    only then does PSCI power off. A brown-out ISR only publishes an atomic flag; the shell's
+    `power.service()` performs the emergency flush and shutdown in normal context.
+  * **Persistent journal (`src/kernel/journal.zig`).** `POWER.JNL` on FAT32 partition 1 is an
+    append-only power event log, not a filesystem journal (CASSAFS's write-ahead journal is phase
+    43). Records are fixed 72-byte little-endian entries with a magic, version, sequence, uptime,
+    wall clock, temperature, throttle and CRC32; decoding stops at the first torn or foreign
+    record. A 96-record ring evicts the oldest entry, whole-file flush rewrites the file and asks
+    the device to flush, and the journal reads it back. The file survives the machine reset, and
+    a manual `power flush` is recorded as a power event rather than a clean shutdown.
+  * **Thermal policy (`src/kernel/thermal.zig`, `src/lib/power.zig`).** A zone starts at 42 C on
+    the explicitly labelled virtual sensor; a board can register a real sensor without changing
+    the policy. The ladder is normal/warm/hot/critical at 70/82/92 C with 67/79/89 C hysteresis,
+    mapping to 0/25/50/75% idle ticks. On a throttled tick the scheduler runs the core's idle
+    thread, whose `wfi` is the actual thermal relief; the counters count injected idle ticks, not
+    intentions. `thermal set`, `clear`, `selftest` and `bench` expose the policy.
+  * **Shell and degraded boot.** `power [info|journal|flush|brownout|poweroff|reboot|selftest|viz|hang]`,
+    `thermal [info|set|clear|selftest|bench]`, `watchdog [info|kick|selftest]`, a top-level
+    `poweroff`, and `power viz` (live panel dashboard). The boot path works with no watchdog and
+    no disk: the watchdog is reported absent, the journal is memory-only, `power selftest` reports
+    both as `OK (degraded)`, and `power hang` is refused because there is no hardware to recover it.
+    `reboot` and `poweroff` route through the coordinator so the flush and disarm paths cannot
+    drift from the tested shutdown path.
+
+**Evidence.** `zig build` clean; **197 host tests pass**, up from 187 (+10 tests in
+`src/lib/power.zig`). `tools/qemu_power_test.py` runs six QEMU 8.2.2 scenarios and passes:
+
+  * **Forced hang.** With a real `i6300esb` and a 65 MiB FAT32 disk, the harness writes
+    `WATCHDOG.TXT`, flushes, then runs `power hang`. The machine resets in the 4 s window, boots
+    again, and reports `previous boot was a watchdog reset` and an unclean journal; the journal
+    contains `watchdog_boot`, the file is readable and `fat check` is consistent.
+  * **Graceful shutdown.** `power poweroff` flushes, disarms, exits QEMU with status 0, and the
+    next boot reports a clean shutdown with the file intact; `power selftest` passes on the real
+    watchdog and FAT-backed journal.
+  * **Brown-out.** `power brownout` runs one board hook, flushes and powers off with status 0;
+    the next boot is clean and the journal records the brownout, with the file intact.
+  * **Thermal.** A normal benchmark took **2212 ms**; at `thermal set 96000` the same workload
+    took **3604 ms** (1.63x slower) at critical/75%, with **12,990 injected idle ticks**, and
+    `thermal clear` restored 42.000 C. The host tests cover the ladder boundaries, hysteresis and
+    exact duty-cycle pattern.
+  * **Degraded boot.** No watchdog and no disk: both are reported as absent/memory-only,
+    `power selftest` is PASS with two `OK (degraded)` lines, and `power hang` is refused.
+  * **Visual evidence.** `docs/screenshots/phase40-power.png` is the live `power viz` dashboard
+    showing critical/75%, the armed watchdog, the FAT-backed journal and three recent records.
+
+The phase-38 input harness and phase-39 USB harness both still pass. Representative boot lines:
+`i6300ESB at BAR 0x11001000: 2000 ms preload 0x7f3, two-stage reset, 4000 total`, `power PSCI off/reset ready, watchdog armed, journal FAT32 partition 1`, and after a hang `previous boot ended
+in a hardware watchdog reset`.
+
+**Limits.** The watchdog driver is specific to the i6300ESB programming model; another board's
+watchdog needs its own driver behind the same coordinator. Only core 0 kicks it, so a hang confined
+to another core that leaves core 0 scheduling is not detected by the watchdog (the scheduler's own
+stall/accounting paths still apply). There is no NMI, stack dump or crash record before a watchdog
+reset; the reset is the recovery, not a diagnosis. `POWER.JNL` is a single FAT32 file on partition
+1, rewritten whole, with a 96-record ring and a 24-byte detail field; it is not CASSAFS, has no
+redundant copy or atomic rename, and a manual flush is deliberately not a clean-shutdown record.
+Thermal control is duty-cycle idle injection, not DVFS; QEMU has only the virtual sensor, and the
+thresholds, four-step ladder and 4-tick granularity are compile-time policy. Brown-out detection is
+a hook/API (`signalBrownout`) with no PMIC/ADC driver yet, and its shutdown is serviced by the shell
+loop, so a shell blocked in a long command delays the emergency flush. Poweroff/reboot depend on
+PSCI; `halt` with an armed watchdog still resets after the timeout, which is the phase-5 explicit
+halt policy. There is no suspend, hibernate or RTC wake.
 
 ---
 
@@ -2481,3 +2564,4 @@ to the OS.
 | 2026-11-17 | 37 | EDID parsed from the panel's MMIO blob (`QEMU Monitor`, 1280x800); mode programmed, read back and mapped non-cacheable; framebuffer write/readback PASS; test-pattern, splash and panic-screen screendumps checked pixel for pixel; `fb mode 1024 768` re-modes; boot without a panel stays clean; 130 host tests pass; fixes the PCI command-register gap that left every BAR undecoded |
 | 2026-11-17 | 38 | virtio keyboard and tablet on virtio-mmio (two queues, 16 posted buffers, IRQ drain and repost, config-space classification, absolute scaling to 1280x800); ordered IRQ-safe event queue with console mirror; HID boot-keyboard/mouse/absolute-pointer decoders; hold-and-decide scanner with prefix/suffix, gap/duration limits and ordered release; key remapping; `input`, `input viz`, `hid`, `keymap`; 162 host tests | QEMU 8.2.2: `QEMU Virtio Keyboard` and `QEMU Virtio Tablet` bind at irq 78/79, tablet abs 0..32767; 72 key events and 11 tablet events (pointer 351,146 → 702,292, button down/up) from `sendkey` and QMP absolute input; a 13-digit burst becomes one `barcode '4006381333931'` event with 0 ms suffix-to-queue delivery (269 ms HMP burst window); HID self-test PASS; boot without input devices clean; screenshot `docs/screenshots/phase38-input-monitor.png` |
 | 2026-11-18 | 39 | USB host stack: xHCI controller (PCI, reset, command/event/transfer rings, 64-entry DCBAA, slots and endpoint contexts, port reset), descriptor-driven enumeration, HID keyboard/tablet plus barcode burst, CDC-ACM and FTDI serial, hubs, hotplug; `usb`, `usb selftest`, `usb serial`; 187 host tests (+25); QEMU 8.2.2: keyboard slot 1 port 5 and tablet slot 2 port 6, 12 key events and pointer 234,97 → 702,268 with button down/up, `barcode '1234'` in 82 ms, two unplug/replug cycles on ports 7/8, hub with a child keyboard, FTDI `hello`/`world` payloads both ways and across replug, no-controller boot PASS; phase 38 harness PASS; screenshot `docs/screenshots/phase39-usb-input.png` |
+| 2026-11-18 | 40 | Watchdog and power: real QEMU i6300ESB PCI watchdog with two-stage 4 s reset and previous-reset flag, core-0 scheduler heartbeat every 250 ms, fault-injection hang, brown-out hook/service path, FAT32-backed `POWER.JNL` (72-byte CRC32 records, 96-record ring, boot/clean/brownout/reboot/watchdog/selftest), thermal ladder with 0/25/50/75% `wfi` idle injection, PSCI poweroff/reboot with storage flush, `power`, `thermal`, `watchdog`, `poweroff`; 197 host tests (+10); QEMU 8.2.2: forced hang reset → watchdog_boot/unclean journal/file intact, poweroff and brownout both exit 0 with clean next boot, thermal 2212 → 3604 ms (1.63x) at critical/75%, no-watchdog/no-disk boot PASS with two `OK (degraded)`, phase 38/39 harnesses PASS; `tools/qemu_power_test.py`; screenshot `docs/screenshots/phase40-power.png` |

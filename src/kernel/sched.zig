@@ -27,6 +27,8 @@ const symbols = @import("symbols.zig");
 const klog = @import("klog.zig");
 const pmm = @import("pmm.zig");
 const smp = @import("smp.zig");
+const power = @import("power.zig");
+const thermal = @import("thermal.zig");
 
 pub const Thread = thread_mod.Thread;
 pub const State = thread_mod.State;
@@ -281,6 +283,11 @@ fn makeReadyLocked(pc: *percpu.Cpu, t: *Thread) void {
 pub fn tick() void {
     const pc = percpu.this();
     pc.ticks += 1;
+    // Core 0 owns the hardware watchdog heartbeat. If this tick stops, the
+    // i6300ESB stage-1 timer expires and resets the machine.
+    power.tick(pc.id);
+    pc.thermal_idle = thermal.tick(pc.id);
+    if (pc.thermal_idle) pc.need_resched = true;
     wakeSleepers(timer.uptimeMs());
     reapAll();
     auditQueues();
@@ -416,9 +423,8 @@ pub fn dumpState(tag: []const u8) void {
     for (&thread_mod.table) |*t| {
         if (t.state == .unused) continue;
         klog.err("sched", "thread {d} '{s}': {s} on_cpu={} cpu {d} runs {d} sp 0x{x} kill={} wake={} pending={} next={d}", .{
-            t.id, t.nameSlice(), t.state.label(), t.on_cpu, t.cpu, t.runs, t.sp,
-            t.kill_requested, t.wake_at_ms, t.pending_wake,
-            if (t.next) |n| n.id else 0,
+            t.id,             t.nameSlice(), t.state.label(), t.on_cpu,                    t.cpu, t.runs, t.sp,
+            t.kill_requested, t.wake_at_ms,  t.pending_wake,  if (t.next) |n| n.id else 0,
         });
     }
 }
@@ -477,18 +483,25 @@ pub fn reschedule(frame: *trap.Frame) *trap.Frame {
     var next: *Thread = undefined;
     var from_queue = false;
     var scanned: u32 = 0;
+    const force_idle = pc.thermal_idle and pc.idle != null and pc.current != pc.idle.?;
+    pc.thermal_idle = false;
     while (true) {
-        if (popHead(pc)) |t| {
+        if (force_idle) {
+            // Thermal duty cycle: spend this tick in the idle thread's `wfi`
+            // rather than on another slice of user work.
+            next = pc.idle.?;
+            break;
+        } else if (popHead(pc)) |t| {
             next = t;
             from_queue = true;
         } else if (stealLocked(pc)) |t| {
             next = t;
             from_queue = true;
         } else {
-        // This core's own idle thread: it is not in any queue and it is
-        // legitimately `on_cpu` while it runs, so it must not be judged by the
-        // queue-entry rules below.
-        next = pc.idle.?;
+            // This core's own idle thread: it is not in any queue and it is
+            // legitimately `on_cpu` while it runs, so it must not be judged by the
+            // queue-entry rules below.
+            next = pc.idle.?;
             break;
         }
         // A throttled thread keeps its readiness and its single queue entry; it

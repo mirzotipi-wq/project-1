@@ -638,6 +638,23 @@ pub const Volume = struct {
         return freed;
     }
 
+    /// Write the cached FAT/FSInfo sector and ask the device to make it
+    /// durable. The power path calls this before the final shutdown record is
+    /// written, so a mounted filesystem is never left with a dirty cache.
+    pub fn sync(self: *Volume) Error!void {
+        try self.flush();
+    }
+
+    /// Another mount of the same partition may have changed the FAT or the
+    /// directory since this volume last read them (the power journal and the
+    /// shell's `fat` command are two such mounts). Flush what this volume owns,
+    /// then drop the cached FAT sector so the next operation re-reads it.
+    pub fn refresh(self: *Volume) Error!void {
+        try self.flush();
+        self.fat_cache_valid = false;
+        self.free_hint = 2;
+    }
+
     pub fn freeCount(self: *Volume) Error!u32 {
         var used: u32 = 0;
         var cluster: u32 = 2;

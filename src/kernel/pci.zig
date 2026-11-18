@@ -161,6 +161,65 @@ fn read8At(root: *const Root, bus: u8, dev: u8, func: u8, off: u16) u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Configuration access for bound drivers
+// ---------------------------------------------------------------------------
+
+/// A driver that needs a vendor-specific configuration register (the i6300ESB
+/// watchdog has two, at 0x60 and 0x68) goes through the same ECAM path as the
+/// enumerator. Writes are rebuilt into an aligned 32-bit access because a
+/// byte or word store to configuration space is not portable across root
+/// complexes; the read/modify/write is what the PCI spec's own drivers do.
+pub fn configRead8(bus: u8, dev: u8, func: u8, off: u16) u8 {
+    return read8At(&g_bus.root, bus, dev, func, off);
+}
+
+pub fn configRead16(bus: u8, dev: u8, func: u8, off: u16) u16 {
+    return read16(&g_bus.root, bus, dev, func, off);
+}
+
+pub fn configWrite8(bus: u8, dev: u8, func: u8, off: u16, value: u8) void {
+    const word_off = off & 0xFFFC;
+    const shift: u5 = @intCast((off & 3) * 8);
+    const mask: u32 = @as(u32, 0xFF) << shift;
+    var word = read32(&g_bus.root, bus, dev, func, word_off);
+    word = (word & ~mask) | ((@as(u32, value) << shift) & mask);
+    write32(&g_bus.root, bus, dev, func, word_off, word);
+}
+
+pub fn configWrite16(bus: u8, dev: u8, func: u8, off: u16, value: u16) void {
+    write16(&g_bus.root, bus, dev, func, off, value);
+}
+
+/// A byte access to ECAM, for a device whose custom configuration register is
+/// decoded by access size (the i6300ESB lock register is a one-byte write in
+/// its model). PCIe ECAM permits 1/2/4-byte accesses; this is the narrow case
+/// where a read/modify/write of the containing word would be decoded as a
+/// four-byte write and ignored by the device.
+pub fn configWrite8Direct(bus: u8, dev: u8, func: u8, off: u16, value: u8) void {
+    const addr = ecamAddress(&g_bus.root, bus, dev, func, off & 0xFFC) + (off & 3);
+    const p: *volatile u8 = @ptrFromInt(addr);
+    p.* = value;
+}
+
+pub fn configRead8Direct(bus: u8, dev: u8, func: u8, off: u16) u8 {
+    const addr = ecamAddress(&g_bus.root, bus, dev, func, off & 0xFFC) + (off & 3);
+    const p: *volatile u8 = @ptrFromInt(addr);
+    return p.*;
+}
+
+pub fn configWrite16Direct(bus: u8, dev: u8, func: u8, off: u16, value: u16) void {
+    const addr = ecamAddress(&g_bus.root, bus, dev, func, off & 0xFFC) + (off & 2);
+    const p: *volatile u16 = @ptrFromInt(addr);
+    p.* = value;
+}
+
+pub fn configRead16Direct(bus: u8, dev: u8, func: u8, off: u16) u16 {
+    const addr = ecamAddress(&g_bus.root, bus, dev, func, off & 0xFFC) + (off & 2);
+    const p: *volatile u16 = @ptrFromInt(addr);
+    return p.*;
+}
+
+// ---------------------------------------------------------------------------
 // Device tree description of the bridge
 // ---------------------------------------------------------------------------
 
@@ -855,9 +914,9 @@ test "ranges decode finds the windows without being told the parent width" {
     var windows: [4]Window = undefined;
     var prop: [21 * 4]u8 = undefined;
     const words = [_]u32{
-        0x0100_0000, 0x0, 0x0, 0x0,      0x3eff_0000, 0x0, 0x1_0000,
+        0x0100_0000, 0x0, 0x0, 0x0,         0x3eff_0000, 0x0, 0x1_0000,
         0x0200_0000, 0x0, 0x0, 0x1000_0000, 0x1000_0000, 0x0, 0x2eff_0000,
-        0x0300_0000, 0x0, 0x0, 0x0,          0x0,     0x0, 0x0,
+        0x0300_0000, 0x0, 0x0, 0x0,         0x0,         0x0, 0x0,
     };
     for (words, 0..) |w, i| std.mem.writeInt(u32, prop[i * 4 ..][0..4], w, .big);
     const list = parseRanges(&prop, 3, 2, &windows).?;
