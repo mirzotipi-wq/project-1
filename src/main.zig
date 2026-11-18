@@ -39,6 +39,7 @@ const ipc = @import("kernel/ipc.zig");
 const service = @import("kernel/service.zig");
 const fb = @import("kernel/fb.zig");
 const input = @import("kernel/input.zig");
+const usb = @import("kernel/usb.zig");
 
 /// Global kernel state. Single-core for now; phase 18 moves these per-CPU.
 var g_machine: machine.Machine = undefined;
@@ -280,6 +281,10 @@ pub export fn kmain(dtb: usize) callconv(.C) noreturn {
     // driver model probes keyboard and pointer transports during binding.
     input.init();
     klog.info("input", "event queue ready: {d} events, {d} device slots", .{ input.ring_capacity, input.max_devices });
+    // The USB core registers its controller callbacks before any driver probes,
+    // so an xHCI device found during binding already has somewhere to deliver
+    // its first port-change and HID report.
+    usb.init();
 
     driver.attachMachine(&g_machine);
     virtio.setAllocator(&g_pmm);

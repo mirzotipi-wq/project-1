@@ -288,6 +288,11 @@ pub fn build(b: *std.Build) void {
         // pointer (tablet), both on virtio-mmio like every other device here.
         "-device", "virtio-keyboard-device",
         "-device", "virtio-tablet-device",
+        // Phase 39's USB host controller and two real USB HID devices. They
+        // enumerate over xHCI and feed the same input event stream as virtio.
+        "-device", "qemu-xhci",
+        "-device", "usb-kbd",
+        "-device", "usb-tablet",
         "-no-reboot",
     });
     run_cmd.addArg("-kernel");
@@ -315,12 +320,40 @@ pub fn build(b: *std.Build) void {
         // pointer (tablet), both on virtio-mmio like every other device here.
         "-device", "virtio-keyboard-device",
         "-device", "virtio-tablet-device",
+        // Phase 39's USB host controller and two real USB HID devices. They
+        // enumerate over xHCI and feed the same input event stream as virtio.
+        "-device", "qemu-xhci",
+        "-device", "usb-kbd",
+        "-device", "usb-tablet",
         "-no-reboot",
     });
     run_elf.addArg("-kernel");
     run_elf.addArtifactArg(kernel);
     const run_elf_step = b.step("run-elf", "Boot the ELF directly (no firmware handoff)");
     run_elf_step.dependOn(&run_elf.step);
+
+    // The same machine without a USB controller: the no-USB boot must still
+    // reach the shell, report no USB devices, and pass its self-tests.
+    const run_nousb = b.addSystemCommand(&.{
+        qemu,
+        "-machine", "virt",
+        "-cpu",   "cortex-a53",
+        "-m",     "512M",
+        "-smp",   smp,
+        "-nographic",
+        "-serial", "mon:stdio",
+        "-nic",    "none",
+        "-global", "virtio-mmio.force-legacy=false",
+        "-device", "bochs-display,romfile=,xres=1280,yres=800",
+        "-device", "virtio-keyboard-device",
+        "-device", "virtio-tablet-device",
+        "-no-reboot",
+    });
+    run_nousb.addArg("-kernel");
+    run_nousb.addFileArg(raw.getOutput());
+    const run_nousb_step = b.step("run-nousb", "Boot with no USB controller (absence path)");
+    run_nousb_step.dependOn(&run_nousb.step);
+    run_nousb_step.dependOn(&image.step);
 
     // ------------------------------------------------------------------ test
     // Pure logic (allocators, formatting, schedulers, protocol codecs) is

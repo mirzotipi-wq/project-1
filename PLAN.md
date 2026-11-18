@@ -2012,12 +2012,71 @@ device reports none and keeps the self-tests green. Screenshot:
 queue, not through xHCI enumeration. The status queue is set up and idle; LEDs and force feedback
 are not written yet. Touch is single-contact. Scanners use one configured prefix and suffix.
 
-### Phase 39 — USB host stack `[ ]`
+### Phase 39 — USB host stack `[x]`
 **Goal:** Real retail peripherals.
 **Build:** xHCI controller init, port reset, enumeration, descriptor parsing, HID and
 CDC-ACM classes, hub support, hotplug.
 **Done when:** A USB keyboard, barcode scanner and serial card terminal all enumerate and work
 across replug cycles.
+
+**Shipped.**
+  * **xHCI host controller (`src/devices/xhci.zig`, `src/lib/xhci.zig`).** Claims the QEMU
+    (`1b36:000d`) and NEC (`1033:0194`) functions through the phase-32 PCI registry, maps BAR0
+    as Device memory, resets the controller, and owns the command ring, a 256-entry event ring
+    (ERST/ERDP/IMAN), the 64-entry DCBAA, slot/EP0/endpoint contexts, address/configure
+    commands, control/interrupt/bulk transfers and a port-reset/change queue. All rings, contexts
+    and packet buffers come from one 160 KiB arena remapped `normal_nc`; one poller consumes
+    events, with the IRQ handler only acknowledging `USBSTS.EINT`. TRB, ring, context, port and
+    event arithmetic is host-tested, including the link-TRB cycle, root-port field and
+    transfer-event endpoint-ID layouts.
+  * **Enumeration and descriptors (`src/lib/usb.zig`, `src/kernel/usb.zig`).** Device,
+    configuration, interface, endpoint and string descriptors; GET_DESCRIPTOR requests with the
+    first 8 bytes then the full device descriptor; SET_CONFIGURATION; endpoint configuration;
+    product strings with a vendor:product fallback; a device table with ordered slots, removal
+    and replug; class binding for HID, CDC-ACM, hubs and FTDI. Descriptor/setup/string/hub/CDC
+    encoding and parsing are host-tested.
+  * **HID (`src/lib/hid.zig`).** A report-descriptor parser (usage pages, input/output/feature
+    fields, report IDs, bit offsets, logical ranges) that drives the phase-38 keyboard, relative
+    mouse, absolute tablet, button and wheel decoders. Report decoding, field extraction and
+    report-ID handling are host-tested.
+  * **Serial.** CDC-ACM class requests (line coding, control-line state) and the class driver are
+    implemented and host-tested. QEMU has no CDC-ACM device, so real serial evidence uses its
+    FTDI bridge (`0403:6001`): vendor setup, bulk endpoints and the two-byte modem-status header
+    are handled, and both directions work across a replug. That FTDI path is also host-tested.
+  * **Hubs and hotplug.** Hub descriptors, per-port power, downstream port status/reset,
+    route-string construction, nested-hub bounds and child removal; root-port connect/disconnect
+    changes release the slot, disable it, release the input device and re-enumerate on the next
+    attach.
+  * **Shell and build.** `usb` prints controller registers, rings, ports, devices, class bindings
+    and counters; `usb selftest` validates every bound class driver; `usb serial <n> send|read`
+    drives the serial bridge; `input viz` now shows a USB device/HID/pointer header. `zig build
+    run` attaches `qemu-xhci`, `usb-kbd` and `usb-tablet`; `zig build run-nousb` boots with no
+    controller. `tools/qemu_usb_test.py` is the scripted regression harness.
+
+**Evidence.** `zig build` clean; **187 host tests pass**, up from 162 (+25). QEMU 8.2.2:
+xHCI 1.0 at BAR `0x11004000`, 8 ports, 64 slots, MSI 32. A `QEMU USB Keyboard` (slot 1, port 5)
+and `QEMU USB Tablet` (slot 2, port 6) enumerate; QMP keystrokes produce 12 HID reports and 12
+key events in the phase-38 queue, and tablet motion produces `pointer 234,97` →
+`pointer 702,268` with button down/up. A 20 ms HID digit burst commits one
+`barcode '1234' 4 chars` event (`[scan] 1234`). Two QMP unplug/replug cycles remove the
+keyboard, re-enumerate it on ports 7/8 (3 then 4 enumerated, 1 then 2 removed) and accept X/Y/Z
+keys again. A `usb-hub` with a child keyboard enumerates as `QEMU USB Hub [hub] 8 ports,
+1 child(ren)` and its child's Q/W/E keys reach input; 31 hub scans run. The FTDI bridge
+enumerates as slot 3 port 7, `usb serial 0 send hello` delivers `hello` plus CRLF to the host, host `world` is read
+back without the modem-status bytes, and the same works after a replug. A boot
+with no xHCI reports `xHCI not present`, 0/8 devices, `usb selftest` explains the absent
+controller, and the pmm self-test stays PASS. The phase-38 harness still passes both its
+with-input and no-input boots. Screenshot:
+`docs/screenshots/phase39-usb-input.png` (live monitor with USB counters, barcode, F-keys and
+pointer/button events).
+
+**Limits.** The event path is polled from the shell thread; the IRQ only acknowledges EINT, so
+throughput is bounded by that loop and the 256-entry event ring. There are no isochronous
+transfers, streams, suspend/resume or power management. No SuperSpeed device was exercised
+(QEMU's devices are high/full speed), and there is no transaction translator for a low/full-speed
+device behind a high-speed hub. The device table holds 8 slots and 16 devices; control buffers
+are limited to the 4 KiB scratch page. CDC-ACM is host-tested but not exercised against a real
+CDC-ACM peripheral; the FTDI bridge is the real serial proof.
 
 ### Phase 40 — Watchdog and power `[ ]`
 **Goal:** Recover from hangs; behave on power loss.
@@ -2421,4 +2480,4 @@ to the OS.
 | 2026-11-13 | 1–12 (Stage A) | Clean `zig build`; 23 host unit tests green; QEMU `virt` boots, parses the device tree (`linux,dummy-virt`, 512 MiB and 1 GiB), reports `selftest … PASS`; timer PPI 30 fires at 1 kHz with zero spurious interrupts; `svc` round trip prints through the syscall path; `textwrite` traps in the MMU with a decoded fault; `panic` prints the captured kernel log. |
 | 2026-11-17 | 37 | EDID parsed from the panel's MMIO blob (`QEMU Monitor`, 1280x800); mode programmed, read back and mapped non-cacheable; framebuffer write/readback PASS; test-pattern, splash and panic-screen screendumps checked pixel for pixel; `fb mode 1024 768` re-modes; boot without a panel stays clean; 130 host tests pass; fixes the PCI command-register gap that left every BAR undecoded |
 | 2026-11-17 | 38 | virtio keyboard and tablet on virtio-mmio (two queues, 16 posted buffers, IRQ drain and repost, config-space classification, absolute scaling to 1280x800); ordered IRQ-safe event queue with console mirror; HID boot-keyboard/mouse/absolute-pointer decoders; hold-and-decide scanner with prefix/suffix, gap/duration limits and ordered release; key remapping; `input`, `input viz`, `hid`, `keymap`; 162 host tests | QEMU 8.2.2: `QEMU Virtio Keyboard` and `QEMU Virtio Tablet` bind at irq 78/79, tablet abs 0..32767; 72 key events and 11 tablet events (pointer 351,146 → 702,292, button down/up) from `sendkey` and QMP absolute input; a 13-digit burst becomes one `barcode '4006381333931'` event with 0 ms suffix-to-queue delivery (269 ms HMP burst window); HID self-test PASS; boot without input devices clean; screenshot `docs/screenshots/phase38-input-monitor.png` |
-| next | 39 | USB host stack: xHCI init, port reset, enumeration, HID and CDC-ACM classes, hubs, hotplug |
+| 2026-11-18 | 39 | USB host stack: xHCI controller (PCI, reset, command/event/transfer rings, 64-entry DCBAA, slots and endpoint contexts, port reset), descriptor-driven enumeration, HID keyboard/tablet plus barcode burst, CDC-ACM and FTDI serial, hubs, hotplug; `usb`, `usb selftest`, `usb serial`; 187 host tests (+25); QEMU 8.2.2: keyboard slot 1 port 5 and tablet slot 2 port 6, 12 key events and pointer 234,97 → 702,268 with button down/up, `barcode '1234'` in 82 ms, two unplug/replug cycles on ports 7/8, hub with a child keyboard, FTDI `hello`/`world` payloads both ways and across replug, no-controller boot PASS; phase 38 harness PASS; screenshot `docs/screenshots/phase39-usb-input.png` |

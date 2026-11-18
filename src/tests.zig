@@ -35,6 +35,9 @@ test {
     _ = @import("lib/keymap.zig");
     _ = @import("lib/scanner.zig");
     _ = @import("lib/input_hid.zig");
+    _ = @import("lib/usb.zig");
+    _ = @import("lib/hid.zig");
+    _ = @import("lib/xhci.zig");
     _ = @import("kernel/input.zig");
     _ = @import("lib/edid.zig");
     _ = @import("lib/display_mode.zig");

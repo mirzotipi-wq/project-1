@@ -12,6 +12,7 @@ const pl031 = @import("pl031.zig");
 const pci = @import("../kernel/pci.zig");
 const virtio_mmio = @import("virtio_mmio.zig");
 const bochs_display = @import("bochs_display.zig");
+const xhci_device = @import("xhci.zig");
 const klog = @import("../kernel/klog.zig");
 
 fn probeConsole(dev: *driver.Device) driver.ProbeError!void {
@@ -191,6 +192,21 @@ const display_driver = driver.Driver{
     .remove = removeDisplay,
 };
 
+/// The USB host controller. QEMU's `qemu-xhci` and the NEC/Renesas part are the
+/// same programming model; both are claimed so a physical card enumerates too.
+/// The controller needs the PCI bus to have placed its BAR and routed its
+/// interrupt, so it depends on the host bridge.
+fn probeUsb(dev: *driver.Device) driver.ProbeError!void {
+    try xhci_device.probe(dev);
+}
+
+const usb_driver = driver.Driver{
+    .name = "xhci",
+    .compat = &.{ "pci,1b36:000d", "pci,1033:0194" },
+    .deps = &.{ "pci-host", "gic" },
+    .probe = probeUsb,
+};
+
 pub const all = [_]*const driver.Driver{
     &console_driver,
     &gic_driver,
@@ -199,6 +215,7 @@ pub const all = [_]*const driver.Driver{
     &pci_host_driver,
     &virtio_driver,
     &display_driver,
+    &usb_driver,
     &broken_driver,
 };
 

@@ -246,14 +246,31 @@ pub fn deviceAt(index: usize) ?*Device {
 pub fn registerDevice(name: []const u8, kind: DeviceKind) ?u8 {
     const flags = lock.acquire();
     defer lock.release(flags);
-    if (device_count >= max_devices) return null;
+    // A replugged USB device reuses the slot its previous incarnation left
+    // behind, so a till that cycles a scanner all day does not exhaust the
+    // table with absent entries.
+    var index: usize = 0;
+    while (index < device_count) : (index += 1) {
+        if (!devices[index].present) break;
+    }
+    if (index == device_count) {
+        if (device_count >= max_devices) return null;
+        device_count += 1;
+    }
     var dev = Device{ .kind = kind, .present = true };
     const n = @min(name.len, dev.name.len);
     @memcpy(dev.name[0..n], name[0..n]);
     dev.name_len = n;
-    devices[device_count] = dev;
-    device_count += 1;
-    return @intCast(device_count - 1);
+    devices[index] = dev;
+    return @intCast(index);
+}
+
+/// Unplug: the slot stays allocated for reuse but no longer counts as a live
+/// input device. Events already queued remain valid and ordered.
+pub fn releaseDevice(index: u8) void {
+    const flags = lock.acquire();
+    if (index < device_count) devices[index].present = false;
+    lock.release(flags);
 }
 
 pub fn setDeviceRange(index: u8, min_x: i32, max_x: i32, min_y: i32, max_y: i32) void {

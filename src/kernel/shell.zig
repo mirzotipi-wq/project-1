@@ -46,6 +46,7 @@ const virtio_mmio = @import("../devices/virtio_mmio.zig");
 const virtio_input = @import("../devices/virtio_input.zig");
 const pl031 = @import("../devices/pl031.zig");
 const input = @import("input.zig");
+const usb_core = @import("usb.zig");
 const keymap = @import("../lib/keymap.zig");
 const scanner = @import("../lib/scanner.zig");
 const input_hid = @import("../lib/input_hid.zig");
@@ -88,6 +89,8 @@ fn printHelp() void {
         \\  input [info|dump <n>|scan <text>|viz <s>|prefix|suffix|minlen|gap|charset|reset]
         \\  keymap [info|map <from> <to>|reset]        key remapping table
         \\  hid                  decode USB HID boot reports through the same queue
+        \\  usb [info|poll|selftest|serial <n> send <text>|serial <n> read]
+        \\                       xHCI controller, attached USB devices, serial bridge
         \\  blk                  block device and elevator counters
         \\  part                 partition table of the attached disk
         \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
@@ -2617,6 +2620,7 @@ fn cmdInputViz(seconds: u32) void {
     var events: [input.recent_capacity]input.Event = undefined;
     while (timer.uptimeMs() - start < @as(u64, bounded) * 1000) {
         virtio_input.pollAll();
+        usb_core.poll();
         while (input.pop()) |ev| {
             var shown: [96]u8 = undefined;
             out("  {s}\n", .{input.describe(&ev, &shown)});
@@ -2633,7 +2637,13 @@ fn cmdInputViz(seconds: u32) void {
             ss.scans, ss.released, ss.last_latency_ms, ss.max_latency_ms, ss.held_keys, cfg.gap_timeout_ms,
         }) catch "scanner";
         _ = surface.drawText(24, 56, header_text, 1, fb.Palette.text_dim);
-        surface.fillRect(24, 72, @intCast(surface.mode.width - 48), 1, fb.Palette.grid);
+        const us = usb_core.statsSnapshot();
+        var usb_header: [96]u8 = undefined;
+        const usb_text = std.fmt.bufPrint(&usb_header, "USB {d} device(s)  {d} HID reports  {d} keys  {d} pointer reports", .{
+            usb_core.deviceCount(), us.hid_reports, us.key_events, us.pointer_events,
+        }) catch "USB";
+        _ = surface.drawText(24, 70, usb_text, 1, fb.Palette.amber);
+        surface.fillRect(24, 84, @intCast(surface.mode.width - 48), 1, fb.Palette.grid);
 
         var y: i32 = 86;
         var cursor_x: i32 = -1;
@@ -2703,6 +2713,80 @@ fn cmdKeymap(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
         out("  remaps      : cleared\n", .{});
     } else {
         out("  unknown keymap subcommand: {s}\n", .{sub});
+    }
+}
+
+/// `usb` — the host controller, the devices the class drivers bound, and the
+/// serial bridge. Enumeration happens on this thread when the loop polls; this
+/// command makes the current state visible and can force a poll.
+fn cmdUsb(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const sub = tokens.next() orelse "info";
+
+    if (std.mem.eql(u8, sub, "info") or std.mem.eql(u8, sub, "devices")) {
+        usb_core.describe(out);
+        const st = usb_core.statsSnapshot();
+        out("  usb activity : {d} enumerated, {d} removed, {d} failed, {d} HID reports\n", .{
+            st.enumerated, st.removed, st.failed, st.hid_reports,
+        });
+        out("  usb events   : {d} keys, {d} pointer reports, {d} hub scans ({d} connect, {d} disconnect)\n", .{
+            st.key_events, st.pointer_events, st.hub_scans, st.hub_connects, st.hub_disconnects,
+        });
+        out("  usb serial   : {d} device(s), {d} bytes out, {d} bytes in\n", .{
+            usb_core.serialCount(), st.serial_tx, st.serial_rx,
+        });
+        usb_core.dumpInputBinding(out);
+    } else if (std.mem.eql(u8, sub, "poll")) {
+        usb_core.poll();
+        out("  usb          : polled ({d} device(s), {d} HID report(s))\n", .{
+            usb_core.deviceCount(), usb_core.statsSnapshot().hid_reports,
+        });
+    } else if (std.mem.eql(u8, sub, "selftest")) {
+        _ = usb_core.selfTest(out);
+    } else if (std.mem.eql(u8, sub, "serial")) {
+        const which = parseNum(tokens.next()) orelse 0;
+        const action = tokens.next() orelse "info";
+        const dev = usb_core.serialAt(which) orelse {
+            out("  usb serial  : no serial device at index {d} ({d} attached)\n", .{ which, usb_core.serialCount() });
+            return;
+        };
+        if (std.mem.eql(u8, action, "send")) {
+            const text = tokens.rest();
+            var line: [128]u8 = undefined;
+            var n: usize = 0;
+            while (n < text.len and n < line.len - 2) : (n += 1) line[n] = text[n];
+            line[n] = '\r';
+            n += 1;
+            line[n] = '\n';
+            n += 1;
+            const sent = usb_core.serialSend(dev, line[0..n]) catch |err| {
+                out("  usb serial  : send failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+            out("  usb serial  : sent {d} bytes to '{s}'\n", .{ sent, dev.nameSlice() });
+        } else if (std.mem.eql(u8, action, "read")) {
+            var buf: [64]u8 = undefined;
+            const got = usb_core.serialRead(dev, buf[0..]) catch |err| {
+                out("  usb serial  : read failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+            if (got == 0) {
+                out("  usb serial  : no bytes within 200 ms\n", .{});
+            } else {
+                out("  usb serial  : {d} bytes:", .{got});
+                for (buf[0..got]) |b| {
+                    if (b >= 0x20 and b < 0x7f) out("{c}", .{b}) else out(" {x:0>2}", .{b});
+                }
+                out("\n", .{});
+            }
+        } else {
+            out("  usb serial  : '{s}' [{s}], bulk in {d} out {d}, {s}\n", .{
+                dev.nameSlice(), @tagName(dev.kind), dev.cdc.?.bulk_in, dev.cdc.?.bulk_out,
+                if (dev.cdc.?.cdc) "CDC-ACM" else "FTDI",
+            });
+            out("  usage       : usb serial <n> send <text> | usb serial <n> read\n", .{});
+        }
+    } else {
+        out("  usage: usb [info|poll|selftest|serial <n> send <text>|serial <n> read]\n", .{});
     }
 }
 
@@ -2804,6 +2888,8 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdKeymap(&tokens);
     } else if (std.mem.eql(u8, command, "hid")) {
         cmdHid();
+    } else if (std.mem.eql(u8, command, "usb")) {
+        cmdUsb(&tokens);
     } else if (std.mem.eql(u8, command, "user")) {
         cmdUser(ctx, &tokens);
     } else if (std.mem.eql(u8, command, "uprobe")) {
@@ -2863,6 +2949,10 @@ pub fn run(ctx: Context) noreturn {
         // A device that could not allocate an interrupt is polled here, and
         // polling also catches completions posted while interrupts were off.
         virtio_input.pollAll();
+        // USB needs the same service: the controller's event ring and root-port
+        // changes are consumed on this thread, so hotplug works with or without
+        // a routed interrupt.
+        usb_core.poll();
 
         // A barcode scanned while the console is idle is announced on its own
         // line, so the cashier sees the scan even before the POS app draws it.
