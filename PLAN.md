@@ -2929,11 +2929,42 @@ proves 500 small 8x8 primitives, not full-screen fill (a 64x40 variant measured 
 native hardware and the vector stores were not disassembled. `tools/qemu_raster52_test.py`;
 design `docs/rasterizer-phase52.md`.
 
-### Phase 53 — Font engine `[ ]`
+### Phase 53 — Font engine `[x]`
 **Goal:** Legible prices at arm's length.
 **Build:** Embedded bitmap fallback font, TrueType parser and scanline rasterizer, kerning,
 subpixel positioning, cached glyph atlas, text shaping hooks for RTL.
 **Done when:** 8–48 pt text renders correctly with kerning and no missing glyphs.
+
+**Shipped:** `src/lib/font.zig` is a pure, allocation-free fixed-point engine over the
+phase-51 `gfx` core: it parses the embedded 9,548-byte DejaVu Sans subset (`head`, `maxp`,
+`hhea`, `hmtx`, format-4 `cmap`, `loca`, simple `glyf` contours and legacy format-0 `kern`),
+flattens quadratic contours adaptively, and rasterizes them with four vertical subsamples and
+exact horizontal span coverage. The subset covers printable ASCII plus euro, pound, yen and
+degree (100 glyphs, 2,048 units/em, 220 kern pairs). A `Renderer` owns a bounded 64-entry
+coverage cache/atlas with LRU replacement and four subpixel phases. `font.measure` and
+`font.drawText` share direction ordering, an optional shaping hook, kerning and advances; RTL
+reverses the run, and unsupported codepoints/composite glyphs use the phase-37 5x7 fallback
+instead of disappearing. The real shell gained `text [test|inject|repair|info]`;
+`src/kernel/text53.zig` draws a 920x700 card at `180,50` on the 1280x800 panel, checks all 95
+printable ASCII glyphs at 10 px, every required size 8/12/18/24/36/48 px, 256 glyphs and
+**19,152 ink pixels**, kerning `AV 4,102,656 q16` vs `A+V 4,303,872 q16` (delta
+**-201,216 q16**, 3.07 px at 48 px), four-phase subpixel snapshots, cache `hits 76 / misses
+692 / evictions 628`, and card snapshot `0x809a41f2` (diagnostic; the harness asserts the
+deterministic card pixels and screendump instead). The test-only fault skips glyph `A`: title
+bright pixels drop **977 -> 618**, `text card : FAIL` / `text verdict: FAIL`, then repair
+returns the original snapshot and PASS. **282 host tests (+10)**. All fifteen prior certified
+harnesses PASS one at a time on this tree: input **13 chars / 257 ms / 1 ms**, USB **4/4**,
+power **2554 -> 3825 ms (1.50x)**, CASSAFS/VFS/VFS-write, page cache **37 ms / 64/64 pages /
+344 evictions / 88 writebacks / 20 flushes / sale 33 B `0x12b569fa`**, FAT32/VFS46 **10,000
+rows / 220,021 B / max line 21 / `0x8678e4e7`**, retail **239 records / 64 receipts / 128
+lines**, sales48 **3 transactions / 6 units / 1,555 cents** with boot-dependent chain
+`0x603c820f` (not asserted), storage49 PASS, recovery50 **1312 B / `0x66d093ce` / audit 576 B**,
+gfx51 **`0x27ae8280`**, raster52 release **4,429/4,883/5,321 us** (under the 8 ms target). Limits: the face is a 100-glyph Latin subset; kerning comes from the
+legacy `kern` table, not GPOS; no ligatures, Arabic joining or bidi algorithm are claimed, only
+an RTL run reversal and a codepoint shaping hook; subpixel positioning has four phases, not a
+full 1/64 pen grid; composite glyphs and unsupported codepoints use the non-anti-aliased 5x7
+fallback; QEMU TCG is not native hardware. `tools/qemu_text53_test.py`; design
+`docs/font-engine-phase53.md`.
 
 ### Phase 54 — Compositor `[ ]`
 **Goal:** Tear-free, damage-driven presentation.

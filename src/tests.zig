@@ -55,6 +55,7 @@ test {
     _ = @import("lib/display_mode.zig");
     _ = @import("lib/gfx.zig");
     _ = @import("lib/raster2d.zig");
+    _ = @import("lib/font.zig");
     _ = @import("kernel/fb.zig");
 }
 

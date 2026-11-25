@@ -42,6 +42,7 @@ const fat32 = @import("fat32.zig");
 const fb = @import("fb.zig");
 const gfx51 = @import("gfx51.zig");
 const raster52 = @import("raster52.zig");
+const text53 = @import("text53.zig");
 const bochs_display = @import("../devices/bochs_display.zig");
 const virtio_blk = @import("../devices/virtio_blk.zig");
 const virtio_mmio = @import("../devices/virtio_mmio.zig");
@@ -101,6 +102,7 @@ fn printHelp() void {
         \\  fb [info|test|splash|mode <w> <h>|check]   panel, test pattern, mode
         \\  gfx [test|inject|repair|info]             phase-51 surfaces, clips, alpha, damage
         \\  raster [test|inject|repair|info]          phase-52 rounded rects, AA lines/arcs, gradients
+        \\  text [test|inject|repair|info]            phase-53 TrueType text, kerning, cache
         \\  input [info|dump <n>|scan <text>|viz <s>|prefix|suffix|minlen|gap|charset|reset]
         \\  keymap [info|map <from> <to>|reset]        key remapping table
         \\  hid                  decode USB HID boot reports through the same queue
@@ -3388,6 +3390,8 @@ fn execute(ctx: Context, line: []const u8) void {
         gfx51.command(&tokens);
     } else if (std.mem.eql(u8, command, "raster")) {
         raster52.command(ctx.heap, &tokens);
+    } else if (std.mem.eql(u8, command, "text")) {
+        text53.command(ctx.heap, &tokens);
     } else if (std.mem.eql(u8, command, "input")) {
         cmdInput(&tokens);
     } else if (std.mem.eql(u8, command, "keymap")) {

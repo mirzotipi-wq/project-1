@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–51 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–53 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -99,8 +99,9 @@ goes to the serial console is now also on the screen. See
 | 50 | Snapshots and recovery: a bounded 128-byte CRC32C config record and 544-byte four-slot snapshot file; copy-before-write `recovery set`, one-command `recovery rollback`, `recovery status/verify`, `factory-reset preserve` retaining the phase-48 sale audit, a support bundle carrying config/snapshot/audit/phase-49 health, and test-only config/snapshot corruption hooks | QEMU 8.2.2: phase-45 **10,000 rows / 220,021 B / `0x8678e4e7`**, phase-47 **239 records** and phase-48 **one committed sale / `sales verify : PASS`** still green; config generation 3 with 4/4 snapshots in slot 3; config corruption refused **`BadCrc`**, one `recovery rollback` restored generation 3 / `North Till`; cache drop, unmount/remount and soft reboot preserved config, slots and sale, with rollback still working after reboot; support bundle **1312 B / CRC32C `0x66d093ce`**, `vfs stat` size matches; factory reset preserve restored generation 1, left the **576-byte** sale audit intact and `sales verify` still PASS; corrupt snapshot rollback refused `BadCrc`; **256 host tests (+4)**; all twelve prior harnesses PASS (input 13 digits, USB 4/4, power PASS, page cache 64/64 + sale CRC `0x12b569fa`, FAT32, VFS46, retail; sales48 verifies 3 transactions / 1,555 cents, with a boot-uptime-dependent chain CRC; storage49); `tools/qemu_recovery50_test.py`; design `docs/recovery-phase50.md` |
 | 51 | Graphics core: pure `src/lib/gfx.zig` with `bgrx8888`/`rgba8888`/`rgb888`/`rgb565` surfaces, clipped 1:1 blits with conversion, straight 8-bit alpha compositing, and a bounded 8-rectangle damage set; `fb.rawBytes()` bridge, `gfx [test|inject|repair|info]`, test-only negative control | QEMU 8.2.2: all four formats round-trip in the kernel; scratch clip/blit/blend/damage PASS; live **128×96** card at `576,352` on **1280x800 BGRX**, exact screenshot pixels `220,32,32`, `32,180,64`, `8,44,144`, `255,255,255`, transparent `16,24,32`, `8,140,16`, `255,128,0`; **1 damage rect / 12,288 px**; clean snapshot **`0x27ae8280`**; injected corruption **`0xda4f8ba2`** → `gfx core : FAIL`, repair → PASS; **264 host tests (+8)**; all thirteen prior harnesses PASS one at a time (input 13 chars/258–260 ms/0 ms, USB 4/4, power 2372–2471→3763–4079 ms/1.54–1.72x, page cache 26–42 ms/64/64 + sale CRC `0x12b569fa`, FAT32 10,000/220,021/`0x8678e4e7`, VFS46, retail 239 records, sales48 3 transactions/1,555 cents with boot-dependent chain `0x68004180`, storage49, recovery50 1312 B/`0x66d093ce`); `tools/qemu_gfx51_test.py`; design `docs/graphics-phase51.md` |
 | 52 | 2D rasterizer: pure fixed-point `src/lib/raster2d.zig` over the phase-51 `gfx` core, public vector `fillSpan`/`blendPixel` path, rounded/filled rectangles, circles, AA round-capped lines, Q14 arcs, gradients, four-layer shadows, nearest-neighbour nine-patch, `raster [test|inject|repair|info]` | QEMU 8.2.2 release: 320x240 card at `480,280` with exact gradient/panel/accent/circle/arc/line/nine-patch pixels and **1 damage rect / 76,800 px**; injected magenta `circle=0xffff00ff` -> `raster card : FAIL` / verdict FAIL, repair PASS; 1920x1080 RGB565 offscreen frame with **500 primitives**, **2,500/2,500** centres checked over five frames, **min 3,530 us / median 3,565 us / max 3,624 us**, heap 4,147,200 B reclaimed `0 -> 0`; **272 host tests (+8)**; all fourteen prior harnesses PASS one at a time (input 13 chars/259 ms/1 ms, USB 4/4, power 2377->3896 ms/1.64x, page cache 32 ms/64/64 + sale CRC `0x12b569fa`, FAT32/VFS46 10,000/220,021/`0x8678e4e7`, retail 239 records, sales48 3 txns/1,555 cents with boot-dependent chain not asserted, storage49 isolated rerun PASS, recovery50 1312 B/`0x66d093ce`, gfx51 `0x27ae8280`); `tools/qemu_raster52_test.py`; design `docs/rasterizer-phase52.md` |
+| 53 | Font engine: pure `src/lib/font.zig` TrueType parser (head/maxp/hhea/hmtx/cmap4/loca/simple glyf/legacy kern), fixed-point adaptive quadratic flattening and 4× vertical AA scanline coverage, 9,548-byte DejaVu Sans subset (95 printable ASCII + €, £, ¥, °; 100 glyphs/2,048 upem/220 kern pairs), 64-entry LRU coverage atlas, four subpixel phases, kerning, RTL order and shaping hook, 5x7 fallback; `text [test|inject|repair|info]` | QEMU 8.2.2: all **254** card glyphs, **missing 0**; all 95 printable ASCII at 10 px; **8/12/18/24/36/48 px** samples, **256 glyphs / 19,152 ink pixels**; kerning **4,102,656 q16** vs **4,303,872 q16** (**−201,216 q16**, 3.07 px at 48 px); four-phase subpixel snapshots differ; cache **76 hits / 692 misses / 628 evictions**; card **920×700** at `180,50`, snapshot `0x809a41f2`; test-only glyph-A fault drops title bright pixels **977 → 618**, `text card : FAIL` / verdict FAIL, repair restores the same snapshot and PASS; screenshot `docs/screenshots/text53-card.png`; **282 host tests (+10)**; all fifteen prior harnesses PASS one at a time (input 13 chars/257 ms/1 ms, USB 4/4, power 2554→3825 ms/1.50x, CASSAFS/VFS/VFS-write, page cache 37 ms/64/64 + sale `0x12b569fa`, FAT32/VFS46 10,000/220,021/`0x8678e4e7`, retail 239 records, sales48 3 txns/1,555 cents with boot-dependent chain not asserted, storage49, recovery50 1312 B/`0x66d093ce`, gfx51 `0x27ae8280`, raster52 release 4,429/4,883/5,321 us); `tools/qemu_text53_test.py`; design `docs/font-engine-phase53.md` |
 
-The remaining 48 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 47 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -177,6 +178,14 @@ framebuffer, checks exact pixels in the kernel and independently in a QEMU
 screendump, and requires a test-only injected corruption to turn the same proof
 into FAIL before repairing it. Design and limits:
 [docs/graphics-phase51.md](docs/graphics-phase51.md).
+The phase-53 font engine adds `python3 tools/qemu_text53_test.py`: it parses the embedded
+TrueType subset, renders the 920×700 card at `180,50` on the real panel, checks all 95
+printable ASCII glyphs, all six required sizes, kerning, four subpixel phases and cache
+activity in the kernel, and independently samples exact card/header/panel pixels and title/
+price ink in a QEMU screendump. It then skips glyph `A` through the test-only fault, requires
+`text card : FAIL` and a visible title-ink drop (**977 → 618** bright pixels), and repairs it
+back to the same snapshot. Design and honest limits (Latin subset, legacy kern, four phases,
+no bidi/ligatures, non-AA fallback): [docs/font-engine-phase53.md](docs/font-engine-phase53.md).
 The phase-52 rasterizer adds `python3 tools/qemu_raster52_test.py`: build the performance
 image with `zig build -Drelease=true`, then the harness draws the 320x240 card on the real
 panel, checks every feature in the kernel and in a QEMU screendump, times a 1920x1080
@@ -361,6 +370,8 @@ tools/qemu_gfx51_test.py      proves all-format/clip/alpha/damage pixels live, c
                                QEMU screendump, and rejects an injected card corruption
 tools/qemu_raster52_test.py proves the rasterizer card and 1080p/500-primitive benchmark,
                                rejects and repairs an injected pixel in a real screendump
+tools/qemu_text53_test.py   proves TrueType layout, kerning, subpixel/cache and 8–48 px text
+                               on the real panel; rejects and repairs a skipped glyph in a screendump
 src/tests.zig        host unit-test root
 docs/cassafs-format.md  the CASSAFS v1 on-disk contract, write path and limits
 docs/vfs.md             the VFS contract, write path, backend interface and limits
@@ -371,6 +382,7 @@ docs/storage-phase49.md phase-49 retry policy, bad-range quarantine, fsck and ev
 docs/recovery-phase50.md phase-50 config snapshots, rollback, factory reset and evidence
 docs/graphics-phase51.md phase-51 formats, surfaces, blits, clipping, alpha, damage and evidence
 docs/rasterizer-phase52.md phase-52 rounded/AA primitives, gradients, shadows, nine-patch, benchmark and evidence
+docs/font-engine-phase53.md phase-53 TrueType subset, scanline coverage, kerning, subpixel/cache, RTL hook and limits
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan
 ```
