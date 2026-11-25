@@ -2738,11 +2738,57 @@ retry service. The timestamp is `uptimeMs`, not wall-clock time, and is not part
 of idempotency. Terminal identity is the retail ID plus local sequence; the code
 is resolved for display. `sales corrupt` is a test fault injector.
 
-### Phase 49 — Storage health `[ ]`
+### Phase 49 — Storage health `[x]`
 **Goal:** Fail predictably, not suddenly.
 **Build:** Bad-block handling, read-retry policy, eMMC/SD health counters, fsck, pre-failure
 warnings surfaced in the supervisor UI.
 **Done when:** Simulated media errors reduce to retries and warnings without data loss.
+
+**Shipped.** The bounded policy is `src/lib/storage_health.zig`: 32 bad ranges,
+a three-retry budget, healthy/degraded/failing states, media operation and sector
+counters, recovered/unrecovered ledgers, one warning per transition and a scrub
+that clears a quarantine but keeps the degraded history. The virtio-blk request
+path (`src/devices/virtio_blk.zig`) now checks a quarantined range before
+submission, rejects it with `BadBlock`, injects simulated medium errors ahead of
+the device, routes real and simulated failures through the existing three-attempt
+transport retry/reset path, counts a recovered request only when a retry succeeds,
+and quarantines a range after the budget is exhausted. The phase-34 boot
+self-test's forced timeout is deliberately excluded from health warnings, so a
+clean boot is healthy rather than permanently degraded. `cassafs.fsck()` runs the
+full read-only CASSAFS verifier and reports named refusals; `BadBlock` is
+propagated by the CASSAFS adapter. The shell exposes `blk health`, `blk fsck`,
+`blk inject read|write|flush <lba> <sectors> <failures>`, `blk clear`,
+`blk scrub <lba> <sectors>` and the `blk viz` supervisor dashboard.
+
+**Evidence.** `python3 tools/qemu_storage49_test.py` boots the real image after
+re-establishing phase-45/47/48 evidence on one disk: 10,000 FAT32 rows / 220,021
+B / CRC32C `0x8678e4e7`, 239 retail records, and one committed phase-48 sale with
+`sales verify : PASS, 1 transaction(s)`. Baseline `blk fsck : PASS, 37 record(s),
+7 inode(s), 4 file(s), 62214 data byte(s), 16284 free block(s)` and the demo
+product is 73 B / `0x3b60dc1d`. One injected read failure at physical LBA 2048
+(the CASSAFS superblock range) prints `health : degraded, warnings 1, retries 1,
+recovered 1, unrecovered 0, bad blocks 0` and fsck still PASSes. A transient
+flush failure is also retried and recovered. A persistent injection prints
+`blk fsck : REFUSED: Io`; the next attempt, now quarantined, prints
+`blk fsck : REFUSED: BadBlock`; health is `failing, warnings 3, retries 5,
+recovered 2, unrecovered 1, bad blocks 1`. Clearing the injector and
+`blk scrub 2048 16` prints `1 bad entr(ies) cleared, readback PASS`; fsck returns
+to PASS with the product and sale bytes unchanged. A raw one-byte payload
+corruption on a separate demo fixture prints `blk fsck : REFUSED: BadCrc`.
+`blk viz 1` draws the live storage-health panel. The same sale and product CRC
+survive `vfs cache drop`, `vfs unmount`/remount and a soft reboot, and fsck still
+passes.
+
+**Limits.** QEMU virtio-blk exposes no eMMC/SD life-time or SMART registers; the
+health counters are transport-level media operations, sectors, retries and bad
+ranges, not device-specific wear data. The bad table is in-memory and bounded
+at 32 ranges; it is cleared on a re-probe and does not survive a reboot. There is
+no sector remapping, ECC, automatic repair or persistent bad-block list. fsck is
+read-only and does not repair; `blk scrub` only proves readability and clears a
+quarantine. The read and flush paths are boot-tested; write injection shares the
+same request path but is not separately exercised. The shell/block path remains
+single-writer, and the harness simulates media errors rather than physically
+removing the disk or cutting power mid-write.
 
 ### Phase 50 — Snapshots and recovery `[ ]`
 **Goal:** Roll back a bad update or configuration.
@@ -3091,3 +3137,4 @@ to the OS.
 | 2026-11-25 | 45 | Read-only FAT32 reader backend: LFN lookup, stable slot-derived inodes, bounded chain/range reads, exact chain validation, `/media/usb` mount on partition 2, read-only enforcement, streaming `vfs import` CSV parser; 231 host tests (+6); QEMU: 22-char LFN `store-catalog-2026.csv`, 10,000 rows/220,021 B/max line 21/CRC32C `0x8678e4e7`, long-name readdir and stat, read-only write/create refusal, unmount/remount and soft-reboot reimport, looped FAT chain refused with CASSAFS root intact, one-partition USB mount refused; all seven prior harnesses PASS unchanged; `tools/qemu_fat32_test.py`; design `docs/fat32-reader.md` |
 | 2026-11-25 | 46 | Unified VFS across three backends: bounded writable tmpfs at `/tmp` (16 nodes, 4 KiB/file, nested dirs), optional backend mkdir/chmod, mode-bit permissions, advisory shared/exclusive file locks, 8-watch/16-event inotify-style queue with created/modified/mounted/unmounted events and drop accounting; `vfs mount tmpfs`, `mkdir`, `chmod`, `lock`, `watch`, `unwatch`, `events`; 233 host tests (+2); QEMU 8.2.2: 3 mounts, identical canonical paths for CASSAFS/FAT32/tmpfs, 7 B CRC `0x6d6a12e7`, chmod 444 refusal then 644 append to 9 B CRC `0x9e9cac38`, exclusive conflict/shared coexistence, 2 events, remount; FAT32 import 10,000 rows/220,021 B/`0x8678e4e7`; all eight prior harnesses PASS; fixed a real virtio-input drain race between IRQ and shell polling (IRQ-safe lock); `tools/qemu_vfs46_test.py`; design `docs/vfs-phase46.md` |
 | 2026-11-25 | 47 | Retail data model: 480 × 128-byte CRC32C-checked records (61,480 B) for products, variants, barcodes, prices, tax classes, promotions, users, roles, receipts, sale lines, shifts, drawers, terminals and suppliers; staged FAT32 CSV import; deterministic 239-record day (64 receipts/128 lines/160 units, subtotal 42,020 / tax 0 / cash 16,540 / variance +50); 243 host tests (+10); QEMU: phase-45 10k import 10,000/220,021 B/`0x8678e4e7`, 8-product retail import, duplicate refusal, cache flush/drop, unmount/remount, reboot, corrupted record refused with `RecordCorrupt`; all nine prior harnesses PASS; `tools/qemu_retail_test.py`; design `docs/retail-phase47.md` |
+| 2026-11-25 | 49 | Storage health: bounded `storage_health` policy (32 bad ranges, 3 retries, healthy/degraded/failing), virtio-blk retry/quarantine and read/flush fault injection, `BadBlock` propagation, read-only CASSAFS `fsck`, `blk health/fsck/inject/clear/scrub/viz` supervisor dashboard; **252 host tests (+4)**; QEMU 8.2.2: phase-45 10,000/220,021 B/`0x8678e4e7`, phase-47 239 records and phase-48 sale green; transient read at LBA 2048 `degraded, warnings 1, retries 1, recovered 1`, fsck PASS; persistent read `REFUSED: Io` then `REFUSED: BadBlock` with `failing, warnings 3, retries 5, recovered 2, unrecovered 1, bad blocks 1`; scrub clears 1 entry and fsck PASS; raw payload corruption on a separate fixture `REFUSED: BadCrc`; 73 B product CRC `0x3b60dc1d` unchanged across cache drop, unmount/remount, reboot; all eleven prior harnesses PASS (power 2379→3885 ms/1.63x, page cache 29 ms/64/64 + sale CRC `0x12b569fa`, FAT32, VFS46, retail, sales48); `tools/qemu_storage49_test.py`; design `docs/storage-phase49.md` |

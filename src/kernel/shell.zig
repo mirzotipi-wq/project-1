@@ -56,6 +56,7 @@ const retail = @import("retail.zig");
 const sales = @import("sales.zig");
 const wdt = @import("../devices/i6300esb.zig");
 const power_lib = @import("../lib/power.zig");
+const storage_health = @import("../lib/storage_health.zig");
 const keymap = @import("../lib/keymap.zig");
 const scanner = @import("../lib/scanner.zig");
 const input_hid = @import("../lib/input_hid.zig");
@@ -106,7 +107,8 @@ fn printHelp() void {
         \\                       thermal zone, throttle ladder, idle injection
         \\  watchdog [info|kick|selftest]
         \\                       i6300ESB hardware watchdog
-        \\  blk                  block device and elevator counters
+        \\  blk [info|health|fsck|inject|clear|scrub|viz]
+        \\                       storage health, retries, bad sectors, supervisor UI
         \\  part                 partition table of the attached disk
         \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
         \\  cassafs <sub>        CASSAFS format 1: info, format [empty|demo], demo,
@@ -2291,11 +2293,222 @@ fn cmdFat(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
     }
 }
 
-/// `blk` — the block layer's view: the disk, the device counters, the
-/// scheduler's counters. No test runs here; `uprobe` step 20 does that.
-fn cmdBlk() void {
+fn printStorageHealth() void {
+    const s = virtio_blk.healthSnapshot();
+    out("  health      : {s}, warnings {d}, retries {d}, recovered {d}, unrecovered {d}, bad blocks {d}\n", .{
+        s.state.label(), s.warnings, s.retries, s.recovered, s.unrecovered, s.bad_count,
+    });
+    out("  media       : reads {d}, writes {d}, flushes {d}, sectors read {d}, sectors written {d}\n", .{
+        s.reads, s.writes, s.flushes, s.sectors_read, s.sectors_written,
+    });
+    if (s.last_error) {
+        out("  last error  : {s} lba {d} +{d}, reason {s}\n", .{
+            s.last_op.label(), s.last_lba, s.last_count, s.last_reason.label(),
+        });
+    } else {
+        out("  last error  : none\n", .{});
+    }
+    const bad = virtio_blk.badBlocks();
+    if (bad.len == 0) {
+        out("  bad sectors : none\n", .{});
+    } else {
+        var i: usize = 0;
+        while (i < bad.len and i < 8) : (i += 1) {
+            out("  bad sector  : lba {d} +{d}, {d} failure(s)\n", .{ bad[i].lba, bad[i].count, bad[i].failures });
+        }
+        if (bad.len > 8) out("  bad sector  : ... {d} more\n", .{bad.len - 8});
+    }
+}
+
+fn drawStorageHealth() void {
+    const surface = fb.screen() orelse {
+        out("  blk viz     : no framebuffer; use 'blk health'\n", .{});
+        return;
+    };
+    const s = virtio_blk.healthSnapshot();
+    const color: fb.Color = switch (s.state) {
+        .healthy => fb.Palette.green,
+        .degraded => fb.Palette.amber,
+        .failing => fb.Palette.red,
+    };
+    surface.clear(fb.Palette.background);
+    _ = surface.drawText(24, 20, "Cassa - storage health", 2, fb.Palette.amber);
+    _ = surface.drawText(24, 56, "bounded retries · bad-sector quarantine · read-only fsck · pre-failure warning", 1, fb.Palette.text_dim);
+
+    var line: [180]u8 = undefined;
+    const headline = std.fmt.bufPrint(&line, "STATE {s}   WARNINGS {d}   RETRIES {d}   RECOVERED {d}", .{
+        s.state.label(), s.warnings, s.retries, s.recovered,
+    }) catch "storage health";
+    _ = surface.drawText(24, 96, headline, 2, color);
+
+    const media = std.fmt.bufPrint(&line, "MEDIA  reads {d}  writes {d}  flushes {d}  sectors {d}/{d}", .{
+        s.reads, s.writes, s.flushes, s.sectors_read, s.sectors_written,
+    }) catch "media";
+    _ = surface.drawText(24, 136, media, 1, fb.Palette.text);
+
+    const failure = if (s.last_error)
+        std.fmt.bufPrint(&line, "LAST  {s}  lba {d} +{d}  reason {s}", .{
+            s.last_op.label(), s.last_lba, s.last_count, s.last_reason.label(),
+        }) catch "last error"
+    else
+        "LAST  none";
+    _ = surface.drawText(24, 160, failure, 1, if (s.last_error) fb.Palette.amber else fb.Palette.text_dim);
+
+    const bad = std.fmt.bufPrint(&line, "BAD SECTORS  {d} quarantined  refusals {d}  unrecovered {d}", .{
+        s.bad_count, s.bad_refusals, s.unrecovered,
+    }) catch "bad sectors";
+    _ = surface.drawText(24, 184, bad, 1, if (s.bad_count != 0) fb.Palette.red else fb.Palette.text_dim);
+
+    const table = virtio_blk.badBlocks();
+    var y: i32 = 224;
+    var i: usize = 0;
+    while (i < table.len and i < 8) : (i += 1) {
+        const row = std.fmt.bufPrint(&line, "QUARANTINE  lba {d} +{d}  {d} failure(s)", .{
+            table[i].lba, table[i].count, table[i].failures,
+        }) catch "quarantine";
+        _ = surface.drawText(24, y, row, 1, fb.Palette.red);
+        y += 16;
+    }
+    if (table.len == 0) {
+        _ = surface.drawText(24, y, "QUARANTINE  none", 1, fb.Palette.text_dim);
+    }
+    _ = surface.drawText(24, @as(i32, @intCast(surface.mode.height)) - 22, "live dashboard: storage supervisor; closes after the set time", 1, fb.Palette.text_dim);
+}
+
+fn cmdBlkViz(seconds: u32) void {
+    const bounded: u32 = @min(seconds, 60);
+    printStorageHealth();
+    out("  blk viz     : {d}s storage health dashboard\n", .{bounded});
+    const start = timer.uptimeMs();
+    while (timer.uptimeMs() - start < @as(u64, bounded) * 1000) {
+        drawStorageHealth();
+        sched.sleepMsBlocking(100);
+    }
+    out("  blk viz     : closed\n", .{});
+}
+
+fn cmdBlkFsck() void {
+    const report = cassafs.fsck() catch |err| {
+        out("  blk fsck    : REFUSED: {s}\n", .{@errorName(err)});
+        return;
+    };
+    out("  blk fsck    : PASS, {d} record(s), {d} inode(s), {d} file(s), {d} data byte(s), {d} free block(s)\n", .{
+        report.records, report.inode_count, report.files, report.data_bytes, report.free_blocks,
+    });
+    out("  blk fsck    : read-only; every superblock, record, extent, data CRC and free-map bit verified\n", .{});
+}
+
+fn cmdBlkInject(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const op_text = tokens.next() orelse {
+        out("  usage: blk inject <read|write|flush> <lba> <sectors> <failures>\n", .{});
+        return;
+    };
+    const lba_text = tokens.next() orelse {
+        out("  usage: blk inject <read|write|flush> <lba> <sectors> <failures>\n", .{});
+        return;
+    };
+    const count_text = tokens.next() orelse {
+        out("  usage: blk inject <read|write|flush> <lba> <sectors> <failures>\n", .{});
+        return;
+    };
+    const failure_text = tokens.next() orelse {
+        out("  usage: blk inject <read|write|flush> <lba> <sectors> <failures>\n", .{});
+        return;
+    };
+    const op: storage_health.Op = if (std.mem.eql(u8, op_text, "read"))
+        .read
+    else if (std.mem.eql(u8, op_text, "write"))
+        .write
+    else if (std.mem.eql(u8, op_text, "flush"))
+        .flush
+    else {
+        out("  blk inject  : REFUSED: BadOp\n", .{});
+        return;
+    };
+    const lba = std.fmt.parseInt(u64, lba_text, 10) catch {
+        out("  blk inject  : REFUSED: BadLba\n", .{});
+        return;
+    };
+    const count = std.fmt.parseInt(u32, count_text, 10) catch {
+        out("  blk inject  : REFUSED: BadCount\n", .{});
+        return;
+    };
+    const failures = std.fmt.parseInt(u32, failure_text, 10) catch {
+        out("  blk inject  : REFUSED: BadFailures\n", .{});
+        return;
+    };
+    if (count == 0 or failures == 0) {
+        out("  blk inject  : REFUSED: BadRange\n", .{});
+        return;
+    }
+    virtio_blk.injectFault(op, lba, count, failures);
+    out("  blk inject  : {s} lba {d} +{d}, {d} simulated failure(s)\n", .{ op.label(), lba, count, failures });
+}
+
+fn cmdBlkScrub(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
+    const lba_text = tokens.next() orelse {
+        out("  usage: blk scrub <lba> <sectors>\n", .{});
+        return;
+    };
+    const count_text = tokens.next() orelse {
+        out("  usage: blk scrub <lba> <sectors>\n", .{});
+        return;
+    };
+    const lba = std.fmt.parseInt(u64, lba_text, 10) catch {
+        out("  blk scrub   : REFUSED: BadLba\n", .{});
+        return;
+    };
+    const count = std.fmt.parseInt(u32, count_text, 10) catch {
+        out("  blk scrub   : REFUSED: BadCount\n", .{});
+        return;
+    };
+    if (count == 0) {
+        out("  blk scrub   : REFUSED: BadCount\n", .{});
+        return;
+    }
+    const removed = virtio_blk.scrubRange(lba, count) catch |err| {
+        out("  blk scrub   : REFUSED: {s}\n", .{@errorName(err)});
+        return;
+    };
+    out("  blk scrub   : lba {d} +{d}, {d} bad entr(ies) cleared, readback PASS\n", .{ lba, count, removed });
+}
+
+/// `blk` — the block layer's view, storage health, fsck and the test-only
+/// media fault injector. No boot test runs here; `uprobe` step 20 does that.
+fn cmdBlk(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
     if (!virtio_blk.present()) {
         out("  no block device attached\n", .{});
+        return;
+    }
+    const sub = tokens.next() orelse "info";
+    if (std.mem.eql(u8, sub, "health")) {
+        printStorageHealth();
+        return;
+    }
+    if (std.mem.eql(u8, sub, "fsck")) {
+        cmdBlkFsck();
+        return;
+    }
+    if (std.mem.eql(u8, sub, "inject")) {
+        cmdBlkInject(tokens);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "clear")) {
+        virtio_blk.clearFault();
+        out("  blk inject  : cleared\n", .{});
+        return;
+    }
+    if (std.mem.eql(u8, sub, "scrub")) {
+        cmdBlkScrub(tokens);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "viz")) {
+        const seconds = std.fmt.parseInt(u32, tokens.next() orelse "8", 10) catch 8;
+        cmdBlkViz(seconds);
+        return;
+    }
+    if (!std.mem.eql(u8, sub, "info") and !std.mem.eql(u8, sub, "")) {
+        out("  usage: blk [info|health|fsck|inject <read|write|flush> <lba> <sectors> <failures>|clear|scrub <lba> <sectors>|viz <s>]\n", .{});
         return;
     }
     const d = virtio_blk.stats;
@@ -2311,6 +2524,7 @@ fn cmdBlk() void {
         block.stats.sectors,   block.stats.bytes,      block.stats.errors,
     });
     out("  irq: {d} routed, {d} acknowledged\n", .{ virtio_blk.interruptId(), virtio_blk.interruptCount() });
+    printStorageHealth();
 }
 
 /// `part` — the partition table of the attached disk, as the parser sees it.
@@ -3139,7 +3353,7 @@ fn execute(ctx: Context, line: []const u8) void {
     } else if (std.mem.eql(u8, command, "virtio")) {
         cmdVirtio();
     } else if (std.mem.eql(u8, command, "blk")) {
-        cmdBlk();
+        cmdBlk(&tokens);
     } else if (std.mem.eql(u8, command, "part")) {
         cmdPart();
     } else if (std.mem.eql(u8, command, "fat")) {

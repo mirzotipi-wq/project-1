@@ -32,6 +32,7 @@ const irq = @import("../kernel/irq.zig");
 const driver = @import("../kernel/driver.zig");
 const fdt = @import("../lib/fdt.zig");
 const timer = @import("../arch/aarch64/timer.zig");
+const storage_health = @import("../lib/storage_health.zig");
 
 pub const sector_size = 512;
 pub const block_device: u32 = 2;
@@ -83,6 +84,104 @@ var interrupt_count: u64 = 0;
 /// re-negotiate and retry — the recovery path, forced on real hardware instead
 /// of waiting for a sick disk. Never armed outside `selfTest`.
 var inject_timeout_once = false;
+
+/// Phase 49: operational media health and a bounded test-only fault injector.
+/// The policy lives in `lib/storage_health.zig`; this driver owns the retry and
+/// quarantine edges because those are part of the virtio request state machine.
+var g_health: storage_health.Health = .{};
+var g_warned_warnings: u32 = 0;
+
+const Fault = struct {
+    active: bool = false,
+    op: storage_health.Op = .read,
+    lba: u64 = 0,
+    count: u32 = 0,
+    remaining: u32 = 0,
+
+    fn applies(self: *Fault, op: storage_health.Op, lba: u64, count: u32) bool {
+        if (!self.active or self.remaining == 0 or self.op != op) return false;
+        // A flush has no byte range: match any flush while the fault is armed.
+        if (op == .flush) return true;
+        if (self.count == 0) return false;
+        const a_end = std.math.add(u64, self.lba, self.count) catch return true;
+        const b_end = std.math.add(u64, lba, count) catch return true;
+        return self.lba < b_end and lba < a_end;
+    }
+
+    fn consume(self: *Fault) void {
+        if (self.remaining != 0) self.remaining -= 1;
+        if (self.remaining == 0) self.active = false;
+    }
+};
+
+var g_fault: Fault = .{};
+
+pub fn healthSnapshot() storage_health.Snapshot {
+    return g_health.snapshot();
+}
+
+pub fn healthState() storage_health.State {
+    return g_health.state;
+}
+
+pub fn badBlocks() []const storage_health.BadBlock {
+    return g_health.badSlice();
+}
+
+/// Test-only injection: the next `failures` requests that overlap this range
+/// return a simulated medium I/O error without touching the device. A caller
+/// can then prove recovery or quarantine on real filesystem reads.
+pub fn injectFault(op: storage_health.Op, lba: u64, count: u32, failures: u32) void {
+    g_fault = .{
+        .active = failures != 0 and count != 0,
+        .op = op,
+        .lba = lba,
+        .count = count,
+        .remaining = failures,
+    };
+}
+
+pub fn clearFault() void {
+    g_fault = .{};
+}
+
+pub fn faultActive() bool {
+    return g_fault.active and g_fault.remaining != 0;
+}
+
+pub fn faultRemaining() u32 {
+    return g_fault.remaining;
+}
+
+pub fn scrubRange(lba: u64, count: u32) block_mod.Error!u32 {
+    if (count == 0) return 0;
+    if (count > 1024) return error.NoSpace;
+    var buf: [8 * sector_size]u8 align(8) = undefined;
+    var done: u32 = 0;
+    while (done < count) {
+        const chunk: u32 = @min(@as(u32, 8), count - done);
+        try request(.read, lba + done, &buf, chunk * sector_size, true);
+        done += chunk;
+    }
+    return g_health.clearBad(lba, count);
+}
+
+fn opOf(kind: ReqType) storage_health.Op {
+    return switch (kind) {
+        .read => .read,
+        .write => .write,
+        .flush => .flush,
+    };
+}
+
+fn warnIfNeeded() void {
+    const s = g_health.snapshot();
+    if (s.warnings == g_warned_warnings) return;
+    g_warned_warnings = s.warnings;
+    klog.warn("blk", "storage health {s}: {d} retry(ies), {d} recovered, {d} unrecovered, {d} bad block(s), {d} warning(s)", .{
+        s.state.label(), s.retries, s.recovered, s.unrecovered, s.bad_count, s.warnings,
+    });
+}
 
 pub fn present() bool {
     return ready;
@@ -151,6 +250,11 @@ fn interruptFor(node_off: usize) u32 {
 
 /// Take a transport that already negotiated features and a live queue 0.
 pub fn attach(t: virtio.Mmio, q: *virtio.Queue, node_off: usize, wanted: u64) !void {
+    // Health belongs to one attachment: a re-probed device must not inherit a
+    // previous device's quarantine or warning count.
+    g_health.reset();
+    g_warned_warnings = 0;
+    g_fault = .{};
     transport = t;
     queue = q;
     features = t.device_features;
@@ -180,7 +284,7 @@ pub fn attach(t: virtio.Mmio, q: *virtio.Queue, node_off: usize, wanted: u64) !v
     });
     ready = true;
     klog.info("blk", "virtio-blk: {d} sectors ({d} MiB), features 0x{x}, flush {s}", .{
-        capacity, (capacity * sector_size) / (1024 * 1024), features,
+        capacity,                                              (capacity * sector_size) / (1024 * 1024), features,
         if (flushSupported()) "negotiated" else "not offered",
     });
 }
@@ -197,6 +301,9 @@ pub fn detach() void {
     capacity = 0;
     queue = null;
     intid = 0;
+    g_health.reset();
+    g_warned_warnings = 0;
+    g_fault = .{};
     block_mod.uninstall();
 }
 
@@ -260,11 +367,16 @@ fn recover() void {
     klog.warn("blk", "device reset and re-negotiated after {d} timeout(s)", .{stats.timeouts});
 }
 
-fn request(kind: ReqType, lba: u64, buf: ?[*]u8, len: u32) block_mod.Error!void {
+fn request(kind: ReqType, lba: u64, buf: ?[*]u8, len: u32, bypass_bad: bool) block_mod.Error!void {
     if (!ready) return error.NoDevice;
     const q = queue orelse return error.NoDevice;
+    const sectors: u32 = if (kind == .flush) 0 else len / sector_size;
     if (kind != .flush) {
         if (!block_mod.fits(capacity, lba, len)) return error.NoSpace;
+        if (!bypass_bad and g_health.isBad(lba, sectors)) {
+            g_health.noteBadRefusal();
+            return error.BadBlock;
+        }
     } else if (!flushSupported()) {
         return error.Unsupported;
     }
@@ -277,6 +389,21 @@ fn request(kind: ReqType, lba: u64, buf: ?[*]u8, len: u32) block_mod.Error!void 
 
     var attempt: u8 = 0;
     while (attempt < max_attempts) : (attempt += 1) {
+        const op = opOf(kind);
+
+        // A simulated medium error follows the same retry path as a real I/O
+        // status: it is never a silent success and it never reaches the device
+        // with a half-built descriptor chain.
+        if (g_fault.applies(op, lba, sectors)) {
+            g_fault.consume();
+            stats.io_errors += 1;
+            stats.retries += 1;
+            g_health.noteRetry(op, .io, lba, sectors);
+            warnIfNeeded();
+            backoff(attempt);
+            continue;
+        }
+
         const chain_len: usize = if (kind == .flush) 2 else 3;
         const head = q.allocChain(chain_len) orelse return error.NoMemory;
         q.setDesc(head, 0, @intFromPtr(&header), header.len, false);
@@ -286,8 +413,12 @@ fn request(kind: ReqType, lba: u64, buf: ?[*]u8, len: u32) block_mod.Error!void 
         q.setDesc(head, chain_len - 1, @intFromPtr(&status_byte), 1, true);
         status_byte[0] = 0xFF;
 
+        // The phase-34 self-test forces one timeout; that test fault is not a
+        // production media warning and must not degrade the health surface on
+        // every clean boot. Operational timeouts still do.
+        const forced_timeout = inject_timeout_once;
         q.submit(head);
-        if (inject_timeout_once) {
+        if (forced_timeout) {
             inject_timeout_once = false;
             // Deliberately no notify: this request is invisible to the device.
         } else {
@@ -297,8 +428,16 @@ fn request(kind: ReqType, lba: u64, buf: ?[*]u8, len: u32) block_mod.Error!void 
         if (!waitCompletion(q)) {
             stats.timeouts += 1;
             stats.retries += 1;
+            if (!forced_timeout) {
+                g_health.noteRetry(op, .timeout, lba, sectors);
+                warnIfNeeded();
+            }
             recover();
-            if (!ready) return error.IoError;
+            if (!ready) {
+                g_health.noteFailure(op, .timeout, lba, sectors);
+                warnIfNeeded();
+                return error.IoError;
+            }
             backoff(attempt);
             continue;
         }
@@ -313,32 +452,44 @@ fn request(kind: ReqType, lba: u64, buf: ?[*]u8, len: u32) block_mod.Error!void 
                 .flush => stats.flushes += 1,
             }
             if (kind == .read) stats.sectors_read += len else if (kind == .write) stats.sectors_written += len;
+            g_health.complete(op, sectors);
+            if (attempt != 0 and !forced_timeout) {
+                g_health.noteRecovered(op, lba);
+                warnIfNeeded();
+            }
             return;
         }
         if (status == status_unsupported) {
             stats.unsupported += 1;
+            g_health.noteFailure(op, .unsupported, lba, sectors);
+            warnIfNeeded();
             return error.Unsupported;
         }
         stats.io_errors += 1;
         stats.retries += 1;
+        g_health.noteRetry(op, .io, lba, sectors);
+        warnIfNeeded();
         backoff(attempt);
     }
     stats.failures += 1;
+    g_health.noteFailure(opOf(kind), .io, lba, sectors);
+    if (kind != .flush) _ = g_health.addBad(lba, sectors);
+    warnIfNeeded();
     return error.IoError;
 }
 
 pub fn readSectors(lba: u64, buf: [*]u8, count: u32) block_mod.Error!void {
     if (count == 0) return;
-    return request(.read, lba, buf, count * sector_size);
+    return request(.read, lba, buf, count * sector_size, false);
 }
 
 pub fn writeSectors(lba: u64, buf: [*]const u8, count: u32) block_mod.Error!void {
     if (count == 0) return;
-    return request(.write, lba, @constCast(buf), count * sector_size);
+    return request(.write, lba, @constCast(buf), count * sector_size, false);
 }
 
 pub fn flush() block_mod.Error!void {
-    return request(.flush, 0, null, 0);
+    return request(.flush, 0, null, 0, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +757,7 @@ pub fn selfTest() SelfTest {
                         var at: usize = 0;
                         while (at < sector_size and got[at] == expected[at]) : (at += 1) {}
                         klog.warn("blk", "readback mismatch: lba {d} (chunk {d} sector {d}) lens {d}/{d} first differing byte {d}: got 0x{x:0>2} want 0x{x:0>2}", .{
-                            lba + k, lba, k, got.len, expected.len, at,
+                            lba + k,                          lba,                                        k, got.len, expected.len, at,
                             if (at < got.len) got[at] else 0, if (at < expected.len) expected[at] else 0,
                         });
                     }

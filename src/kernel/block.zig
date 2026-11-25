@@ -35,6 +35,9 @@ pub const Error = error{
     Timeout,
     IoError,
     Unsupported,
+    /// The device driver quarantined this LBA range after exhausting retries.
+    /// Callers must report it, not retry forever or silently substitute data.
+    BadBlock,
 };
 
 pub const Op = enum(u8) { read, write, flush };

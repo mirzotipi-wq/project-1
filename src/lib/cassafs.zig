@@ -65,6 +65,7 @@ pub const checkpoint_payload_size: usize = 120;
 
 pub const Error = error{
     Io,
+    BadBlock,
     ReadOnly,
     NoDevice,
     OutOfRange,

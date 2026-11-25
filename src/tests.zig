@@ -48,6 +48,7 @@ test {
     _ = @import("lib/page_cache.zig");
     _ = @import("lib/retail.zig");
     _ = @import("lib/sale_log.zig");
+    _ = @import("lib/storage_health.zig");
     _ = @import("kernel/input.zig");
     _ = @import("lib/edid.zig");
     _ = @import("lib/display_mode.zig");

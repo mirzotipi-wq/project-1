@@ -75,14 +75,20 @@ fn blockRead(ctx: *anyopaque, block_index: u32, buf: *[cassafs.block_size]u8) ca
     const view: *block_view.View = @ptrCast(@alignCast(ctx));
     const sectors_per_block: u64 = cassafs.block_size / block.sector_size;
     const lba = @as(u64, block_index) * sectors_per_block;
-    view.read(lba, buf[0..]) catch return error.Io;
+    view.read(lba, buf[0..]) catch |err| return switch (err) {
+        error.BadBlock => error.BadBlock,
+        else => error.Io,
+    };
 }
 
 fn blockWrite(ctx: *anyopaque, block_index: u32, buf: *const [cassafs.block_size]u8) cassafs.Error!void {
     const view: *block_view.View = @ptrCast(@alignCast(ctx));
     const sectors_per_block: u64 = cassafs.block_size / block.sector_size;
     const lba = @as(u64, block_index) * sectors_per_block;
-    view.write(lba, buf[0..]) catch return error.Io;
+    view.write(lba, buf[0..]) catch |err| return switch (err) {
+        error.BadBlock => error.BadBlock,
+        else => error.Io,
+    };
 }
 
 fn blockFlush(ctx: *anyopaque) cassafs.Error!void {
@@ -165,6 +171,7 @@ pub fn explain(err: anyerror) void {
         error.Unsupported => out("  cassafs     : partition 1 is not a 4 KiB-aligned CASSAFS-sized volume\n", .{}),
         error.BadSuperblock, error.BadMagic => out("  cassafs     : no valid CASSAFS superblock; format the volume first\n", .{}),
         error.BadCrc => out("  cassafs     : CRC32C mismatch; the volume is damaged\n", .{}),
+        error.BadBlock => out("  cassafs     : the storage layer quarantined a bad sector; run 'blk scrub' after inspecting 'blk health'\n", .{}),
         error.BadRecord => out("  cassafs     : malformed log record\n", .{}),
         error.BadSequence => out("  cassafs     : log sequence is not contiguous\n", .{}),
         error.BadCheckpoint => out("  cassafs     : checkpoint does not match the superblock\n", .{}),
@@ -233,12 +240,18 @@ fn printSuper(status: cassafs.SuperStatus, slot: []const u8) void {
     }
 }
 
+/// The read-only fsck entry point: attach partition 1 and run the complete
+/// CASSAFS verifier (superblock CRC, every log record, inode tree, extents, data
+/// CRC and free map). It returns the actual error so the shell can print a
+/// distinct refusal (including `BadBlock`) instead of a generic failure.
+pub fn fsck() !*const cassafs.Report {
+    const device = try attach();
+    g_report = try cassafs.scan(device, &workspace, &inode_storage);
+    return &g_report;
+}
+
 fn load() ?*cassafs.Report {
-    const device = attach() catch |err| {
-        explain(err);
-        return null;
-    };
-    g_report = cassafs.scan(device, &workspace, &inode_storage) catch |err| {
+    _ = fsck() catch |err| {
         explain(err);
         return null;
     };
