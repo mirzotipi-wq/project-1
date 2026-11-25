@@ -2665,11 +2665,78 @@ tenders are one-per-receipt and promotions are line-scoped; the seeded day is
 fixed and tax-free while VAT20/VAT5 are validated by host tests; and the model
 remains single-writer kernel state behind the shell.
 
-### Phase 48 — Transactional sale log `[ ]`
+### Phase 48 — Transactional sale log `[x]`
 **Goal:** A sale is committed or it never happened.
 **Build:** Idempotent transaction records, write-ahead ordering with CASSAFS, replay,
 sequence numbers, terminal identity stamping.
 **Done when:** Duplicate submissions after a network retry never double-count a sale.
+
+**Shipped.** `/catalog/sales.log` is a bounded append-only transaction log. Each
+committed sale is one 512-byte record appended at the committed file end through
+the real VFS/CASSAFS `writeAt` path, flushed through the phase-44 page cache and
+read back before the shell prints a receipt. The pure model in
+`src/lib/sale_log.zig` holds a 64-byte immutable header (no mutable count; count
+is derived from file length), up to 16 records, four 64-byte lines per record,
+a global sequence, a terminal-local sequence, `(terminal_id, txn_id)` as the
+idempotency key, both CRCs and a previous-record CRC chain. `src/kernel/sales.zig`
+resolves the terminal, SKU, catalog price and tax class from the phase-47 retail
+snapshot, computes line/subtotal/tax/total in the kernel (the shell cannot pass
+or invent a price), and refuses missing terminals, SKUs, tax classes, full logs,
+bad sequences, conflicts and any committed-prefix damage. `sales init`, `sell`,
+`report`, `verify`, `replay` and a test-only `corrupt` are wired into the shell;
+`retail.loadForSales()`/`saleDb()` and `vfs.flushCache()` expose the existing
+layers without a second storage or import path.
+
+**Evidence.**
+- `zig build` clean; `zig build test --summary all` reports **248/248**, up from
+  243 (+5): round-trip with the CRC chain, exact-retry no-op and changed-payload
+  `Conflict`, corrupted record/broken predecessor/sequence gap, terminal-local
+  sequence and capacity bounds, non-zero tax acceptance and malformed-total/
+  amount refusal.
+- `python3 tools/qemu_sales48_test.py` **PASS** on QEMU 8.2.2. The same disk
+  first re-imports the phase-45 FAT32 catalog as **10,000 rows / 220,021 bytes /
+  CRC32C `0x8678e4e7`** and reproduces the phase-47 **239-record** day, then
+  creates `/catalog/sales.log` with a 64-byte header, 0/16 transactions and
+  8,256-byte capacity.
+- The booted guest commits **three sales**: sequence 1 (T1, local 1, txn 5001,
+  2 lines, **680 cents**), sequence 2 (T2, local 1, txn 5002, 1 line, **150
+  cents**) and sequence 3 (T1, local 2, txn 5003, 2 lines, **725 cents**). Each
+  prints a 512-byte record at offsets 64/576/1088 and a 576/1088/1600-byte log
+  after `flush + reread PASS`. The report is **3 transactions, 6 units, subtotal
+  1,555, tax 0, total 1,555 cents, 2 terminals**; T1 is 1,405 cents and T2 is 150
+  cents. `sales verify` passes and `sales replay` prints the same chain.
+- An exact retry of `T1/5001` prints `duplicate ... at sequence 1; no append, no
+  double count`; a changed payload under the same key is `REFUSED: Conflict`;
+  unknown terminals and SKUs are refused; the committed count stays three.
+- `vfs cache flush` + `vfs cache drop`, `vfs unmount /` + remount, and a soft
+  reboot each preserve the same verify/report result. After the reboot the same
+  retry is still a no-op, proving the key is derived from the committed log, not
+  process memory.
+- `sales corrupt` flips one byte in the last record; `sales verify` prints
+  `REFUSED: RecordCorrupt` and a sell over it also refuses rather than appending.
+  The refusal survives a cache drop, unmount/remount and another soft reboot.
+- All ten prior harnesses pass unchanged, one at a time: input (13 digits, 0 ms
+  suffix-to-queue assertion), USB 4/4, power thermal **2374 → 4039 ms (1.70x)**
+  with repeats at **2389 → 3847 ms (1.61x)** and **2361 → 3870 ms (1.64x)**
+  (host-timing spread around the prior 1.69x sample; the harness asserts
+  throttling, not a fixed ratio), CASSAFS/VFS/VFS-write, page cache (23/64
+  pages, 79%, 21/6 cold, 37 ms sale commit, 64/64 pages, 344 evictions, 88
+  writebacks, 20 flushes; asserted sale CRC `0x12b569fa`), FAT32 10,000
+  rows/220,021 B/`0x8678e4e7`, phase-46 VFS and phase-47 retail (239 records).
+- Design, exact record layout and observed lines: `docs/sales-phase48.md`.
+
+**Limits.** The log is 16 transactions / four lines / 8,256 bytes with no
+rotation or compaction; a full log refuses with `Full`. The shell is the only
+writer; there is no concurrent till or multi-writer protocol. A non-record-aligned
+tail after a crash refuses the whole log as `Truncated` rather than repairing or
+discarding it; recovery tooling is future work. CRC32C proves integrity, not
+authentication. Catalog prices/tax are resolved at verify time, so a later price
+change makes an old sale fail `PriceMismatch`/`TaxMismatch`; the seeded demo
+products are `ZERO`-tax, so booted tax is 0 while VAT20/VAT5 remain host-tested.
+Tender is one exact tender; no split tender, change, card settlement or network
+retry service. The timestamp is `uptimeMs`, not wall-clock time, and is not part
+of idempotency. Terminal identity is the retail ID plus local sequence; the code
+is resolved for display. `sales corrupt` is a test fault injector.
 
 ### Phase 49 — Storage health `[ ]`
 **Goal:** Fail predictably, not suddenly.

@@ -106,6 +106,13 @@ pub fn fileWriteAt(handle: u32, offset: u64, data: []const u8) vfs.Error!usize {
     return g_vfs.writeAt(handle, offset, data);
 }
 
+/// Commit every dirty CASSAFS page before a caller acknowledges a durable
+/// transaction. Phase 48 uses this as the `fsync` boundary for its sale log.
+pub fn flushCache() !void {
+    if (!g_root_mounted) return error.NotMounted;
+    try cassafs.flushMountCache();
+}
+
 pub fn mount() bool {
     if (mounted()) {
         out("  vfs mount   : refused: / is already mounted\n", .{});

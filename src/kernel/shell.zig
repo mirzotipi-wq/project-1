@@ -53,6 +53,7 @@ const journal = @import("journal.zig");
 const cassafs = @import("cassafs.zig");
 const vfs = @import("vfs.zig");
 const retail = @import("retail.zig");
+const sales = @import("sales.zig");
 const wdt = @import("../devices/i6300esb.zig");
 const power_lib = @import("../lib/power.zig");
 const keymap = @import("../lib/keymap.zig");
@@ -115,6 +116,8 @@ fn printHelp() void {
         \\                       lock, watch, unwatch, events, import <csv>, selftest
         \\  retail <sub>         retail model: init, import <csv>, seedday, report,
         \\                       verify, corrupt (durability/audit proof)
+        \\  sales <sub>          transactional sale log: init, sell <terminal> <txn>
+        \\                       <sku> <qty> ..., report, verify, replay, corrupt
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -3151,6 +3154,8 @@ fn execute(ctx: Context, line: []const u8) void {
         if (is_viz) drainConsole();
     } else if (std.mem.eql(u8, command, "retail")) {
         retail.command(&tokens);
+    } else if (std.mem.eql(u8, command, "sales")) {
+        sales.command(&tokens);
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();
     } else if (std.mem.eql(u8, command, "fb")) {

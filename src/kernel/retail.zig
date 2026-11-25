@@ -78,6 +78,17 @@ fn persist() !void {
     try writeSnapshot(g_disk[0..]);
 }
 
+/// Used by the phase-48 sale log to resolve catalog prices, tax classes and
+/// terminal identities. The retail snapshot remains the source of catalog
+/// truth; the sale log never invents a price.
+pub fn loadForSales() !void {
+    try loadSnapshot();
+}
+
+pub fn saleDb() *const retail.Db {
+    return &g_db;
+}
+
 fn loadOrInit() !void {
     loadSnapshot() catch |err| {
         if (err != error.NotFound) return err;

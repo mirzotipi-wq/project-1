@@ -160,15 +160,15 @@ row-sink tests (ordered delivery and rejection).
 ## Limits (honest)
 
 - The model is a **snapshot**, not a transaction log. A save rewrites the whole
-  file; phase 48's idempotent transaction log is the path to per-sale commits
-  without exhausting CASSAFS's append-only record budget.
+  file; phase 48 now provides the idempotent transaction log for per-sale
+  commits without exhausting CASSAFS's append-only record budget.
 - One 61,480-byte file, 480 records, 16-byte codes and 32-byte names. Larger
   catalogs need a paged/indexed format; this phase deliberately refuses them.
 - CASSAFS still has no `mkdir`, so the database lives in the demo volume's
   existing `/catalog` directory. No unlink/rename/truncate is used.
 - The demo day is fixed (time base 2026-01-01, fixed receipts and terminal
-  assignment) for reproducibility; live time and terminal sequence allocation
-  are phase 48 work.
+  assignment) for reproducibility; phase 48 ships terminal-local sequence
+  allocation, while wall-clock time remains later work.
 - User records carry role and terminal assignment, not a PIN/password
   credential or a cryptographic verifier. Authentication is a later layer.
 - Receipts store a status/tender flag, not a full tender split (one tender per
