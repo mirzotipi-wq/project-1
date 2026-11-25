@@ -223,26 +223,50 @@ The observations were:
 | Harness | Observed |
 |---|---|
 | `qemu_input_test.py` | `4006381333931 (13 chars)` becomes one barcode event; suffix-to-queue delivery stays within the 20 ms budget; no-input boot PASS |
-| `qemu_usb_test.py` | **4/4** scenarios: HID, hub, FTDI serial, no-controller |
+| `qemu_usb_test.py` | **4/4** scenarios: HID, hub, FTDI serial, no-controller; `USB scenarios: 4/4 PASS` |
 | `qemu_power_test.py` | normal → critical throttling PASS; brownout, fallback and dashboard PASS. The harness asserts throttling, not a fixed ratio, so wall-clock timings are not claimed as constants. |
 | `qemu_cassafs_test.py` | format/verify/read-back/reboot/fallback/corruption/absence PASS |
 | `qemu_vfs_test.py` | mount/read/refusals/fallback/reboot PASS |
 | `qemu_vfs_write_test.py` | write/overwrite, out-of-space and corruption refusal PASS |
-| `qemu_page_cache_test.py` | 23/64 pages, 79% hit; 21 hit/6 miss cold; 22 readahead; sale commit within the 100 ms budget; 64/64 pages, 344 evictions, 88 writebacks, 20 flushes; harness-asserted sale CRC `0x12b569fa`; drop/remount/host verify PASS |
+| `qemu_page_cache_test.py` | 23/64 pages, 79% hit; 21 hit/6 miss cold; 22 readahead; sale commit within the 100 ms budget; 64/64 pages, 344 evictions, 88 writebacks, 20 flushes; `sale file: 33 B, CRC32C 0x12b569fa (asserted)`; drop/remount/host verify PASS |
 | `qemu_fat32_test.py` | **10,000 rows / 220,021 B / max line 21 / CRC32C `0x8678e4e7`**; read-only, remount, reboot, corrupt-chain and one-partition cases PASS |
 | `qemu_vfs46_test.py` | three-backend paths, tmpfs, chmod, locks, watches, remount PASS |
 | `qemu_retail_test.py` | 239 records, 64 receipts, 128 lines; cache drop/remount/reboot and `RecordCorrupt` refusal PASS |
 | `qemu_sales48_test.py` | 3 transactions / 6 units / 1,555 cents / 2 terminals; `sales verify : PASS, 3 transaction(s)`; duplicate/no-op, `Conflict` and `RecordCorrupt` PASS |
 | `qemu_storage49_test.py` | transient read/flush recovery, persistent `REFUSED: Io` then `REFUSED: BadBlock`, scrub recovery and raw `REFUSED: BadCrc` PASS |
 
-The page-cache harness asserts the 33-byte sale file's `0x12b569fa` CRC rather
-than printing it, so that is a checked value, not a transcript line.
+The page-cache harness prints `sale file: 33 B, CRC32C 0x12b569fa (asserted)`.
+The USB harness prints `USB scenarios: 4/4 PASS`.
 
-The phase-48 sale-chain CRC is timestamp-dependent because each committed record
-carries the boot's uptime. The harness asserts chain validity and `PASS`, not a
-fixed CRC. The support bundle was `1312 B` / `0x66d093ce` in the observed runs;
-the harness checks its size, readback and internal CRC rather than hard-coding the
-printed value.
+### Sale-chain CRC proof
+
+The phase-48 record stores its timestamp at bytes 80..87. `src/kernel/sales.zig`
+sets that field to `timer.uptimeMs()`, which is derived from the physical
+`CNTPCT` counter since boot. `src/lib/sale_log.zig` includes bytes 0..507 —
+including the timestamp — in the 512-byte record CRC, and `sales chain` prints the
+last record's CRC. Three consecutive `qemu_sales48_test.py` runs from this head
+produced:
+
+| Run | Last record timestamp | `sales chain` CRC |
+|---|---:|---:|
+| 1 | 5724 ms | `0x41ad2bcc` |
+| 2 | 5741 ms | `0xc01391d0` |
+| 3 | 5795 ms | `0x7718a800` |
+
+Every run still printed `sales report : 3 transaction(s), 6 unit(s), subtotal
+1555, tax 0, total 1555 cents` and `sales verify : PASS, 3 transaction(s)`. The
+observed range is therefore boot-time dependent, not a drift defect: the exact
+varying input is the physical-counter millisecond value at the sale commit. No
+fixed chain CRC is valid and the harness intentionally does not assert one.
+
+The same CRC property explains the apparently stable bundle checksum. Three
+recovery runs produced audit timestamps 4427, 4471 and 4431 ms with record CRCs
+`0x6ad7e41a`, `0x7f58e2dc` and `0x6903b1f0`; the extracted audit bytes differed,
+but the audit's whole-file CRC stayed `0xc0d5ba9c` and the bundle CRC stayed
+`0x66d093ce`. The record ends in its own CRC32C, so a CRC across that
+self-checksummed record has a constant residue. The host reader verified that the
+bundle's 576-byte audit segment equals the audit bytes exactly. The stable bundle
+CRC is an integrity residue, not a content digest.
 
 ## Limits (honest)
 
@@ -266,6 +290,10 @@ printed value.
   quoted strings with spaces.
 - **No background snapshot or automatic rollback.** Every operation is explicit
   and bounded; there is no watchpoint that rolls back a running app.
+- **The bundle CRC is not a content hash.** It is a CRC32C residue over a bundle
+  whose audit record ends in its own CRC. A changed sale timestamp with a
+  recomputed record CRC can leave the printed bundle CRC unchanged; use the
+  audit record fields, not that one number, to distinguish support bundles.
 - **Corrupt snapshot slots fail closed.** A corrupted slot or header makes the
   set refuse; there is no attempt to guess bytes or silently choose a stale slot.
 - **Test hooks are compiled in.** `recovery corrupt config|snapshot` intentionally

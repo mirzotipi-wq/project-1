@@ -2815,7 +2815,10 @@ the sale-log audit excerpt and phase-49 health counters, with a CRC32C.
 disk carrying phase-45 **10,000 rows / 220,021 B / CRC32C `0x8678e4e7`**,
 phase-47 **239 records / 64 receipts / 128 lines**, one phase-48 sale with
 `sales verify : PASS, 1 transaction(s)`, and phase-49 `blk fsck : PASS` plus
-`health : healthy`. Configuration init is generation 1 / 1 of 4 slots; two
+`health : healthy`. The sale chain CRC is boot-uptime dependent: three
+consecutive sales48 runs printed `0x41ad2bcc`, `0xc01391d0` and `0x7718a800`
+with last-record times 5724, 5741 and 5795 ms, so no fixed CRC is asserted.
+Configuration init is generation 1 / 1 of 4 slots; two
 changes produce generation 3; an explicit snapshot lands in slot 3. A raw
 config corruption prints `recovery verify : REFUSED: BadCrc`; one
 `recovery rollback` prints `restored generation 3 from slot 3, store "North

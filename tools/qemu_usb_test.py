@@ -489,6 +489,7 @@ def main() -> int:
         for scenario in scenarios:
             scenario()
             print(f"[ok]   {scenario.__name__}")
+        print(f"USB scenarios: {len(scenarios)}/{len(scenarios)} PASS")
     except Failure as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1

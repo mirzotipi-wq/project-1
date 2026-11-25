@@ -162,6 +162,7 @@ def page_cache_scenario() -> None:
         ssize, scrc = cat_summary(sale, "/receipts/sale44.tmp")
         check(ssize == 33 and scrc == "0x12b569fa",
               f"sale file is {ssize}/{scrc}, expected 33/0x12b569fa")
+        log(f"      sale file: {ssize} B, CRC32C {scrc} (asserted)")
         check("sale=43 sku=1001 qty=1 total=250" in sale, "sale payload is wrong")
 
         screenshot(machine)
