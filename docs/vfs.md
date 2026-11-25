@@ -1,9 +1,10 @@
-# CassaOS VFS (phases 42–44)
+# CassaOS VFS (phases 42–45)
 
 The VFS is a namespace above filesystem backends with read and write handles. It is implemented
-in `src/lib/vfs.zig`; CASSAFS is the first backend, in `src/lib/cassafs_vfs.zig`, and the kernel
-front end is `src/kernel/vfs.zig`. The design is deliberately backend-neutral: a second
-filesystem provides the same callbacks and a root inode.
+in `src/lib/vfs.zig`; CASSAFS is the writable root backend in `src/lib/cassafs_vfs.zig`, the
+read-only FAT32 backend is `src/lib/fat32_vfs.zig`, and the kernel front end is
+`src/kernel/vfs.zig`. The design is backend-neutral: both filesystems provide the same
+callbacks and a root inode, and the core has no CASSAFS or FAT32 types.
 
 ## Namespace
 
@@ -17,9 +18,10 @@ filesystem provides the same callbacks and a root inode.
   commands in phase 42 (`/`).
 
 Mounts are longest-prefix entries in an eight-entry table. A mount at `/` owns the normal
-namespace; a mount at `/mnt/data` would shadow only that component subtree. Path lookup
-selects the longest matching mount point, then walks the remaining components through the
-backend. There is no second backend yet, but the VFS has no CASSAFS types in its core.
+namespace; a mount at `/media/usb` shadows only that component subtree. Path lookup selects
+the longest matching mount point, then walks the remaining components through the backend.
+The kernel mounts CASSAFS at `/` and can mount the read-only FAT32 reader at `/media/usb`
+from partition 2; the core knows neither backend's types.
 
 ## Nodes and handles
 
@@ -41,6 +43,23 @@ stat; the VFS updates the node before returning. `close` releases the handle.
 
 Unmount checks every open handle and refuses with `Busy` while one references the mount.
 A successful unmount removes the mount and every node that belonged to it.
+
+## FAT32 read-only backend
+
+`src/lib/fat32_vfs.zig` wraps the phase-36 driver. FAT32 has no inode number, so a stable
+backend inode is the directory entry's on-disk `(sector, slot)` packed into a `u64`; the root
+is inode 1. The adapter caches up to 128 entry locations, resolves names case-insensitively,
+walks subdirectories by cluster, hides `.` and `..`, and validates a file's FAT chain against
+its directory size before exposing it. Reads call `fat32.readFileRange`, which streams from a
+cluster chain without the old whole-file 64 KiB buffer. The backend is registered with
+`writable = false`; the VFS therefore refuses a write/create open with `ReadOnly` before the
+backend can be asked, and the backend's create/write callbacks also return `ReadOnly`.
+
+Mounting validates the BPB, FAT geometry, FAT[0] media marker and root directory before the
+VFS table gets an entry. A corrupt file chain is refused when the file is looked up; a
+self-loop in the FAT cannot become a partial catalog read. The phase-45 fixture is a
+foreign-formatted 204,800-sector FAT32 partition with a 22-character LFN file, 201,616
+512-byte clusters and root cluster 2. See [fat32-reader.md](fat32-reader.md).
 
 ## CASSAFS backend
 
@@ -67,7 +86,9 @@ flushes and invalidates it. See [page-cache.md](page-cache.md).
 
 ```text
 vfs mount                 scan partition 1 and mount CASSAFS at /
-vfs unmount               remove the mount (refused while handles are open)
+vfs mount usb             mount read-only FAT32 from partition 2 at /media/usb
+vfs unmount               remove the root mount (refused while handles or /media/usb exist)
+vfs unmount usb           remove /media/usb (refused while handles are open)
 vfs info                  mount, volume, node/handle and I/O counters
 vfs ls [path]             stable readdir; a file is refused
 vfs stat <path>           type, inode, parent, size and mode
@@ -76,6 +97,7 @@ vfs create <path>         create a regular file and a write handle
 vfs write <path> <off> <text>  offset write through a write handle
 vfs df                    log head, free blocks, record budget and next inode
 vfs read <path> <off> <n> range read, clamped at EOF
+vfs import <csv>          stream and validate a catalog CSV through the VFS
 vfs cache [stats|flush|drop|bench]  page cache counters, flush, invalidate, sale-commit probe
 vfs selftest              namespace, handles, EOF, readdir and access checks
 vfs viz [seconds]         live dashboard, if a framebuffer is present
@@ -90,7 +112,10 @@ an 8-block volume refusing a create with `NoSpace`, and a committed payload corr
 medium being refused with `CRC32C mismatch` and no mount entry. The phase-44 harness proves
 mount-warmed hits/misses, readahead, bounded dirty write-back and a sale-sized commit under the
 100 ms budget, then drops the cache and checks the same committed bytes after unmount/remount and
-with the host verifier.
+with the host verifier. The phase-45 harness mounts a foreign FAT32 partition read-only, decodes
+its 22-character LFN, streams 10,000 rows/220,021 bytes/CRC32C `0x8678e4e7` through `vfs import`,
+refuses writes, repeats the import after unmount/remount and a soft reboot, and refuses a looped
+FAT chain with `integrity failure` while the CASSAFS root stays readable.
 
 ## Limits
 
@@ -99,8 +124,12 @@ with the host verifier.
   met. The harness covers clean unmount/remount, soft reboot and deliberate corruption.
 - One writer per handle and no concurrent handle-table locking or shared file offsets. The shell
   is single-threaded, and the VFS tables are kernel-owned.
-- CASSAFS on partition 1 only; the mount table supports other points and backends, but no other
-  backend exists.
+- CASSAFS on partition 1 is the only writable backend. FAT32 on partition 2 is read-only and
+  only one FAT32 mount is supported at a time; the phase-36 driver owns static scratch buffers,
+  and there is no USB mass-storage driver yet. A second partition stands in for the vendor stick.
+- FAT32 exposes no ownership/mode/timestamps beyond a fixed read-only file mode; LFN non-ASCII
+  units become `?`, names are capped at 63 bytes and LFN checksums are not validated. The CSV
+  importer accepts only the exact `sku,name,price_cents` header and unquoted three-field rows.
 - The phase-41 reference format caps a volume at 128 inodes/records, 128 log records and eight
   extents per file (128 KiB per file). The PLAN's 100k-file tree and 2%-of-page-cache random-read
   target cannot be met by this pass; larger format bounds are a later scale-out change.

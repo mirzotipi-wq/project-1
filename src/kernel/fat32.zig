@@ -311,7 +311,14 @@ pub const Volume = struct {
     };
 
     pub fn iterStart(self: *Volume) Iter {
-        return .{ .cluster = self.geo.root_cluster, .slot = 0, .total = self.entriesPerCluster() };
+        return self.iterStartAt(self.geo.root_cluster);
+    }
+
+    /// Iterate a directory other than the root. The same bounded slot/chain
+    /// walk is used, so a corrupt subdirectory is refused instead of becoming
+    /// an out-of-range read.
+    pub fn iterStartAt(self: *Volume, cluster: u32) Iter {
+        return .{ .cluster = cluster, .slot = 0, .total = self.entriesPerCluster() };
     }
 
     pub fn nextItem(self: *Volume, it: *Iter) Error!?DirItem {
@@ -411,8 +418,17 @@ pub const Volume = struct {
     }
 
     pub fn find(self: *Volume, name: []const u8) Error!?DirItem {
-        var it = self.iterStart();
+        return self.findIn(self.geo.root_cluster, name);
+    }
+
+    /// Case-insensitive lookup in one directory. `.` and `..` are entries the
+    /// on-disk format uses for navigation; the VFS never exposes them as
+    /// children.
+    pub fn findIn(self: *Volume, dir_cluster: u32, name: []const u8) Error!?DirItem {
+        if (dir_cluster < 2 or dir_cluster >= self.geo.clusters + 2) return error.Corrupt;
+        var it = self.iterStartAt(dir_cluster);
         while (try self.nextItem(&it)) |item| {
+            if (std.mem.eql(u8, item.name(), ".") or std.mem.eql(u8, item.name(), "..")) continue;
             if (nameEq(item.name(), name)) return item;
         }
         return null;
@@ -553,6 +569,29 @@ pub const Volume = struct {
         return written;
     }
 
+    /// Check that a file's FAT chain explains exactly the size in its directory
+    /// entry. This is the read-only analogue of the old whole-file check: a
+    /// short chain, an extra chain or a loop is corruption, never a file with
+    /// missing or duplicated bytes.
+    pub fn validateFileChain(self: *Volume, first_cluster: u32, size: u32) Error!void {
+        const expected: u32 = if (size == 0) 0 else @intCast((@as(u64, size) + self.geo.cluster_bytes - 1) / self.geo.cluster_bytes);
+        if (expected == 0) return;
+        if (first_cluster < 2 or first_cluster >= self.geo.clusters + 2) return error.Corrupt;
+        var cluster = first_cluster;
+        var seen: u32 = 0;
+        while (seen < expected) : (seen += 1) {
+            const next = try self.chainNext(cluster);
+            if (next == 0xffff_ffff) {
+                if (seen + 1 != expected) return error.Corrupt;
+                return;
+            }
+            cluster = next;
+        }
+        // We consumed exactly `expected` clusters but the chain still points
+        // somewhere: it is longer than the size, or it looped.
+        return error.Corrupt;
+    }
+
     pub const WriteResult = struct {
         clusters: u32 = 0,
         freed: u32 = 0,
@@ -620,6 +659,49 @@ pub const Volume = struct {
         result.clusters = need;
         result.free_after = try self.freeCount();
         return result;
+    }
+
+    /// Stream a byte range from a file without requiring the whole file to fit
+    /// in a buffer. `first_cluster` and `size` come from a validated directory
+    /// entry; the VFS adapter checks the chain once at lookup and then uses this
+    /// for bounded 4 KiB reads. Every skip and every next-cluster step is
+    /// bounded, so a corrupt chain cannot hang the caller.
+    pub fn readFileRange(self: *Volume, first_cluster: u32, size: u32, offset: u64, out: []u8) Error!usize {
+        if (offset >= size or out.len == 0) return 0;
+        const want: usize = @intCast(@min(@as(u64, out.len), @as(u64, size) - offset));
+        if (first_cluster < 2 or first_cluster >= self.geo.clusters + 2) return error.Corrupt;
+        const cb = self.geo.cluster_bytes;
+        const skip: u64 = offset / cb;
+        if (skip > self.geo.clusters + 2) return error.Corrupt;
+
+        var cluster = first_cluster;
+        var step: u64 = 0;
+        while (step < skip) : (step += 1) {
+            const next = try self.chainNext(cluster);
+            if (next == 0xffff_ffff) return error.Corrupt;
+            cluster = next;
+        }
+
+        var done: usize = 0;
+        var in_cluster: u32 = @intCast(offset % cb);
+        while (done < want) {
+            try self.readCluster(cluster, cluster_buf[0..]);
+            const take: usize = @intCast(@min(@as(u64, cb - in_cluster), @as(u64, want - done)));
+            @memcpy(out[done..][0..take], cluster_buf[in_cluster..][0..take]);
+            done += take;
+            in_cluster = 0;
+            if (done == want) break;
+            const next = try self.chainNext(cluster);
+            if (next == 0xffff_ffff) return error.Corrupt;
+            cluster = next;
+        }
+        // If this read reaches EOF, the final cluster must be the end of the
+        // chain. A directory entry that claims a longer chain is corruption.
+        if (offset + want == size) {
+            const next = try self.chainNext(cluster);
+            if (next != 0xffff_ffff) return error.Corrupt;
+        }
+        return done;
     }
 
     pub fn deleteFile(self: *Volume, name: []const u8) Error!u32 {
@@ -1209,6 +1291,37 @@ test "a long name written by another OS is read from its LFN entries" {
     // user will type it.
     try std.testing.expect((try vol.find("longfilename.TXT")) != null);
     _ = made;
+}
+
+test "range reads stream across clusters and refuse a looped chain" {
+    const view = try ramView();
+    defer block.uninstall();
+    _ = try mkfs(view, .{ .total_sectors = test_sectors });
+    var vol = try mount(view);
+
+    var content: [2500]u8 = undefined;
+    for (&content, 0..) |*byte, i| byte.* = @intCast((i * 31 + 7) & 0xff);
+    _ = try vol.writeFile("RANGE.BIN", &content);
+    const item = (try vol.find("RANGE.BIN")) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(u32, 5), (item.size + 511) / 512);
+    try vol.validateFileChain(item.cluster, item.size);
+
+    var whole: [2500]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2500), try vol.readFileRange(item.cluster, item.size, 0, &whole));
+    try std.testing.expectEqualSlices(u8, content[0..], whole[0..]);
+
+    var window: [1200]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1200), try vol.readFileRange(item.cluster, item.size, 500, &window));
+    try std.testing.expectEqualSlices(u8, content[500..1700], window[0..]);
+
+    var tail: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try vol.readFileRange(item.cluster, item.size, 2499, &tail));
+    try std.testing.expectEqual(content[2499], tail[0]);
+    try std.testing.expectEqual(@as(usize, 0), try vol.readFileRange(item.cluster, item.size, 2500, &tail));
+
+    try vol.fatSet(item.cluster, item.cluster);
+    try std.testing.expectError(error.Corrupt, vol.validateFileChain(item.cluster, item.size));
+    try std.testing.expectError(error.Corrupt, vol.readFileRange(item.cluster, item.size, 0, &whole));
 }
 
 test "an 8.3 name is required for creation, and overwriting keeps one entry" {

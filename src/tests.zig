@@ -31,6 +31,7 @@ test {
     _ = @import("kernel/partition.zig");
     _ = @import("kernel/block_view.zig");
     _ = @import("kernel/fat32.zig");
+    _ = @import("lib/catalog_csv.zig");
     _ = @import("lib/font5x7.zig");
     _ = @import("lib/keymap.zig");
     _ = @import("lib/scanner.zig");
@@ -42,6 +43,7 @@ test {
     _ = @import("lib/cassafs.zig");
     _ = @import("lib/vfs.zig");
     _ = @import("lib/cassafs_vfs.zig");
+    _ = @import("lib/fat32_vfs.zig");
     _ = @import("lib/page_cache.zig");
     _ = @import("kernel/input.zig");
     _ = @import("lib/edid.zig");

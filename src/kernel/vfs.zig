@@ -1,18 +1,24 @@
 //! Kernel VFS front end (phase 42).
 //!
 //! The namespace policy, mount table, node table and handles live in
-//! `src/lib/vfs.zig`. This file owns the one registered backend (CASSAFS on
-//! partition 1) and the shell surface: mount/unmount, stat, directory
-//! iteration, sequential reads, range reads and a failure-mode self-test.
+//! `src/lib/vfs.zig`. This file owns the kernel front end and shell surface:
+//! CASSAFS on partition 1 at `/`, the read-only FAT32 reader on partition 2 at
+//! `/media/usb`, stat, directory iteration, range reads, catalog import and a
+//! failure-mode self-test.
 
 const std = @import("std");
 const uart = @import("../devices/pl011.zig");
 const timer = @import("../arch/aarch64/timer.zig");
 const fb = @import("fb.zig");
 const sched = @import("sched.zig");
+const block_view = @import("block_view.zig");
 const cassafs = @import("cassafs.zig");
 const cassafs_lib = @import("../lib/cassafs.zig");
 const cassafs_vfs = @import("../lib/cassafs_vfs.zig");
+const fat32 = @import("fat32.zig");
+const fat32_vfs = @import("../lib/fat32_vfs.zig");
+const catalog_csv = @import("../lib/catalog_csv.zig");
+const partition = @import("partition.zig");
 const vfs = @import("../lib/vfs.zig");
 
 fn out(comptime fmt: []const u8, args: anytype) void {
@@ -22,6 +28,12 @@ fn out(comptime fmt: []const u8, args: anytype) void {
 var g_vfs: vfs.Vfs = .{};
 var g_adapter: cassafs_vfs.Adapter = undefined;
 var g_source: cassafs.MountSource = undefined;
+var g_fat_adapter: fat32_vfs.Adapter = undefined;
+var g_fat_volume: fat32.Volume = undefined;
+var g_fat_table: partition.Table = .{};
+var g_root_mounted = false;
+var g_usb_mounted = false;
+var import_buf: [4096]u8 = undefined;
 
 const demo_catalog = "sku,name,price_cents\n1001,Espresso,250\n1002,Croissant,180\n1003,Water,150\n";
 const demo_welcome = "Welcome to Cassa POS.\nThis volume was formatted by the phase 41 reference formatter.\n";
@@ -59,7 +71,7 @@ fn canonicalPath(path: []const u8, buf: *[vfs.max_path]u8) []const u8 {
 }
 
 pub fn mounted() bool {
-    return g_vfs.mountCount() != 0;
+    return g_root_mounted;
 }
 
 pub fn mount() bool {
@@ -78,6 +90,7 @@ pub fn mount() bool {
         return false;
     };
     g_source = source;
+    g_root_mounted = true;
     const report = source.report;
     out("  vfs mount   : / <- cassafs, format {d}, {d} inode(s), {d} file(s), {d} data byte(s), active {s}{s}\n", .{
         report.format_version,                 report.inode_count,                             report.files, report.data_bytes,
@@ -92,6 +105,10 @@ pub fn mount() bool {
 pub fn unmount() bool {
     if (!mounted()) {
         out("  vfs unmount : refused: nothing is mounted\n", .{});
+        return false;
+    }
+    if (g_usb_mounted) {
+        out("  vfs unmount : refused: /media/usb is still mounted; unmount it first\n", .{});
         return false;
     }
     // The page cache is write-back: unmount must push every dirty page before
@@ -110,7 +127,77 @@ pub fn unmount() bool {
         return false;
     };
     cassafs.invalidateMountCache();
+    g_root_mounted = false;
     out("  vfs unmount : / removed and page cache flushed; mount table 0/1, no dangling nodes or handles\n", .{});
+    return true;
+}
+
+/// Attach the read-only FAT32 reader to partition 2 at `/media/usb`. The plan's
+/// "vendor USB stick" is represented by a second partition until USB mass
+/// storage lands; the reader itself is the same BPB/LFN/cluster-chain path a
+/// real stick uses. The mount is refused, with no table entry, unless the BPB,
+/// FAT geometry and root directory validate.
+pub fn mountUsb() bool {
+    if (!mounted()) {
+        out("  vfs mount   : refused: mount the CASSAFS root at / first\n", .{});
+        return false;
+    }
+    if (g_usb_mounted) {
+        out("  vfs mount   : refused: /media/usb is already mounted\n", .{});
+        return false;
+    }
+    partition.read(.{}, &g_fat_table) catch |err| {
+        out("  vfs mount   : refused: partition table unreadable: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    if (g_fat_table.count < 2) {
+        out("  vfs mount   : refused: no FAT32 partition 2 on this disk\n", .{});
+        return false;
+    }
+    const entry = &g_fat_table.entries[1];
+    const view = block_view.View.fromPartition(entry) catch |err| {
+        out("  vfs mount   : refused: partition 2 lies outside the disk: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    g_fat_volume = fat32.mount(view) catch |err| {
+        out("  vfs mount   : refused: partition 2 is not a mountable FAT32: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    _ = g_fat_volume.list() catch |err| {
+        out("  vfs mount   : refused: FAT32 root directory is unreadable: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    g_fat_adapter = fat32_vfs.Adapter.init(&g_fat_volume);
+    g_vfs.mount("/media/usb", g_fat_adapter.backend()) catch |err| {
+        out("  vfs mount   : refused by the VFS (no table entry was created): {s}\n", .{@errorName(err)});
+        return false;
+    };
+    g_usb_mounted = true;
+    const geo = g_fat_volume.geo;
+    out("  vfs mount   : /media/usb <- fat32, read-only, partition 2 LBA {d}..{d}, {d} B/cluster, {d} cluster(s), root {d}\n", .{
+        entry.first_lba, entry.last_lba, geo.cluster_bytes, geo.clusters, geo.root_cluster,
+    });
+    out("  vfs mount   : mount table {d}/8, node table {d}/{d}, open handles {d}/{d}\n", .{
+        g_vfs.mountCount(), g_vfs.stats().nodes, vfs.max_nodes, g_vfs.stats().handles, vfs.max_handles,
+    });
+    return true;
+}
+
+pub fn unmountUsb() bool {
+    if (!g_usb_mounted) {
+        out("  vfs unmount : refused: /media/usb is not mounted\n", .{});
+        return false;
+    }
+    g_vfs.unmount("/media/usb") catch |err| {
+        if (err == error.Busy) {
+            out("  vfs unmount : refused: open handles still reference /media/usb\n", .{});
+        } else {
+            printError(err);
+        }
+        return false;
+    };
+    g_usb_mounted = false;
+    out("  vfs unmount : /media/usb removed; mount table {d}/8, no dangling nodes or handles\n", .{g_vfs.mountCount()});
     return true;
 }
 
@@ -137,6 +224,13 @@ fn info() void {
     out("  vfs cache   : {d}/{d} page(s) resident ({d}% pressure), {d}/{d} dirty, hit rate {d}% ({d} hit / {d} miss)\n", .{
         cache.used, cache.capacity, cache.pressure(), cache.dirty, cache.max_dirty, cache.hitRate(), cache.hits, cache.misses,
     });
+    if (g_usb_mounted) {
+        const geo = g_fat_volume.geo;
+        out("  vfs info    : /media/usb <- fat32, read-only, {d} cluster(s), {d} B/cluster, root cluster {d}\n", .{
+            geo.clusters, geo.cluster_bytes, geo.root_cluster,
+        });
+        out("  vfs info    : FAT32 directory entries are LFN-decoded on demand; writes are refused by the backend\n", .{});
+    }
 }
 
 fn statPath(path: []const u8) void {
@@ -279,6 +373,9 @@ fn df() void {
     out("  vfs cache   : {d}/{d} page(s), {d}% pressure, {d} dirty\n", .{
         cache.used, cache.capacity, cache.pressure(), cache.dirty,
     });
+    if (g_usb_mounted) {
+        out("  vfs df      : /media/usb is FAT32 read-only; free-cluster scan is not run on the import path\n", .{});
+    }
 }
 
 fn cacheStats() void {
@@ -410,6 +507,56 @@ fn readRange(path: []const u8, offset_text: []const u8, length_text: []const u8)
         uart.writeAll(buf[0..n]);
         if (buf[n - 1] != '\n') out("\n", .{});
     }
+}
+
+/// Stream a CSV catalog through the VFS and validate it without ever holding
+/// the whole file in memory. This is the phase-45 "catalog import" proof: the
+/// CSV parser is bounded, the FAT32 backend reads 4 KiB at a time, and a
+/// malformed or corrupt file is refused instead of being reported as imported.
+fn catalogImport(path: []const u8) void {
+    const h = g_vfs.open(path, "/", .{}) catch |err| {
+        out("  vfs import  : {s}: ", .{path});
+        printReason(err);
+        return;
+    };
+    defer g_vfs.close(h) catch {};
+    const st = g_vfs.statHandle(h) catch |err| {
+        printError(err);
+        return;
+    };
+    if (st.kind == .directory) {
+        out("  vfs import  : refused: {s} is a directory\n", .{path});
+        return;
+    }
+
+    var parser = catalog_csv.Parser{};
+    var crc_state: u32 = 0xffff_ffff;
+    var reads: u32 = 0;
+    while (true) {
+        const n = g_vfs.read(h, &import_buf) catch |err| {
+            out("  vfs import  : read failed at {d} byte(s): {s}\n", .{ parser.bytes, reason(err) });
+            return;
+        };
+        if (n == 0) break;
+        crc_state = cassafs_lib.crc32cUpdate(crc_state, import_buf[0..n]);
+        reads += 1;
+        parser.feed(import_buf[0..n]) catch |err| {
+            out("  vfs import  : refused at line {d}: {s}\n", .{ parser.line_no + 1, @errorName(err) });
+            return;
+        };
+    }
+    const result = parser.finish() catch |err| {
+        out("  vfs import  : refused: {s}\n", .{@errorName(err)});
+        return;
+    };
+    if (result.bytes != st.size) {
+        out("  vfs import  : refused: parsed {d} byte(s), file stat says {d}\n", .{ result.bytes, st.size });
+        return;
+    }
+    out("  vfs import  : {s}, {d} read(s), directed through the VFS/FAT32 chain reader\n", .{ path, reads });
+    out("  vfs import  : {d} data row(s), {d} line(s), {d} byte(s), max line {d}, CRC32C 0x{x:0>8}  PASS\n", .{
+        result.rows, result.lines, result.bytes, result.max_line, ~crc_state,
+    });
 }
 
 const SelfTest = struct {
@@ -560,6 +707,27 @@ fn selfTest() bool {
     suite.check(seen >= 2 and stable, "root readdir returns a stable ordered set");
     g_vfs.close(dir_h) catch {};
 
+    if (g_usb_mounted) {
+        const usb_h = g_vfs.open("/media/usb", "/", .{}) catch {
+            suite.check(false, "FAT32 mount point opens as a directory");
+            return false;
+        };
+        var usb_entry: vfs.DirEntry = .{};
+        const has_usb_entry = g_vfs.readdir(usb_h, 0, &usb_entry) catch false;
+        g_vfs.close(usb_h) catch {};
+        suite.check(has_usb_entry and usb_entry.name_len > 8, "FAT32 readdir decodes a long file name");
+        var usb_path_buf: [vfs.max_path]u8 = undefined;
+        if (std.fmt.bufPrint(&usb_path_buf, "/media/usb/{s}", .{usb_entry.nameSlice()})) |usb_path| {
+            const usb_write = g_vfs.open(usb_path, "/", .{ .read = false, .write = true });
+            suite.check(if (usb_write) |uh| blk: {
+                g_vfs.close(uh) catch {};
+                break :blk false;
+            } else |err| err == error.ReadOnly, "FAT32 write open is refused as read-only");
+        } else |_| {
+            suite.check(false, "FAT32 long-name path fits the VFS boundary");
+        }
+    }
+
     const write_open = g_vfs.open("/catalog/products.db", "/", .{ .read = false, .write = true });
     var write_ok = false;
     if (write_open) |h| {
@@ -643,8 +811,15 @@ fn drawViz() void {
         cache.used, cache.capacity, cache.pressure(), cache.dirty, cache.hitRate(), cache.hits, cache.misses,
     }) catch "cache";
     _ = surface.drawText(24, 136, cache_line, 1, fb.Palette.green);
-    _ = surface.drawText(32, 162, "TREE (real readdir order)", 1, fb.Palette.text_dim);
-    var y: i32 = 186;
+    if (g_usb_mounted) {
+        const geo = g_fat_volume.geo;
+        const usb_line = std.fmt.bufPrint(&line, "USB /media/usb <- FAT32 READ-ONLY  {d} CLUSTERS  {d} B/CLUSTER  ROOT {d}", .{
+            geo.clusters, geo.cluster_bytes, geo.root_cluster,
+        }) catch "USB FAT32 READ-ONLY";
+        _ = surface.drawText(24, 158, usb_line, 1, fb.Palette.amber);
+    }
+    _ = surface.drawText(32, if (g_usb_mounted) 184 else 162, "TREE (real readdir order)", 1, fb.Palette.text_dim);
+    var y: i32 = if (g_usb_mounted) 208 else 186;
     drawTree(surface, "/", 0, &y);
     _ = surface.drawText(24, 748, "CASSAFS write path and 64-page LRU cache are live; journal replay, GC and concurrent writers remain future work.", 1, fb.Palette.text_dim);
 }
@@ -663,9 +838,23 @@ fn viz(seconds: u32) void {
 pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
     const sub = tokens.next() orelse "info";
     if (std.mem.eql(u8, sub, "mount")) {
-        _ = mount();
+        const which = tokens.next();
+        if (which == null) {
+            _ = mount();
+        } else if (std.mem.eql(u8, which.?, "usb") or std.mem.eql(u8, which.?, "fat") or std.mem.eql(u8, which.?, "/media/usb")) {
+            _ = mountUsb();
+        } else {
+            out("  usage: vfs mount [usb]\n", .{});
+        }
     } else if (std.mem.eql(u8, sub, "unmount") or std.mem.eql(u8, sub, "umount")) {
-        _ = unmount();
+        const which = tokens.next() orelse "/";
+        if (std.mem.eql(u8, which, "usb") or std.mem.eql(u8, which, "/media/usb")) {
+            _ = unmountUsb();
+        } else if (std.mem.eql(u8, which, "/")) {
+            _ = unmount();
+        } else {
+            out("  usage: vfs unmount [/|usb]\n", .{});
+        }
     } else if (std.mem.eql(u8, sub, "info")) {
         info();
     } else if (std.mem.eql(u8, sub, "ls") or std.mem.eql(u8, sub, "readdir")) {
@@ -713,12 +902,18 @@ pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
         const offset = tokens.next() orelse "0";
         const length = tokens.next() orelse "128";
         readRange(path, offset, length);
+    } else if (std.mem.eql(u8, sub, "import")) {
+        const path = tokens.next() orelse {
+            out("  usage: vfs import <csv-path>\n", .{});
+            return;
+        };
+        catalogImport(path);
     } else if (std.mem.eql(u8, sub, "selftest") or std.mem.eql(u8, sub, "test")) {
         _ = selfTest();
     } else if (std.mem.eql(u8, sub, "viz")) {
         const seconds = std.fmt.parseInt(u32, tokens.next() orelse "8", 10) catch 8;
         viz(seconds);
     } else {
-        out("  usage: vfs [mount|unmount|info|df|cache [stats|flush|drop|bench]|ls [path]|stat <path>|cat <path>|create <path>|write <path> <offset> <text>|read <path> <offset> <len>|selftest|viz <s>]\n", .{});
+        out("  usage: vfs [mount [usb]|unmount [/|usb]|info|df|cache [stats|flush|drop|bench]|ls [path]|stat <path>|cat <path>|create <path>|write <path> <offset> <text>|read <path> <offset> <len>|import <csv>|selftest|viz <s>]\n", .{});
     }
 }
