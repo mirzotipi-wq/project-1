@@ -51,6 +51,7 @@ const power = @import("power.zig");
 const thermal = @import("thermal.zig");
 const journal = @import("journal.zig");
 const cassafs = @import("cassafs.zig");
+const vfs = @import("vfs.zig");
 const wdt = @import("../devices/i6300esb.zig");
 const power_lib = @import("../lib/power.zig");
 const keymap = @import("../lib/keymap.zig");
@@ -108,6 +109,8 @@ fn printHelp() void {
         \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
         \\  cassafs <sub>        CASSAFS format 1: info, format [empty|demo], demo,
         \\                       dump, verify, cat <path>, viz <s>
+        \\  vfs <sub>            read-only VFS: mount, unmount, info, ls, stat,
+        \\                       cat, read, selftest, viz <s>
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -3137,6 +3140,10 @@ fn execute(ctx: Context, line: []const u8) void {
     } else if (std.mem.eql(u8, command, "cassafs")) {
         const is_viz = std.mem.eql(u8, tokens.peek() orelse "", "viz");
         cassafs.command(&tokens);
+        if (is_viz) drainConsole();
+    } else if (std.mem.eql(u8, command, "vfs")) {
+        const is_viz = std.mem.eql(u8, tokens.peek() orelse "", "viz");
+        vfs.command(&tokens);
         if (is_viz) drainConsole();
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();

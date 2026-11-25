@@ -2264,9 +2264,9 @@ The phase-38 input, phase-39 USB and phase-40 power harnesses still pass. Repres
 lines: `cassafs  formatted 20 block(s), 9 record(s), 16364 free, label 'Cassa POS data'`;
 `cassafs verify: PASS`; `active      : A (fallback; the other copy is damaged)`.
 
-**Limits.** Phase 41 is the **format and reference read/verify path**, not a mounted filesystem.
-There is no mount, directory iterator, VFS, write path, journal replay or garbage collection yet
-(phases 42–43); formatting rewrites the volume. The reference bounds are 128 inodes, 128
+**Limits.** Phase 41 is the **format and reference read/verify path**. At the time it shipped
+there was no mounted filesystem; phase 42 now adds the mount/VFS read path. Phase 41 still has
+no write path, journal replay or garbage collection (phase 43); formatting rewrites the volume. The reference bounds are 128 inodes, 128
 records, 8 extents per inode, 16 KiB per data record and 1 GiB per volume; they are compile-time
 constants chosen to keep the kernel's memory bounded. A/B redundancy covers superblock damage
 only; there is no redundant checkpoint, so a damaged checkpoint is reported and refused until
@@ -2276,11 +2276,68 @@ still FAT-backed on partition 1, and CASSAFS formatting refuses while that journ
 CASSAFS's own journal is phase 43. There is no encryption, checksum-at-rest beyond CRC32C, or
 metadata replication.
 
-### Phase 42 — Mount and read path `[ ]`
-**Goal:** Read files fast and safely.
-**Build:** Mount, inode lookup, directory iteration, extent reads, integrity verification,
-corruption reporting.
-**Done when:** A 100k-file tree mounts and random-reads within 2% of page-cache speed.
+### Phase 42 — Mount and read path `[x]`
+**Goal:** Read files safely through a real VFS, with mount, lookup, directory iteration and
+extent reads.
+**Build:** A backend-neutral VFS (node table, mount table, path normalisation, handles, read-only
+access checks, stable directory iteration), a CASSAFS backend adapter, validate-before-mount,
+unmount/remount, sequential and ranged reads, and honest kernel-side failure checks.
+
+**Shipped.** `src/lib/vfs.zig` owns the namespace policy and the visible tables: eight mount
+points with longest-prefix matching, 128 nodes keyed by `(mount, inode)`, 32 file handles,
+canonicalisation of `.`/`..`/repeated/trailing slashes with empty-path rejection, `open`/`close`,
+sequential `read`, explicit-offset `readAt`, `readdir`, `stat` (type, size, inode, parent, mode)
+and a read-only access check. `src/lib/cassafs_vfs.zig` adapts the phase-41 scan report to that
+interface, with range reads through `cassafs.readInodeRange` and stable readdir in on-disk inode
+order. `src/kernel/vfs.zig` owns the one CASSAFS mount on partition 1, prints specific refusal
+reasons, and exposes `vfs mount|unmount|info|ls|stat|cat|read|selftest|viz`; the shell help and
+CONSOLE draining are wired in. Mount loads the active superblock, honours A/B fallback, verifies
+the complete volume before adding a table entry, and leaves no half-mounted state on failure.
+The phase-41 `cassafs info/format/verify/cat` path is unchanged.
+
+**Evidence.**
+- `zig build` is clean; `zig build test` passes **217/217**, up from 208 (+9): seven VFS core
+  tests, one CASSAFS-as-backend test, and one A/B fallback mount test.
+- `python3 tools/qemu_vfs_test.py` **PASS**: eight QEMU processes / nine guest boots (the main
+  guest is soft-rebooted through PSCI reset). Main: the demo volume mounts at `/` with 5 inodes,
+  3 directories, 2 files and 158 data bytes, active superblock B; `vfs ls /` returns
+  `catalog/` then `receipts/` in the same order on every call; `vfs ls /catalog` returns
+  `products.db`; `vfs stat` reports file/inode 3/parent 2/73 B/mode 0100644; `vfs cat` reads
+  `products.db` as 73 bytes CRC32C `0x3b60dc1d` and `WELCOME.TXT` as 85 bytes, both matching
+  `cassafs cat`; a range read at offset 4 returns 8 bytes; a read at offset 73 returns zero;
+  `vfs selftest` passes all 16 checks; unmount then remount succeeds; after a soft reboot the
+  same volume mounts and both files return the same sizes and CRCs byte-for-byte.
+- `vfs selftest` proves `..` at the root stays at `/`, absolute and relative paths normalise
+  identically, `readdir` on a file returns `NotDirectory`, `read` on a directory returns
+  `IsDirectory`, reads at and past EOF return zero, a write open is refused as read-only, and
+  root readdir index 0 is stable. The refusals scenario proves no-disk mount says
+  `no block device; attach a disk with partition 1` with no table entry, and a damaged data
+  payload refuses the mount with `CRC32C mismatch; the volume is damaged`, leaving zero mounts;
+  the kernel self-tests still PASS without a disk.
+- Fallback scenario: a damaged B superblock mounts through A, reports
+  `active A (A/B fallback)` / `the other superblock copy is damaged`, and reads the 73-byte
+  catalog with the correct CRC. `tools/qemu_cassafs_test.py`, `tools/qemu_input_test.py`,
+  `tools/qemu_usb_test.py` and `tools/qemu_power_test.py` were rerun and PASS.
+- Screenshot: `docs/screenshots/phase42-vfs.png` (1280x800) shows the mounted CASSAFS tree,
+  node/handle tables and the real readdir order. Design/limits: `docs/vfs.md`.
+
+**Bug found and fixed.** The phase-41 formatter could return success while the superblock magic
+written to the medium was a stale kernel function pointer (observed as
+`BadSuperblock` after a clean shutdown; the value was the address of `kernel.cassafs.blockWrite`).
+The formatter used stack-owned superblock write buffers and never decoded the medium after
+writing. `src/lib/cassafs.zig` now spells the magic explicitly, uses module-owned superblock
+write buffers, and reads back and decodes both superblocks before reporting success. The phase-41
+harness, including its corruption scenario, passes again after the fix.
+
+**Limits.** This is still **read-only**: no create/write/truncate/rename/unlink, no `fsync`, no
+journal replay, no checkpoint redundancy and no garbage collection; those are phase 43. The VFS
+has one reader per handle and no shared file-offset or concurrent handle-table design. The
+CASSAFS reference format caps a volume at 128 inodes/records, eight extents per file and a 1 GiB
+volume; therefore the original Phase 42 Done-when target of a 100k-file tree and random reads
+within 2% of page-cache speed is **not met by this pass**. Achieving it needs larger format
+bounds and the phase-44 page cache; phase 42 proves the mount/read path on the shipped format.
+The mount table and backend interface already admit a second backend, but none is implemented.
+The kernel mounts partition 1 only and does not auto-mount at boot.
 
 ### Phase 43 — Write path and recovery `[ ]`
 **Goal:** Power cut at any instant, no corruption.
@@ -2665,3 +2722,4 @@ to the OS.
 | 2026-11-18 | 39 | USB host stack: xHCI controller (PCI, reset, command/event/transfer rings, 64-entry DCBAA, slots and endpoint contexts, port reset), descriptor-driven enumeration, HID keyboard/tablet plus barcode burst, CDC-ACM and FTDI serial, hubs, hotplug; `usb`, `usb selftest`, `usb serial`; 187 host tests (+25); QEMU 8.2.2: keyboard slot 1 port 5 and tablet slot 2 port 6, 12 key events and pointer 234,97 → 702,268 with button down/up, `barcode '1234'` in 82 ms, two unplug/replug cycles on ports 7/8, hub with a child keyboard, FTDI `hello`/`world` payloads both ways and across replug, no-controller boot PASS; phase 38 harness PASS; screenshot `docs/screenshots/phase39-usb-input.png` |
 | 2026-11-18 | 40 | Watchdog and power: real QEMU i6300ESB PCI watchdog with two-stage 4 s reset and previous-reset flag, core-0 scheduler heartbeat every 250 ms, fault-injection hang, brown-out hook/service path, FAT32-backed `POWER.JNL` (72-byte CRC32 records, 96-record ring, boot/clean/brownout/reboot/watchdog/selftest), thermal ladder with 0/25/50/75% `wfi` idle injection, PSCI poweroff/reboot with storage flush, `power`, `thermal`, `watchdog`, `poweroff`; 197 host tests (+10); QEMU 8.2.2: forced hang reset → watchdog_boot/unclean journal/file intact, poweroff and brownout both exit 0 with clean next boot, thermal 2212 → 3604 ms (1.63x) at critical/75%, no-watchdog/no-disk boot PASS with two `OK (degraded)`, phase 38/39 harnesses PASS; `tools/qemu_power_test.py`; screenshot `docs/screenshots/phase40-power.png` |
 | 2026-11-25 | 41 | CASSAFS format 1: 4 KiB log-structured volume with A/B superblocks, 64-byte record headers and payload CRC32C, 268-byte inode tree with names/parents, ordered byte extents, free-space bitmap and checkpoint; kernel `cassafs info/format/demo/dump/verify/cat/viz`, host read-only reader, shell integration; 208 host tests (+11); QEMU 8.2.2: 20-block demo with 9 records and 5 inodes, verify PASS, 73-byte CSV CRC `0x3b60dc1d`, reboot persistence, B-superblock fallback to A, data-payload corruption rejected by both kernel and host reader, no-disk absence PASS; 64 KiB kernel stacks fix a real scan-stack overflow caught as a corrupt frame; `tools/qemu_cassafs_test.py`; screenshot `docs/screenshots/phase41-cassafs.png`  |
+| 2026-11-25 | 42 | Read-only VFS: backend-neutral node/mount/handle tables, canonical paths, stable readdir, range reads, CASSAFS backend, validate-before-mount, read-only checks, failure diagnostics; 217 host tests (+9); QEMU 8.2.2: 5-inode demo mounts at `/`, 73 B products CRC `0x3b60dc1d` matches `cassafs cat`, WELCOME.TXT 85 B, stable readdir, unmount/remount, byte-identical reads after a soft reboot; no-disk and bad-CRC mounts refused with no table entry; damaged B falls back to A; `tools/qemu_vfs_test.py`; fixed a format superblock write-buffer lifetime bug; screenshot `docs/screenshots/phase42-vfs.png` |

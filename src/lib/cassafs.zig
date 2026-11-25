@@ -646,6 +646,12 @@ fn checkFixture(fixture: Fixture) Error!void {
     }
 }
 
+/// Format-owned write buffers. A block transport is allowed to retain the
+/// caller's buffer until its request is retired; keeping these in module
+/// storage means a late retirement can never see a reused stack frame.
+var format_superblock_raw: [superblock_size]u8 = undefined;
+var format_superblock_block: [block_size]u8 = undefined;
+
 pub fn format(device: Device, fixture: Fixture, workspace: []u8) Error!FormatStats {
     if (device.blocks < 8 or device.blocks > max_volume_blocks) return error.NoSpace;
     if (workspace.len < workspaceRequired(device.blocks)) return error.BufferTooSmall;
@@ -783,6 +789,10 @@ pub fn format(device: Device, fixture: Fixture, workspace: []u8) Error!FormatSta
         .timestamp = fixture.created_sec,
     };
     var sb = Superblock{
+        // Spell the magic out here as well as in the field default. A format
+        // must never depend on an optimised default copy for the one value
+        // that decides whether the volume is mountable at all.
+        .magic = superblock_magic,
         .total_blocks = device.blocks,
         .generation = 1,
         .checkpoint_block = checkpoint_block,
@@ -796,17 +806,25 @@ pub fn format(device: Device, fixture: Fixture, workspace: []u8) Error!FormatSta
         .uuid = fixture.uuid,
         .label = label_raw,
     };
-    var superblock_raw: [superblock_size]u8 = undefined;
-    var superblock_block = [_]u8{0} ** block_size;
-    encodeSuperblock(sb, &superblock_raw);
-    @memcpy(superblock_block[0..superblock_size], &superblock_raw);
-    try device.write(0, &superblock_block);
+    encodeSuperblock(sb, &format_superblock_raw);
+    @memset(&format_superblock_block, 0);
+    @memcpy(format_superblock_block[0..superblock_size], &format_superblock_raw);
+    try device.write(0, &format_superblock_block);
     sb.generation = 2;
-    encodeSuperblock(sb, &superblock_raw);
-    @memset(&superblock_block, 0);
-    @memcpy(superblock_block[0..superblock_size], &superblock_raw);
-    try device.write(1, &superblock_block);
+    encodeSuperblock(sb, &format_superblock_raw);
+    @memset(&format_superblock_block, 0);
+    @memcpy(format_superblock_block[0..superblock_size], &format_superblock_raw);
+    try device.write(1, &format_superblock_block);
     try device.flush();
+
+    // Read the two superblocks back and decode them before declaring success.
+    // The on-disk image is the contract; returning stats without this check
+    // would let a bad first sector look like a successful format.
+    var verify_block: [block_size]u8 = undefined;
+    try device.read(0, &verify_block);
+    _ = try decodeSuperblock(verify_block[0..superblock_size]);
+    try device.read(1, &verify_block);
+    _ = try decodeSuperblock(verify_block[0..superblock_size]);
 
     stats.log_head = used_blocks;
     stats.used_blocks = used_blocks;
@@ -860,6 +878,51 @@ fn findInode(inodes: []const Inode, ino: u64) ?usize {
         if (inodes[i].ino == ino) return i;
     }
     return null;
+}
+
+/// Read a byte range of one inode through its extents. This is the phase-42
+/// VFS read primitive: it never reads the whole file and never returns bytes
+/// outside the requested range. An offset at or past EOF returns 0; the caller
+/// sees a short read only when the request crosses EOF.
+pub fn readInodeRange(device: Device, report: *const Report, ino: u64, offset: u64, out: []u8) Error!usize {
+    if (out.len == 0) return 0;
+    const idx = findInode(report.inodes, ino) orelse return error.PathNotFound;
+    const inode = &report.inodes[idx];
+    if (inode.kind != .data) return error.BadInode;
+    if (offset >= inode.size) return 0;
+    const want: usize = @intCast(@min(@as(u64, out.len), inode.size - offset));
+    var copied: usize = 0;
+    var e: usize = 0;
+    while (e < inode.extent_count and copied < want) : (e += 1) {
+        const extent = inode.extents[e];
+        const start = extent.logical_offset;
+        const end = start + extent.length;
+        const request_end = offset + want;
+        if (request_end <= start or offset >= end) continue;
+        const first = @max(offset, start);
+        const last = @min(request_end, end);
+        const n: usize = @intCast(last - first);
+        try readExtentRange(device, extent, first - start, out[copied..][0..n]);
+        copied += n;
+    }
+    if (copied != want) return error.BadExtent;
+    return copied;
+}
+
+fn readExtentRange(device: Device, extent: Extent, within: u64, out: []u8) Error!void {
+    const absolute = @as(u64, extent.physical_offset) + within;
+    var block = extent.physical_block + @as(u32, @intCast(absolute / block_size));
+    var offset: usize = @intCast(absolute % block_size);
+    var copied: usize = 0;
+    while (copied < out.len) {
+        var data_block: [block_size]u8 = undefined;
+        try device.read(block, &data_block);
+        const n = @min(out.len - copied, block_size - offset);
+        @memcpy(out[copied..][0..n], data_block[offset..][0..n]);
+        copied += n;
+        block += 1;
+        offset = 0;
+    }
 }
 
 pub fn readFile(device: Device, report: *const Report, path: []const u8, out: []u8) Error!usize {

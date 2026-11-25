@@ -108,7 +108,7 @@ An inode payload is **268 bytes**:
 Every non-root inode has a parent that is a directory, and every child name is unique within
 its parent. The scanner walks each inode to the root, detects cycles and depth overflow, and
 rejects a parent pointer that is not a directory or a sibling-name duplicate. This is the inode
-tree phase 42 will mount.
+tree phase 42 mounts through the VFS.
 
 ## Extents
 
@@ -124,8 +124,8 @@ Each extent is 24 bytes:
 Extents are ordered and contiguous in logical space: the first starts at 0, each next starts
 where the previous ended, and the final end equals the inode's size. The scanner checks every
 extent against a data record's payload range, computes the file CRC from the extents in order
-and compares it with the inode's `data_crc`. A 16 KiB data chunk becomes one extent; phase 42
-can read a file by walking these records with no copy layer.
+and compares it with the inode's `data_crc`. A 16 KiB data chunk becomes one extent; the phase-42
+VFS reads a file by walking these records with no copy layer.
 
 ## Free-space map and checkpoint
 
@@ -179,8 +179,8 @@ tool only reads; the kernel is the only writer in phase 41.
 
 - The log is append-only; there is no garbage collection, in-place update or atomic rename yet
   (phase 43). Formatting rewrites the volume.
-- Mount and ordinary file I/O are phase 42; `cassafs cat` is a read-only diagnostic path, not
-  the VFS.
+- `cassafs cat` is a read-only diagnostic path. Phase 42 mounts the same tree through the VFS
+  (`vfs cat`, `vfs ls`, `vfs stat`); writes and recovery are phase 43.
 - Eight extents and 128 inodes/records are the phase-41 reference bounds; they are compile-time
   constants so the formatter's memory use is bounded on a till.
 - The power journal is still FAT-backed on partition 1. Formatting a volume while that journal

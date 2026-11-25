@@ -39,6 +39,14 @@ var workspace: [cassafs.workspaceRequired(cassafs.max_volume_blocks)]u8 = undefi
 var read_buffer: [cassafs.max_file_bytes]u8 = undefined;
 var g_report: cassafs.Report = .{};
 
+// Phase 42: a mounted volume has its own view, report and inode storage. The
+// diagnostics above must not invalidate a live mount when `cassafs info` or
+// `cassafs verify` runs.
+var mount_view: block_view.View = undefined;
+var mount_inode_storage: [cassafs.max_nodes]cassafs.Inode = undefined;
+var mount_workspace: [cassafs.workspaceRequired(cassafs.max_volume_blocks)]u8 = undefined;
+var mount_report: cassafs.Report = .{};
+
 const demo_catalog = "sku,name,price_cents\n1001,Espresso,250\n1002,Croissant,180\n1003,Water,150\n";
 const demo_welcome = "Welcome to Cassa POS.\nThis volume was formatted by the phase 41 reference formatter.\n";
 
@@ -73,17 +81,17 @@ fn blockFlush(ctx: *anyopaque) cassafs.Error!void {
     view.flush() catch return error.Io;
 }
 
-fn attach() !cassafs.Device {
+fn attachTo(view: *block_view.View) !cassafs.Device {
     if (!block.present()) return error.NoDevice;
     try partition.read(.{}, &g_table);
     if (g_table.count == 0) return error.NoTable;
-    g_view = try block_view.View.fromPartition(&g_table.entries[0]);
-    const sectors = g_view.capacitySectors();
+    view.* = try block_view.View.fromPartition(&g_table.entries[0]);
+    const sectors = view.capacitySectors();
     const sectors_per_block: u64 = cassafs.block_size / block.sector_size;
     if (sectors == 0 or sectors % sectors_per_block != 0) return error.Unsupported;
     if (sectors / sectors_per_block > cassafs.max_volume_blocks) return error.Unsupported;
     return .{
-        .ctx = &g_view,
+        .ctx = view,
         .blocks = @intCast(sectors / sectors_per_block),
         .read_fn = blockRead,
         .write_fn = blockWrite,
@@ -91,7 +99,26 @@ fn attach() !cassafs.Device {
     };
 }
 
-fn explain(err: anyerror) void {
+fn attach() !cassafs.Device {
+    return attachTo(&g_view);
+}
+
+pub const MountSource = struct {
+    device: cassafs.Device,
+    report: *const cassafs.Report,
+};
+
+/// Attach partition 1 and scan the volume into the mount workspace. This is the
+/// only path used by the VFS mount: it does not format, write, or mutate the
+/// volume, and it returns only after the complete log, inode tree, data CRCs and
+/// free map have been verified. A failure leaves no mount state anywhere.
+pub fn mountVolume() !MountSource {
+    const device = try attachTo(&mount_view);
+    mount_report = try cassafs.scan(device, &mount_workspace, &mount_inode_storage);
+    return .{ .device = device, .report = &mount_report };
+}
+
+pub fn explain(err: anyerror) void {
     switch (err) {
         error.NoDevice => out("  cassafs     : no block device; attach a disk with partition 1\n", .{}),
         error.NoTable => out("  cassafs     : no MBR/GPT partition table on the disk\n", .{}),
