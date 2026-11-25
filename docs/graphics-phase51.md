@@ -167,16 +167,16 @@ image. Observed evidence:
 | fat32 | `10000 rows, 220021 B, max line 21, CRC32C 0x8678e4e7` (three imports); corrupt chain and one-partition refusal PASS |
 | vfs46 | `10000 rows, 220021 B, max line 21, CRC32C 0x8678e4e7`; three-backend paths, tmpfs, chmod, locks, watches, remount PASS |
 | retail | `239 records, 64 receipts, 128 lines`; `subtotal 42020, units 160, cash 16540, variance 50`; top `100001 Croissant`; corruption refusal PASS |
-| sales48 | `3 transaction(s), 6 unit(s), subtotal 1555, tax 0, total 1555 cents`; observed boot-dependent chain CRCs `0x9ea23dc9`, `0x3afe457d`, `0x72b85792`, `0x63226e9e`, `0x97a85d13`; retry/conflict/corruption/reboot PASS |
+| sales48 | `3 transaction(s), 6 unit(s), subtotal 1555, tax 0, total 1555 cents`; observed boot-dependent chain CRCs `0x9ea23dc9`, `0x3afe457d`, `0x72b85792`, `0x63226e9e`, `0x97a85d13`, `0x68004180`; retry/conflict/corruption/reboot PASS |
 | storage49 | baseline fsck PASS; transient read/flush recovery; persistent failure `REFUSED: Io` then `REFUSED: BadBlock`; scrub cleared 1 bad entry and fsck PASS; `BadCrc` on separate fixture PASS |
 | recovery50 | config generation 3 in slot 3; `REFUSED: BadCrc` then one-command rollback; bundle **1312 B / CRC32C `0x66d093ce`**; audit **576 B**; factory reset preserve PASS |
 
 The sale-log chain CRC remains intentionally **boot-uptime dependent**. The
 record timestamp at bytes 80..87 is `timer.uptimeMs()` and is inside the record
 CRC, so no fixed sale-chain value is asserted. The phase-51 runs observed
-`0x9ea23dc9`, `0x3afe457d`, `0x72b85792`, `0x63226e9e` and `0x97a85d13` in sales48
+`0x9ea23dc9`, `0x3afe457d`, `0x72b85792`, `0x63226e9e`, `0x97a85d13` and `0x68004180` in sales48
 (3 transactions), and `0x61fa4d8c`, `0x7eb2c829`, `0x74754b4a` and
-`0x68e99b05` and `0x4023c363` in recovery50's one-sale check. Timer-sensitive values are
+`0x68e99b05`, `0x4023c363` and `0xc1f4b88b` in recovery50's one-sale check. Timer-sensitive values are
 representative observations, not golden constants; host load changes them.
 
 ## Limits
