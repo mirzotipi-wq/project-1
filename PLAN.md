@@ -2598,11 +2598,72 @@ because those operations are not implemented. There is one tmpfs mount, one
 FAT32 mount and one CASSAFS root, and the VFS tables remain single-threaded
 kernel-owned state.
 
-### Phase 47 — Retail data model `[ ]`
+### Phase 47 — Retail data model `[x]`
 **Goal:** The schema a store actually needs.
 **Build:** Products, variants, barcodes, prices, tax classes, promotions, users, roles,
 receipts, shifts, drawers, terminals, suppliers.
 **Done when:** A full day of sales can be represented and queried without schema changes.
+
+**Shipped.** `src/lib/retail.zig` defines a bounded, checksummed retail snapshot at
+`/catalog/retail.db`: a 40-byte header plus **480 × 128-byte records**, exactly
+**61,480 bytes**. The thirteen record kinds cover products, variants, barcodes,
+tax classes, promotions, users, roles, receipts, sale lines, shifts, drawers,
+terminals and suppliers. Every record carries a CRC32C over its first 112 bytes;
+the header has its own CRC32C. IDs are globally unique, codes are unique within a
+kind, and names/codes are copied or the row is refused, never truncated.
+
+The model is independent of storage. `src/kernel/retail.zig` loads and saves the
+complete snapshot through the existing VFS → CASSAFS `writeAt` path, so the page
+cache, permissions, mount rules and A/B superblock commit are the same ones
+already proven by phases 43/44. Imports are staged into a second static database
+and only replace the live one after every row and the final relation checks pass.
+The phase-45 CSV parser gained an optional bounded row sink; its old validation
+path and 10,000-row `vfs import` are unchanged. A retail import from the real
+FAT32 fixture consumes eight products; duplicate SKUs and capacity overruns are
+refused without changing the committed day. The seed builds 64 receipts, 128
+sale lines, 3 terminals, 3 shifts, 3 drawers, 4 staff, 8 products, 4 variants, 12
+barcodes, 3 tax classes, 2 promotions and 2 suppliers — 239 records. Validation
+recomputes sale-line arithmetic, promotion discounts, tax from the product's tax
+class, receipt sums from their lines, and shift/drawer variance. `retail report`
+refuses rather than printing a plausible day when any check fails.
+
+**Evidence.**
+- `zig build` clean; `zig build test --summary all` reports **243/243**, up from
+  233 (+10): eight retail tests (tax math, exact day counts/totals and round-trip,
+  duplicate code, corrupted-record CRC, mismatched tax, a valid 20% taxed receipt,
+  capacity/name bounds, and bounded arithmetic refusing an overflowing line) and
+  two CSV row-sink tests (ordered delivery, rejection).
+- `python3 tools/qemu_retail_test.py` **PASS** on QEMU 8.2.2. The same disk
+  re-imports the phase-45 FAT32 catalog as **10,000 rows / 220,021 bytes / max
+  line 21 / CRC32C `0x8678e4e7`**, then imports the eight-product LFN
+  `retail-catalog.csv` through the same VFS/FAT32 path.
+- The booted guest reports **239 records, 64 receipts, 128 lines, 160 units,
+  subtotal 42,020, tax 0, total 42,020 cents, cash 16,540, change 0, drawer
+  variance +50, top `100001 Croissant` 24 units / 4,320 cents**, and `retail
+  verify : PASS`.
+- A duplicate import is refused with `DuplicateCode` and the committed day is
+  still 239 records. `vfs cache flush` + `vfs cache drop` reloads the day from
+  disk; `vfs unmount /` + remount and a soft reboot each preserve the same
+  verify result and totals. `retail corrupt` flips a record byte; the next
+  `retail verify` refuses with `RecordCorrupt` instead of reporting a valid day.
+- All nine prior harnesses pass unchanged, one at a time: input (`4006381333931`,
+  13 chars, 259 ms, 0 ms delivery), USB 4/4, power thermal 2362 → 3995 ms
+  (1.69x), CASSAFS/VFS/VFS-write (7-byte CRC `0xdb03992b`, 8-byte CRC
+  `0x394478f0`), page cache (23/64 pages, 79% hit, 21/6 cold, 37 ms sale commit,
+  64/64 pages, 344 evictions, 88 writebacks, 20 flushes, sale CRC `0x12b569fa`),
+  FAT32 10,000 rows/220,021 B/`0x8678e4e7`, and phase-46 VFS.
+- Design and observed numbers: `docs/retail-phase47.md`.
+
+**Limits.** This is a snapshot, not a transaction log. A save rewrites the whole
+file; 480 records and 61,480 bytes are the bounded model, so the 10k vendor
+catalog is validated by `vfs import` but cannot be loaded into one retail
+snapshot. CASSAFS's append-only record budget makes a per-sale commit per update
+phase-48 work, not a hidden phase-47 feature. There is no `mkdir`/unlink/rename
+on CASSAFS, so the database uses the demo volume's existing `/catalog`; user
+records have role/terminal assignment but no PIN verifier or authentication;
+tenders are one-per-receipt and promotions are line-scoped; the seeded day is
+fixed and tax-free while VAT20/VAT5 are validated by host tests; and the model
+remains single-writer kernel state behind the shell.
 
 ### Phase 48 — Transactional sale log `[ ]`
 **Goal:** A sale is committed or it never happened.
@@ -2962,3 +3023,4 @@ to the OS.
 | 2026-11-25 | 44 | Bounded 4 KiB CASSAFS page cache: 64-page LRU, 16 dirty pages, four-page readahead, write-back eviction/flush, cache pressure stats, `vfs cache stats/flush/drop/bench`, unmount flush, dashboard line; 225 host tests (+6); QEMU: mount 23/64 pages/79% hit, cold-read readahead, 8 sale-sized commits 27–38 ms/100 ms with 16 catalog reads/1,264 B, 64/64 pages/344 evictions/88 writebacks/20 flushes/0 dirty, sale 33 B CRC `0x12b569fa` survives cache drop/unmount/remount/host verify; fixed a real 64 KiB stack overflow after cache insertion by moving the bounce page off-stack and raising stacks to 128 KiB; all prior harnesses PASS; screenshot `docs/screenshots/phase44-cache.png` |
 | 2026-11-25 | 45 | Read-only FAT32 reader backend: LFN lookup, stable slot-derived inodes, bounded chain/range reads, exact chain validation, `/media/usb` mount on partition 2, read-only enforcement, streaming `vfs import` CSV parser; 231 host tests (+6); QEMU: 22-char LFN `store-catalog-2026.csv`, 10,000 rows/220,021 B/max line 21/CRC32C `0x8678e4e7`, long-name readdir and stat, read-only write/create refusal, unmount/remount and soft-reboot reimport, looped FAT chain refused with CASSAFS root intact, one-partition USB mount refused; all seven prior harnesses PASS unchanged; `tools/qemu_fat32_test.py`; design `docs/fat32-reader.md` |
 | 2026-11-25 | 46 | Unified VFS across three backends: bounded writable tmpfs at `/tmp` (16 nodes, 4 KiB/file, nested dirs), optional backend mkdir/chmod, mode-bit permissions, advisory shared/exclusive file locks, 8-watch/16-event inotify-style queue with created/modified/mounted/unmounted events and drop accounting; `vfs mount tmpfs`, `mkdir`, `chmod`, `lock`, `watch`, `unwatch`, `events`; 233 host tests (+2); QEMU 8.2.2: 3 mounts, identical canonical paths for CASSAFS/FAT32/tmpfs, 7 B CRC `0x6d6a12e7`, chmod 444 refusal then 644 append to 9 B CRC `0x9e9cac38`, exclusive conflict/shared coexistence, 2 events, remount; FAT32 import 10,000 rows/220,021 B/`0x8678e4e7`; all eight prior harnesses PASS; fixed a real virtio-input drain race between IRQ and shell polling (IRQ-safe lock); `tools/qemu_vfs46_test.py`; design `docs/vfs-phase46.md` |
+| 2026-11-25 | 47 | Retail data model: 480 × 128-byte CRC32C-checked records (61,480 B) for products, variants, barcodes, prices, tax classes, promotions, users, roles, receipts, sale lines, shifts, drawers, terminals and suppliers; staged FAT32 CSV import; deterministic 239-record day (64 receipts/128 lines/160 units, subtotal 42,020 / tax 0 / cash 16,540 / variance +50); 243 host tests (+10); QEMU: phase-45 10k import 10,000/220,021 B/`0x8678e4e7`, 8-product retail import, duplicate refusal, cache flush/drop, unmount/remount, reboot, corrupted record refused with `RecordCorrupt`; all nine prior harnesses PASS; `tools/qemu_retail_test.py`; design `docs/retail-phase47.md` |

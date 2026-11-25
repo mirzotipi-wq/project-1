@@ -81,6 +81,31 @@ pub fn mounted() bool {
     return g_root_mounted;
 }
 
+/// Narrow file API for kernel subsystems that own their own format logic (the
+/// phase-47 retail store is the first). Paths are always resolved against the
+/// VFS root and every operation goes through the same permissions, cache and
+/// backend callbacks as the shell commands.
+pub fn fileOpen(path: []const u8, flags: vfs.OpenFlags) vfs.Error!u32 {
+    if (!g_root_mounted) return error.NotMounted;
+    return g_vfs.open(path, "/", flags);
+}
+
+pub fn fileClose(handle: u32) void {
+    g_vfs.close(handle) catch {};
+}
+
+pub fn fileStat(handle: u32) vfs.Error!vfs.Stat {
+    return g_vfs.statHandle(handle);
+}
+
+pub fn fileReadAt(handle: u32, offset: u64, dest: []u8) vfs.Error!usize {
+    return g_vfs.readAt(handle, offset, dest);
+}
+
+pub fn fileWriteAt(handle: u32, offset: u64, data: []const u8) vfs.Error!usize {
+    return g_vfs.writeAt(handle, offset, data);
+}
+
 pub fn mount() bool {
     if (mounted()) {
         out("  vfs mount   : refused: / is already mounted\n", .{});

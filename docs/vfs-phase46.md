@@ -88,9 +88,10 @@ Observed on the final build:
 - The same VFS reimports the phase-45 FAT32 catalog:
   **10,000 rows, 220,021 bytes, max line 21, CRC32C `0x8678e4e7`**.
 
-Host tests: `zig build test --summary all` reports **233/233**, up from 231.
-The two new tests cover nested tmpfs paths and the permission/lock/event
-contract. `zig build` is clean.
+Host tests at phase 46: `zig build test --summary all` reported **233/233**, up
+from 231. The two new tests cover nested tmpfs paths and the permission/lock/
+event contract. On the current phase-47 tree the same suite reports **243/243**
+(the phase-47 model and CSV sink tests are additive); `zig build` is clean.
 
 ## Regression sweep
 

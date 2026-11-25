@@ -52,6 +52,7 @@ const thermal = @import("thermal.zig");
 const journal = @import("journal.zig");
 const cassafs = @import("cassafs.zig");
 const vfs = @import("vfs.zig");
+const retail = @import("retail.zig");
 const wdt = @import("../devices/i6300esb.zig");
 const power_lib = @import("../lib/power.zig");
 const keymap = @import("../lib/keymap.zig");
@@ -112,6 +113,8 @@ fn printHelp() void {
         \\  vfs <sub>            VFS: mount [usb|tmpfs], unmount [/|usb|tmpfs], info,
         \\                       ls, stat, cat, mkdir, chmod, create, write, read,
         \\                       lock, watch, unwatch, events, import <csv>, selftest
+        \\  retail <sub>         retail model: init, import <csv>, seedday, report,
+        \\                       verify, corrupt (durability/audit proof)
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -3146,6 +3149,8 @@ fn execute(ctx: Context, line: []const u8) void {
         const is_viz = std.mem.eql(u8, tokens.peek() orelse "", "viz");
         vfs.command(&tokens);
         if (is_viz) drainConsole();
+    } else if (std.mem.eql(u8, command, "retail")) {
+        retail.command(&tokens);
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();
     } else if (std.mem.eql(u8, command, "fb")) {

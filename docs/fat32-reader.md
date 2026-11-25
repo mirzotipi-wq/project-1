@@ -47,7 +47,9 @@ cache exists for this backend because there is no write path.
 4 KiB at a time, updates CRC32C over every byte, feeds the CSV parser, then
 checks that the parsed byte count equals the directory size. It prints the row
 count, line count, byte count, maximum line length, CRC32C and a PASS/refusal
-verdict. It does not write a product database; schema ingestion is phase 47.
+verdict. Phase 47 adds an optional row sink to the parser and uses it to build
+the retail snapshot in `docs/retail-phase47.md`; the default `vfs import` path
+still only validates and prints the CRC.
 
 The test fixture is a foreign-formatted 204,800-sector FAT32 volume:
 
@@ -79,9 +81,9 @@ image and proves:
    but `vfs import` refuses with `integrity failure`; the CASSAFS root remains
    readable. No partial catalog is reported as imported.
 
-Host tests (`zig build test`) are **231/231**, including 10k-row parsing across
-7/31/4093-byte boundaries, malformed input, FAT32 range reads and the read-only
-VFS mount.
+Host tests (`zig build test`) are now **243/243**, including 10k-row parsing
+across 7/31/4093-byte boundaries, malformed input, ordered/rejected row sinks,
+FAT32 range reads and the read-only VFS mount.
 
 ## Limits
 
@@ -94,5 +96,6 @@ VFS mount.
   does not validate LFN checksums. `.`/`..` are hidden from the VFS.
 - File size is the FAT 32-bit field. No write, `fsync`, permissions model,
   timestamp exposure, partition auto-discovery or hotplug.
-- The CSV importer is deliberately strict and only validates an import; it does
-  not yet build the phase-47 product schema, index 100k items or merge data.
+- The CSV importer is deliberately strict. Its default `vfs import` path only
+  validates; phase 47's optional sink builds the bounded 480-record retail
+  snapshot. There is no 100k-item index or merge/update path yet.

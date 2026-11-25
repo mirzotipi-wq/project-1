@@ -22,6 +22,21 @@ pub const Error = error{
     LineTooLong,
     NoRows,
     AlreadyFinished,
+    SinkRejected,
+};
+
+pub const Row = struct {
+    sku: []const u8,
+    name: []const u8,
+    price_cents: []const u8,
+};
+
+/// Optional row consumer. The slices point into the parser's line buffer and
+/// are valid only for the duration of the callback; a durable consumer copies
+/// what it needs immediately. Returning false refuses the import at that row.
+pub const Sink = struct {
+    ctx: *anyopaque,
+    on_row: *const fn (ctx: *anyopaque, row: Row) bool,
 };
 
 pub const Result = struct {
@@ -41,6 +56,7 @@ pub const Parser = struct {
     max_line_seen: u16 = 0,
     header_ok: bool = false,
     finished: bool = false,
+    row_sink: ?Sink = null,
 
     /// Consume the next chunk. A malformed header or row is refused at the
     /// first byte that proves it; the caller must not treat later chunks as a
@@ -101,6 +117,10 @@ pub const Parser = struct {
             if (fields[0].len == 0 or fields[0].len > 12 or !digits(fields[0])) return error.BadRow;
             if (fields[1].len == 0 or !printable(fields[1])) return error.BadRow;
             if (fields[2].len == 0 or fields[2].len > 12 or !digits(fields[2])) return error.BadRow;
+            if (self.row_sink) |sink| {
+                const row = Row{ .sku = fields[0], .name = fields[1], .price_cents = fields[2] };
+                if (!sink.on_row(sink.ctx, row)) return error.SinkRejected;
+            }
             self.rows += 1;
         }
         self.line_no += 1;
@@ -182,6 +202,36 @@ test "bad header, malformed row and oversized line are refused" {
     try long.feed(prefix);
     const filler = [_]u8{'x'} ** max_line;
     try std.testing.expectError(error.LineTooLong, long.feed(&filler));
+}
+
+const SinkProbe = struct {
+    seen: u32 = 0,
+    reject_at: u32 = 0,
+
+    fn onRow(ctx: *anyopaque, row: Row) bool {
+        const self: *SinkProbe = @ptrCast(@alignCast(ctx));
+        self.seen += 1;
+        if (self.reject_at != 0 and self.seen == self.reject_at) return false;
+        return row.sku.len != 0 and row.name.len != 0 and row.price_cents.len != 0;
+    }
+};
+
+test "a row sink receives every imported product in order" {
+    var probe = SinkProbe{};
+    var parser = Parser{};
+    parser.row_sink = .{ .ctx = &probe, .on_row = SinkProbe.onRow };
+    try parser.feed("sku,name,price_cents\n1001,Coffee,250\n1002,Cake,400\n");
+    const result = try parser.finish();
+    try std.testing.expectEqual(@as(u32, 2), result.rows);
+    try std.testing.expectEqual(@as(u32, 2), probe.seen);
+}
+
+test "a rejecting row sink stops the import" {
+    var probe = SinkProbe{ .reject_at = 2 };
+    var parser = Parser{};
+    parser.row_sink = .{ .ctx = &probe, .on_row = SinkProbe.onRow };
+    try std.testing.expectError(error.SinkRejected, parser.feed("sku,name,price_cents\n1001,Coffee,250\n1002,Cake,400\n"));
+    try std.testing.expectEqual(@as(u32, 2), probe.seen);
 }
 
 test "an empty data section is refused" {
