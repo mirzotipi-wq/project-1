@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–40 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–41 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -60,7 +60,7 @@ goes to the serial console is now also on the screen. See
 | 12 | generic timer, 1 kHz tick, uptime | `time` shows ticks advancing at 1 kHz |
 | 13 | IRQ-safe spinlocks, per-CPU IRQ counters | `irq` shows 0 spurious, 0 unhandled |
 | 14 | spin/ticket/IRQ locks, atomics, semaphores | `stress 4 20000` → 80000 exact, 0 lost |
-| 15 | kernel threads, 32 KiB stacks, exit and reaping | `threads`; `reap 8` → 0 pages leaked |
+| 15 | kernel threads, 64 KiB stacks, exit and reaping | `threads`; `reap 8` → 0 pages leaked |
 | 16 | preemptive round-robin, work stealing, pinning | `preempt` → equal timeslices on one core |
 | 17 | wait queues, semaphore, timed sleep | `sleep 100`; host tests for blocking |
 | 18 | PSCI SMP bring-up, per-CPU state, reschedule IPI | `cores` shows 4/4 online and switching |
@@ -87,8 +87,9 @@ goes to the serial console is now also on the screen. See
 | 38 | Input: virtio keyboard and tablet over a two-queue virtio-mmio driver (16 posted buffers, IRQ drain/repost, EV_BITS/ABS_INFO classification, absolute scaling to the panel, wheel and three buttons), an ordered IRQ-safe event queue with console mirror, USB HID boot-keyboard/mouse/absolute-pointer decoders, a hold-and-decide barcode scanner with prefix/suffix and ordered release, key remapping, `input`, `input viz`, `hid`, `keymap` | QEMU 8.2.2: `QEMU Virtio Keyboard` and `QEMU Virtio Tablet` bind at irq 78/79 with tablet abs 0..32767; 72 key events and 11 tablet events (pointer 351,146 → 702,292 with button down/up) from `sendkey` and QMP absolute input; a 13-digit burst becomes exactly one barcode event with 0 ms suffix-to-queue delivery; HID self-test PASS; boot without input devices clean; 162 host tests |
 | 39 | USB host stack: xHCI over PCI (BAR mapping, controller reset, command/event/transfer rings, 64-entry DCBAA, slot and endpoint contexts, port reset), descriptor-driven enumeration, HID and CDC-ACM class drivers, FTDI serial bridge, hubs and child devices, unplug/replug, `usb`, `usb selftest`, `usb serial` | QEMU 8.2.2: keyboard slot 1 port 5 and tablet slot 2 port 6 enumerate; 12 key events and pointer 234,97 → 702,268 with button down/up; one `barcode '1234'` from a HID burst; two replug cycles on ports 7/8; a child keyboard behind an 8-port hub; FTDI `hello`/`world` payloads in both directions and across replug; no-controller boot and `usb selftest` PASS; 187 host tests; `tools/qemu_usb_test.py` |
 | 40 | Watchdog and power: real i6300ESB PCI watchdog with a two-stage 4 s reset and previous-reset flag, core-0 scheduler heartbeat, brown-out hooks and emergency service path, FAT32-backed `POWER.JNL` with 72-byte CRC32 records and a 96-record ring, thermal ladder with 0/25/50/75% idle injection, PSCI poweroff/reboot with storage flush, `power`, `thermal`, `watchdog`, `poweroff` | QEMU 8.2.2: forced hang resets in 4 s and the next boot reports `watchdog_boot` with an unclean journal and intact FAT32 file; poweroff and brownout exit 0 and the next boot is clean with the file intact; thermal benchmark 2212 → 3604 ms (1.63x) at critical/75% with 12,990 idle ticks; no-watchdog/no-disk boot PASS with two `OK (degraded)` and `power hang` refused; 197 host tests; `tools/qemu_power_test.py` |
+| 41 | CASSAFS format 1: 4 KiB log-structured volume, A/B superblocks with CRC32C, 64-byte record headers with header and payload CRC32C, 268-byte inode tree (parent/name), ordered byte extents, free-space bitmap, checkpoint, on-disk versioning; kernel `cassafs info/format/demo/dump/verify/cat/viz`, read-only host reference reader, shell integration | QEMU 8.2.2: 64 MiB MBR partition formats to 20 blocks/9 records/5 inodes/2 files/158 data bytes with 16,364 free; verify PASS covers every CRC, tree edge, extent, data CRC and bitmap bit; 73-byte CSV CRC `0x3b60dc1d` read by guest and host; reboot persistence; damaged B superblock falls back to A; corrupted data payload rejected by both; no-disk absence PASS; 208 host tests (+11); `tools/qemu_cassafs_test.py`; screenshot `docs/screenshots/phase41-cassafs.png` |
 
-The remaining 60 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 59 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -104,13 +105,26 @@ zig build run-elf   # boot the ELF directly (no device-tree handoff)
 zig build image     # only the flat arm64 Image container
 ```
 
+`zig build` also installs `zig-out/bin/cassafs`, the read-only host reference reader for the
+phase-41 CASSAFS format. It uses the same Zig library as the kernel and takes an image plus an
+MBR partition number or raw byte offset:
+
+```sh
+zig-out/bin/cassafs verify --image disk.img --partition 1
+zig-out/bin/cassafs dump   --image disk.img --partition 1
+zig-out/bin/cassafs cat    --image disk.img --partition 1 --path /catalog/products.db
+```
+
 `zig build run` invokes `qemu-system-aarch64` from `$PATH` (override with
 `-Dqemu=/path/to/qemu-system-aarch64`) with `-smp 4` (override with `-Dsmp=N`) and attaches
 `qemu-xhci`, `usb-kbd` and `usb-tablet`; `run-nousb` is the same boot without any USB controller.
 The power and thermal paths have their own black-box run: `python3 tools/qemu_power_test.py` boots
 QEMU with an `i6300esb` watchdog and a generated FAT32 disk, then checks forced-hang reset,
 graceful poweroff, brownout shutdown, thermal throttling, the degraded no-hardware boot and the
-dashboard screenshot.
+dashboard screenshot. The phase-41 storage format has its own run:
+`python3 tools/qemu_cassafs_test.py` formats a 64 MiB MBR disk, verifies it in the guest and with
+the host reader, reboots on the same image, corrupts a superblock and a payload, and boots with
+no disk at all. The format contract is in [docs/cassafs-format.md](docs/cassafs-format.md).
 The kernel
 console is the first PL011 UART; press Enter for a prompt and type `help`. Concurrency can be
 inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
@@ -163,6 +177,19 @@ HID/pointer counters. Screenshot:
 Power is not a promise in a log line. QEMU attaches a real Intel 6300ESB watchdog over PCI; the scheduler kicks it every 250 ms on core 0, and `power hang` stops those kicks so the hardware resets the machine. The next boot reads the watchdog's reset flag, reports `previous boot was a watchdog reset`, and opens the FAT32-backed `POWER.JNL` to say whether the previous session ended cleanly. `power poweroff` and `power brownout` both run the same flush path: registered filesystems sync, a final journal record is written, the block device flushes, the watchdog is disarmed, and only then does PSCI power off. Thermal policy is visible in the scheduler: warm/hot/critical inject 25/50/75% idle ticks and `thermal bench` is measurably slower at critical, while `thermal clear` returns to 42 C and normal. `power`, `power journal`, `power selftest`, `thermal`, `watchdog` and the top-level `poweroff` expose all of it; `power viz` is the live dashboard. A machine with neither watchdog nor disk still boots, reports both limitations and passes the self-tests. Screenshot:
 [phase40-power.png](docs/screenshots/phase40-power.png).
 
+CASSAFS is the storage format the till will use, and phase 41 ships its byte-level contract.
+The volume is a 4 KiB log-structured format: A/B superblocks, CRC32C on every record header and
+payload, an inode tree with parent pointers and names, ordered byte extents into data records,
+a free-space bitmap and a checkpoint, with explicit format/record versions and incompatible
+feature refusal. `cassafs info` reports the A/B state, log head, tree and free map; `cassafs
+format demo` writes a demo catalog; `cassafs verify` re-derives every CRC, tree edge, extent,
+data CRC and bitmap bit; `cassafs dump` prints the log and extents; `cassafs cat` reads through
+the extents; `cassafs viz` is the live dashboard. The host reader `zig-out/bin/cassafs` verifies
+the same image outside the guest and is the reference dump/verify tool the phase requires. A
+machine with no disk reports the absence and still passes its self-tests; formatting refuses
+while the phase-40 FAT journal is mounted, because that journal is CASSAFS work in phase 43.
+Screenshot: [phase41-cassafs.png](docs/screenshots/phase41-cassafs.png).
+
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
 1 privileged-register attempt, 2 kernel-memory read, 3 two-process isolation, 4 the capability
 suite, 5 the IPC client, 6 the IPC server, 7 the IPC outsider, 8 the shared-memory owner,
@@ -214,17 +241,21 @@ src/devices/         PL011 UART
 src/user/            the EL0 demo program and its embedded image
 src/kernel/          logging, panic, pmm, heap, irq, sync, percpu, thread, sched,
                      smp, addrspace, process, uaccess, syscall, machine, shell, pci,
-                     virtio, block, partition, fat32, fb, input, usb, power,
+                     virtio, block, partition, fat32, cassafs, fb, input, usb, power,
                      thermal, journal
 src/devices/         PL011, PL031, virtio-mmio, virtio-blk, virtio-input, bochs-display, xhci,
                      i6300esb
 src/lib/             freestanding helpers (device tree, EDID, 5x7 font, display modes,
-                     keymap, scanner, USB descriptors/HID/xHCI arithmetic, power policy)
+                     keymap, scanner, USB descriptors/HID/xHCI arithmetic, power policy,
+                     CASSAFS codec/format/verify/read path)
 tools/mkimage.zig    host-side Image wrapper used by the build
+tools/cassafs.zig    read-only host reference reader for CASSAFS images
 tools/qemu_input_test.py  boots with virtio keyboard/tablet, drives them over HMP/QMP
 tools/qemu_usb_test.py    boots xHCI with HID/tablet/hub/FTDI, drives QMP and checks replug
 tools/qemu_power_test.py  watchdog hang/reset, poweroff, brownout, thermal and fallback
+tools/qemu_cassafs_test.py  formats/verifies, reboots, corrupts and checks absence
 src/tests.zig        host unit-test root
+docs/cassafs-format.md  the CASSAFS v1 on-disk contract and limits
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan
 ```

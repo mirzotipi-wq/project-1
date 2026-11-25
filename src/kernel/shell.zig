@@ -50,6 +50,7 @@ const usb_core = @import("usb.zig");
 const power = @import("power.zig");
 const thermal = @import("thermal.zig");
 const journal = @import("journal.zig");
+const cassafs = @import("cassafs.zig");
 const wdt = @import("../devices/i6300esb.zig");
 const power_lib = @import("../lib/power.zig");
 const keymap = @import("../lib/keymap.zig");
@@ -105,6 +106,8 @@ fn printHelp() void {
         \\  blk                  block device and elevator counters
         \\  part                 partition table of the attached disk
         \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
+        \\  cassafs <sub>        CASSAFS format 1: info, format [empty|demo], demo,
+        \\                       dump, verify, cat <path>, viz <s>
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -3131,6 +3134,10 @@ fn execute(ctx: Context, line: []const u8) void {
         cmdPart();
     } else if (std.mem.eql(u8, command, "fat")) {
         cmdFat(&tokens);
+    } else if (std.mem.eql(u8, command, "cassafs")) {
+        const is_viz = std.mem.eql(u8, tokens.peek() orelse "", "viz");
+        cassafs.command(&tokens);
+        if (is_viz) drainConsole();
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();
     } else if (std.mem.eql(u8, command, "fb")) {

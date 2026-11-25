@@ -39,6 +39,7 @@ test {
     _ = @import("lib/hid.zig");
     _ = @import("lib/xhci.zig");
     _ = @import("lib/power.zig");
+    _ = @import("lib/cassafs.zig");
     _ = @import("kernel/input.zig");
     _ = @import("lib/edid.zig");
     _ = @import("lib/display_mode.zig");

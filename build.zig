@@ -358,6 +358,21 @@ pub fn build(b: *std.Build) void {
     // ------------------------------------------------------------------ test
     // Pure logic (allocators, formatting, schedulers, protocol codecs) is
     // unit-tested on the host, where a normal debugger is available.
+    const cassafs_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib/cassafs.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const cassafs_mod = b.createModule(.{
+        .root_source_file = b.path("tools/cassafs.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    cassafs_mod.addImport("cassafs_lib", cassafs_lib_mod);
+    const cassafs_tool = b.addExecutable(.{ .name = "cassafs", .root_module = cassafs_mod });
+    const install_cassafs = b.addInstallArtifact(cassafs_tool, .{});
+    b.getInstallStep().dependOn(&install_cassafs.step);
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = b.graph.host,

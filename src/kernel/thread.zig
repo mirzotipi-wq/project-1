@@ -36,12 +36,12 @@ pub const State = enum {
 
 pub const EntryFn = *const fn (?*anyopaque) void;
 
-/// Eight pages (32 KiB). Formatting in a debug build is stack-hungry: a single
-/// klog line can pass through several layers of std.fmt with large temporary
-/// buffers. 16 KiB was measured at 94% used by the shell, which is far too close
-/// to the edge for production code; the POS workloads will be measured again
-/// once they exist.
-pub const stack_pages: u32 = 8;
+/// Sixteen pages (64 KiB). Formatting and full-volume verification in a debug
+/// build are stack-hungry: a CASSAFS scan decodes record headers and payloads
+/// through several layers while keeping a full report, and phase 41's scan was
+/// measured at roughly 46 KiB. 64 KiB stays small next to the 8 MiB heap and
+/// leaves room for the POS workload without silent inter-thread stack damage.
+pub const stack_pages: u32 = 16;
 pub const stack_bytes: usize = stack_pages * pmm.page_size;
 
 pub const max_threads: usize = 24;

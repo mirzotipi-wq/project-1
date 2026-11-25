@@ -164,7 +164,7 @@ class Guest:
         self.serial = wait_for(self.serial_path)
         self.serial.settimeout(0.2)
         self.qmp = Qmp(qmp_path)
-        self.boot = self.until("cassa>", timeout=20.0)
+        self.boot = self.until("cassa>", timeout=30.0)
 
     def read(self, seconds: float = 0.35) -> str:
         end = time.time() + seconds

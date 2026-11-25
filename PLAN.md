@@ -215,7 +215,7 @@ needs the lock graph the file server will introduce.
 **Build:** Thread struct, callee-saved context switch, per-thread stacks with guards, idle
 thread, thread exit and reaping.
 **Done when:** Two threads ping-pong a counter with correct interleaving and no stack bleed.
-**Verified:** `thread.zig` (24 slots, 32 KiB stacks, fabricated trap frames) plus
+**Verified:** `thread.zig` (24 slots, 64 KiB stacks since phase 41, fabricated trap frames) plus
 `sched.zig` (idle thread per core, exit and reaping). `threads` lists live contexts with
 state, core, run count and stack; `preempt` shows three threads interleaving on one core;
 `reap 8` and `reap 12` return every stack to the PMM (0 pages leaked). Guard pages are not
@@ -2171,11 +2171,110 @@ halt policy. There is no suspend, hibernate or RTC wake.
 
 ## Stage E — Storage and filesystems
 
-### Phase 41 — CASSAFS format `[ ]`
+### Phase 41 — CASSAFS format `[x]`
 **Goal:** A crash-safe filesystem designed for till workloads.
 **Build:** Log-structured design, CRC32C on every record, A/B superblocks, inode tree,
 extent allocation, free-space map, on-disk versioning.
 **Done when:** The format is documented and a reference dump/verify tool exists (in Zig).
+
+**Shipped.** CASSAFS v1 is a real, byte-level format with one implementation shared by the
+kernel and a host reference tool. The contract is documented in
+[`docs/cassafs-format.md`](docs/cassafs-format.md); the pure codec, formatter, scanner and
+reader live in `src/lib/cassafs.zig`, the partition/block adapter and shell surface in
+`src/kernel/cassafs.zig`, and the read-only host verifier in `tools/cassafs.zig`.
+
+  * **Log-structured layout.** 4096-byte blocks; A/B superblocks at blocks 0 and 1; an
+    append-only log from block 2. A record is a 64-byte header block followed by
+    `ceil(payload_len / 4096)` payload blocks. Each record is one of inode, data, free-space
+    map or checkpoint, and records are sequence-numbered from 1 with no gaps.
+  * **CRC32C everywhere.** The Castagnoli implementation covers the first 60 bytes of every
+    record header and exactly `payload_len` bytes of every payload. The superblock has its own
+    CRC over bytes 0..507. A torn header, a flipped payload byte, a damaged bitmap or a
+    mismatched checkpoint is a typed `BadCrc`/`BadFreeMap`/`BadCheckpoint` failure before any
+    metadata is trusted.
+  * **A/B superblocks.** A is generation 1 and B is generation 2 after format. The scanner
+    decodes both independently and selects the highest valid generation. Damaging B is a
+    verified fallback to A, reported by name rather than silently hidden.
+  * **Inode tree and extents.** A 268-byte inode carries kind, name, parent, size, data CRC,
+    mode and up to eight 24-byte extents. Every non-root inode must have a directory parent and
+    a unique name; the scanner walks each node to the root, rejects cycles, parent/non-directory
+    links and duplicate siblings. Extents are ordered, contiguous in logical space and must lie
+    inside a data record; the scanner computes each file's CRC from its extents and compares it
+    with the inode. `cassafs cat` reads through the extents, not a side buffer.
+  * **Free-space map and checkpoint.** The penultimate record is a bitmap over every volume
+    block; the last is a 120-byte checkpoint naming the root inode, log head, counts and the
+    free-map record. The scanner proves the bitmap marks exactly `[0, log_head)` used, proves
+    the checkpoint's pointers and counters, and only then exposes the report.
+  * **On-disk versioning.** Format version 1, independent record version, compatible and
+    incompatible feature words, and a UUID. An unknown incompatible feature is refused rather
+    than guessed; a different format version is refused at the superblock.
+  * **Kernel surface.** `cassafs info|format [empty|demo]|demo|dump|verify|cat <path>|viz <s>`
+    through the phase-12 shell. `format demo` builds the tree `root -> catalog -> products.db`
+    and `root -> receipts -> WELCOME.TXT`; `verify` checks every record, tree edge, extent,
+    data CRC and free-map bit; `dump` prints the log table, tree and extents; `viz` is the live
+    dashboard. The command is registered with the driver/storage shell surface and does not
+    depend on the FAT32 cache.
+  * **Reference tool.** `zig build` also produces `zig-out/bin/cassafs`, which reads an image
+    through `--partition N` (MBR entry) or `--offset BYTES`, uses the same library and prints
+    `info`, `verify`, `dump` or `cat`. It is read-only by construction, so a QEMU image can be
+    checked from outside the guest.
+  * **Absence and safety.** With no disk, `cassafs info`/`verify` report
+    `no block device; attach a disk with partition 1`, the kernel still passes `selftest`, and
+    no write path is entered. Formatting refuses while the phase-40 FAT power journal is mounted
+    on partition 1, because rewriting that volume would invalidate `POWER.JNL`; phase 43
+    integrates the journal with CASSAFS.
+  * **Stack-budget repair.** The full scan path measured a 46 KiB frame in the debug kernel.
+    The shell's 32 KiB stack therefore wrote through its base into the adjacent watchdog
+    thread's saved frame on the first full `cassafs info`, which the scheduler correctly caught
+    as a corrupt frame. The fix is at the thread layer: kernel thread stacks are now 64 KiB
+    (`src/kernel/thread.zig`), not a CASSAFS workaround. The failure and the repair are recorded
+    here because they were a real phase-41 integration bug.
+
+**Evidence.** `zig build` clean; **208 host tests pass**, up from 197 (+11 in
+`src/lib/cassafs.zig`: CRC32C reference, superblock round trip/refusal, record header CRC,
+inode codec, formatter tree/free map/checkpoint/A+B, A/B fallback, payload corruption, free-map
+bit corruption, malformed fixture, path/read refusal, unknown incompatible feature). The new
+`tools/qemu_cassafs_test.py` runs five scripted scenarios (eight QEMU boots) and passes:
+
+  * **Format and read-back.** A 64 MiB partition-1 MBR disk reports no valid superblock, then
+    `cassafs format demo` writes **20 blocks, 9 records, 5 inodes, 3 directories, 2 files and
+    158 data bytes**, leaving **16,364 free** blocks. `info` reads A generation 1, B generation
+    2, active B, log head 20, checkpoint seq 9 and free-map block 16/seq 8. `verify` PASSes
+    every header/payload CRC, parent/name edge, extent range, data CRC and bitmap bit. `cat`
+    returns the 73-byte CSV with CRC32C `0x3b60dc1d`; `dump` prints both files and their
+    extents. `poweroff` exits QEMU with status 0.
+  * **Host reference verification.** On the same image after shutdown, the host `cassafs
+    verify` reports `16384 total`, `verify: PASS` and the same A/B/log/free-map facts; host
+    `cat` returns the CSV and CRC byte-identically.
+  * **Reboot persistence.** A second boot on the untouched image reads 5 inodes/3 dirs/2 files/
+    158 bytes, `verify` PASSes, and `/receipts/WELCOME.TXT` still reads.
+  * **A/B fallback.** Corrupting bytes in superblock B makes the kernel report
+    `superblock B: INVALID`, `active A (fallback; the other copy is damaged)` and still
+    `cassafs verify: PASS`; the host reader independently reports `active A (fallback)`.
+  * **CRC corruption.** Flipping one byte in the `products.db` *data payload* makes both the
+    kernel and the host reader reject the volume: kernel output names `CRC32C mismatch`, prints
+    `cassafs verify: FAIL` and never `PASS`; the host tool exits nonzero with `BadCrc`.
+  * **Absence.** A machine with no disk at all prints `no block device; attach a disk with
+    partition 1`, refuses to call verify a success, reaches the shell and passes `selftest`.
+  * **Visual evidence.** `docs/screenshots/phase41-cassafs.png` is the live `cassafs viz`
+    dashboard showing format 1, 4096-byte blocks, 16384 total/20 used/16364 free, A/B OK and
+    active B, 9 records, the inode tree, extents and `DATA CRC OK`.
+
+The phase-38 input, phase-39 USB and phase-40 power harnesses still pass. Representative boot
+lines: `cassafs  formatted 20 block(s), 9 record(s), 16364 free, label 'Cassa POS data'`;
+`cassafs verify: PASS`; `active      : A (fallback; the other copy is damaged)`.
+
+**Limits.** Phase 41 is the **format and reference read/verify path**, not a mounted filesystem.
+There is no mount, directory iterator, VFS, write path, journal replay or garbage collection yet
+(phases 42–43); formatting rewrites the volume. The reference bounds are 128 inodes, 128
+records, 8 extents per inode, 16 KiB per data record and 1 GiB per volume; they are compile-time
+constants chosen to keep the kernel's memory bounded. A/B redundancy covers superblock damage
+only; there is no redundant checkpoint, so a damaged checkpoint is reported and refused until
+phase 43. The kernel adapter formats and reads **partition 1** (MBR or GPT from the existing
+partition parser); it does not format the whole disk or another partition. The power journal is
+still FAT-backed on partition 1, and CASSAFS formatting refuses while that journal is mounted;
+CASSAFS's own journal is phase 43. There is no encryption, checksum-at-rest beyond CRC32C, or
+metadata replication.
 
 ### Phase 42 — Mount and read path `[ ]`
 **Goal:** Read files fast and safely.
@@ -2565,3 +2664,4 @@ to the OS.
 | 2026-11-17 | 38 | virtio keyboard and tablet on virtio-mmio (two queues, 16 posted buffers, IRQ drain and repost, config-space classification, absolute scaling to 1280x800); ordered IRQ-safe event queue with console mirror; HID boot-keyboard/mouse/absolute-pointer decoders; hold-and-decide scanner with prefix/suffix, gap/duration limits and ordered release; key remapping; `input`, `input viz`, `hid`, `keymap`; 162 host tests | QEMU 8.2.2: `QEMU Virtio Keyboard` and `QEMU Virtio Tablet` bind at irq 78/79, tablet abs 0..32767; 72 key events and 11 tablet events (pointer 351,146 → 702,292, button down/up) from `sendkey` and QMP absolute input; a 13-digit burst becomes one `barcode '4006381333931'` event with 0 ms suffix-to-queue delivery (269 ms HMP burst window); HID self-test PASS; boot without input devices clean; screenshot `docs/screenshots/phase38-input-monitor.png` |
 | 2026-11-18 | 39 | USB host stack: xHCI controller (PCI, reset, command/event/transfer rings, 64-entry DCBAA, slots and endpoint contexts, port reset), descriptor-driven enumeration, HID keyboard/tablet plus barcode burst, CDC-ACM and FTDI serial, hubs, hotplug; `usb`, `usb selftest`, `usb serial`; 187 host tests (+25); QEMU 8.2.2: keyboard slot 1 port 5 and tablet slot 2 port 6, 12 key events and pointer 234,97 → 702,268 with button down/up, `barcode '1234'` in 82 ms, two unplug/replug cycles on ports 7/8, hub with a child keyboard, FTDI `hello`/`world` payloads both ways and across replug, no-controller boot PASS; phase 38 harness PASS; screenshot `docs/screenshots/phase39-usb-input.png` |
 | 2026-11-18 | 40 | Watchdog and power: real QEMU i6300ESB PCI watchdog with two-stage 4 s reset and previous-reset flag, core-0 scheduler heartbeat every 250 ms, fault-injection hang, brown-out hook/service path, FAT32-backed `POWER.JNL` (72-byte CRC32 records, 96-record ring, boot/clean/brownout/reboot/watchdog/selftest), thermal ladder with 0/25/50/75% `wfi` idle injection, PSCI poweroff/reboot with storage flush, `power`, `thermal`, `watchdog`, `poweroff`; 197 host tests (+10); QEMU 8.2.2: forced hang reset → watchdog_boot/unclean journal/file intact, poweroff and brownout both exit 0 with clean next boot, thermal 2212 → 3604 ms (1.63x) at critical/75%, no-watchdog/no-disk boot PASS with two `OK (degraded)`, phase 38/39 harnesses PASS; `tools/qemu_power_test.py`; screenshot `docs/screenshots/phase40-power.png` |
+| 2026-11-25 | 41 | CASSAFS format 1: 4 KiB log-structured volume with A/B superblocks, 64-byte record headers and payload CRC32C, 268-byte inode tree with names/parents, ordered byte extents, free-space bitmap and checkpoint; kernel `cassafs info/format/demo/dump/verify/cat/viz`, host read-only reader, shell integration; 208 host tests (+11); QEMU 8.2.2: 20-block demo with 9 records and 5 inodes, verify PASS, 73-byte CSV CRC `0x3b60dc1d`, reboot persistence, B-superblock fallback to A, data-payload corruption rejected by both kernel and host reader, no-disk absence PASS; 64 KiB kernel stacks fix a real scan-stack overflow caught as a corrupt frame; `tools/qemu_cassafs_test.py`; screenshot `docs/screenshots/phase41-cassafs.png`  |
