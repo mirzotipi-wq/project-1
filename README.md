@@ -98,8 +98,9 @@ goes to the serial console is now also on the screen. See
 | 49 | Storage health: bounded `src/lib/storage_health.zig` policy (32 bad ranges, 3 retries, healthy/degraded/failing, media counters, recovered/unrecovered ledger), virtio-blk quarantine check and read/flush fault injection through the existing retry/reset path, `BadBlock` propagation, read-only CASSAFS `fsck`, and `blk health/fsck/inject/clear/scrub/viz` supervisor dashboard | QEMU 8.2.2: phase-45 **10,000 rows / 220,021 B / `0x8678e4e7`**, phase-47 **239 records** and phase-48 **`sales verify : PASS, 1 transaction(s)`** on the same disk; transient superblock read at LBA 2048 recovered with **`degraded, warnings 1, retries 1, recovered 1`** and fsck PASS; transient flush recovered; persistent failure printed **`REFUSED: Io`** then **`REFUSED: BadBlock`**, health **`failing, warnings 3, retries 5, recovered 2, unrecovered 1, bad blocks 1`**; `blk scrub 2048 16` cleared 1 entry, fsck PASS and 73 B product CRC `0x3b60dc1d` unchanged; raw payload corruption on a separate fixture prints **`REFUSED: BadCrc`**; sale and product survive cache drop, unmount/remount and soft reboot; **252 host tests (+4)**; all eleven prior harnesses PASS (input 13 chars/259 ms/0 ms, USB 4/4, power **1.63x**, page cache 29 ms/64/64 + sale CRC `0x12b569fa`, FAT32, VFS46, retail 239, sales48 3 transactions); `tools/qemu_storage49_test.py`; design `docs/storage-phase49.md` |
 | 50 | Snapshots and recovery: a bounded 128-byte CRC32C config record and 544-byte four-slot snapshot file; copy-before-write `recovery set`, one-command `recovery rollback`, `recovery status/verify`, `factory-reset preserve` retaining the phase-48 sale audit, a support bundle carrying config/snapshot/audit/phase-49 health, and test-only config/snapshot corruption hooks | QEMU 8.2.2: phase-45 **10,000 rows / 220,021 B / `0x8678e4e7`**, phase-47 **239 records** and phase-48 **one committed sale / `sales verify : PASS`** still green; config generation 3 with 4/4 snapshots in slot 3; config corruption refused **`BadCrc`**, one `recovery rollback` restored generation 3 / `North Till`; cache drop, unmount/remount and soft reboot preserved config, slots and sale, with rollback still working after reboot; support bundle **1312 B / CRC32C `0x66d093ce`**, `vfs stat` size matches; factory reset preserve restored generation 1, left the **576-byte** sale audit intact and `sales verify` still PASS; corrupt snapshot rollback refused `BadCrc`; **256 host tests (+4)**; all twelve prior harnesses PASS (input 13 digits, USB 4/4, power PASS, page cache 64/64 + sale CRC `0x12b569fa`, FAT32, VFS46, retail; sales48 verifies 3 transactions / 1,555 cents, with a boot-uptime-dependent chain CRC; storage49); `tools/qemu_recovery50_test.py`; design `docs/recovery-phase50.md` |
 | 51 | Graphics core: pure `src/lib/gfx.zig` with `bgrx8888`/`rgba8888`/`rgb888`/`rgb565` surfaces, clipped 1:1 blits with conversion, straight 8-bit alpha compositing, and a bounded 8-rectangle damage set; `fb.rawBytes()` bridge, `gfx [test|inject|repair|info]`, test-only negative control | QEMU 8.2.2: all four formats round-trip in the kernel; scratch clip/blit/blend/damage PASS; live **128×96** card at `576,352` on **1280x800 BGRX**, exact screenshot pixels `220,32,32`, `32,180,64`, `8,44,144`, `255,255,255`, transparent `16,24,32`, `8,140,16`, `255,128,0`; **1 damage rect / 12,288 px**; clean snapshot **`0x27ae8280`**; injected corruption **`0xda4f8ba2`** → `gfx core : FAIL`, repair → PASS; **264 host tests (+8)**; all thirteen prior harnesses PASS one at a time (input 13 chars/258–260 ms/0 ms, USB 4/4, power 2372–2471→3763–4079 ms/1.54–1.72x, page cache 26–42 ms/64/64 + sale CRC `0x12b569fa`, FAT32 10,000/220,021/`0x8678e4e7`, VFS46, retail 239 records, sales48 3 transactions/1,555 cents with boot-dependent chain `0x68004180`, storage49, recovery50 1312 B/`0x66d093ce`); `tools/qemu_gfx51_test.py`; design `docs/graphics-phase51.md` |
+| 52 | 2D rasterizer: pure fixed-point `src/lib/raster2d.zig` over the phase-51 `gfx` core, public vector `fillSpan`/`blendPixel` path, rounded/filled rectangles, circles, AA round-capped lines, Q14 arcs, gradients, four-layer shadows, nearest-neighbour nine-patch, `raster [test|inject|repair|info]` | QEMU 8.2.2 release: 320x240 card at `480,280` with exact gradient/panel/accent/circle/arc/line/nine-patch pixels and **1 damage rect / 76,800 px**; injected magenta `circle=0xffff00ff` -> `raster card : FAIL` / verdict FAIL, repair PASS; 1920x1080 RGB565 offscreen frame with **500 primitives**, **2,500/2,500** centres checked over five frames, **min 3,530 us / median 3,565 us / max 3,624 us**, heap 4,147,200 B reclaimed `0 -> 0`; **272 host tests (+8)**; all fourteen prior harnesses PASS one at a time (input 13 chars/259 ms/1 ms, USB 4/4, power 2377->3896 ms/1.64x, page cache 32 ms/64/64 + sale CRC `0x12b569fa`, FAT32/VFS46 10,000/220,021/`0x8678e4e7`, retail 239 records, sales48 3 txns/1,555 cents with boot-dependent chain not asserted, storage49 isolated rerun PASS, recovery50 1312 B/`0x66d093ce`, gfx51 `0x27ae8280`); `tools/qemu_raster52_test.py`; design `docs/rasterizer-phase52.md` |
 
-The remaining 49 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 48 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -176,6 +177,13 @@ framebuffer, checks exact pixels in the kernel and independently in a QEMU
 screendump, and requires a test-only injected corruption to turn the same proof
 into FAIL before repairing it. Design and limits:
 [docs/graphics-phase51.md](docs/graphics-phase51.md).
+The phase-52 rasterizer adds `python3 tools/qemu_raster52_test.py`: build the performance
+image with `zig build -Drelease=true`, then the harness draws the 320x240 card on the real
+panel, checks every feature in the kernel and in a QEMU screendump, times a 1920x1080
+RGB565 frame with exactly 500 primitives (observed median **3.5 ms**, under the 8 ms target),
+requires the 4,147,200-byte heap allocation to be reclaimed, and proves a test-only injected
+pixel turns the same card FAIL before repair. Design, measured spread and honest limits
+(small 8x8 chips, release-only, RGB565, QEMU TCG): [docs/rasterizer-phase52.md](docs/rasterizer-phase52.md).
 The kernel
 console is the first PL011 UART; press Enter for a prompt and type `help`. Concurrency can be
 inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
@@ -351,6 +359,8 @@ tools/qemu_recovery50_test.py  proves bounded config snapshots, one-command roll
                                audit-preserving factory reset and support-bundle export
 tools/qemu_gfx51_test.py      proves all-format/clip/alpha/damage pixels live, checks the
                                QEMU screendump, and rejects an injected card corruption
+tools/qemu_raster52_test.py proves the rasterizer card and 1080p/500-primitive benchmark,
+                               rejects and repairs an injected pixel in a real screendump
 src/tests.zig        host unit-test root
 docs/cassafs-format.md  the CASSAFS v1 on-disk contract, write path and limits
 docs/vfs.md             the VFS contract, write path, backend interface and limits
@@ -360,6 +370,7 @@ docs/vfs-phase46.md     phase-46 tmpfs, permissions, locks, watches and evidence
 docs/storage-phase49.md phase-49 retry policy, bad-range quarantine, fsck and evidence
 docs/recovery-phase50.md phase-50 config snapshots, rollback, factory reset and evidence
 docs/graphics-phase51.md phase-51 formats, surfaces, blits, clipping, alpha, damage and evidence
+docs/rasterizer-phase52.md phase-52 rounded/AA primitives, gradients, shadows, nine-patch, benchmark and evidence
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan
 ```

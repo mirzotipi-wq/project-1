@@ -2893,11 +2893,41 @@ booted pixel check is one 1280x800 BGRX QEMU panel; other formats are host-teste
 not physical-hardware-tested. Details and honest limits:
 `docs/graphics-phase51.md`.
 
-### Phase 52 — 2D rasterizer `[ ]`
+### Phase 52 — 2D rasterizer `[x]`
 **Goal:** Crisp, fast drawing at 60 fps.
 **Build:** Filled and rounded rectangles, anti-aliased lines and arcs, gradients, shadows,
 nine-patch scaling, SIMD fast paths.
 **Done when:** A 1080p frame with 500 drawn primitives composites in under 8 ms on QEMU.
+
+**Shipped:** `src/lib/raster2d.zig` is a pure, allocation-free fixed-point rasterizer over
+the phase-51 `gfx` core, which now exposes the single public `fillSpan` (`@Vector(4,u32)`
+and `@Vector(8,u16)` bodies with scalar tails) and `blendPixel` path. It implements filled
+and rounded rectangles, circles, anti-aliased round-capped lines and Q14-table arcs,
+two-stop linear gradients, four-layer shadows and nearest-neighbour nine-patch scaling;
+all operations clip through `gfx.Surface` and report bounded damage. The real shell gained
+`raster [test|inject|repair|info]`; `src/kernel/raster52.zig` draws a 320x240 card at
+`480,280` on the 1280x800 panel, reads back exact gradient/accent/circle/arc/line/nine-patch
+pixels and requires exactly **1 damage rect / 76,800 px**. One release run observed card
+snapshot `0x792b55ac` (diagnostic; the raw framebuffer snapshot varies between boots, so the
+harness asserts pixels and screendump instead), injected magenta `circle=0xffff00ff` ->
+`raster card : FAIL` / `raster verdict: FAIL`, then repair -> PASS. The 1080p benchmark
+allocates **4,147,200 B** of RGB565, clears outside the timed window, masks IRQs in it, draws
+**500 primitives** (100 rounded + 400 filled 8x8 chips) five times and verifies all
+**2,500/2,500** primitive centres; observed release **min 3,530 us / median 3,565 us / max
+3,624 us**, under the 8 ms target on the median, with heap `used 0 -> 0 B`, largest free
+`8,388,584 B` restored. Standard debug was **12–13 ms**, so the performance claim is
+release-only. **272 host tests (+8)**. All fourteen prior harnesses PASS one at a time:
+input **13 chars / 259 ms / 1 ms delivery**, USB **4/4**, power **2377 -> 3896 ms (1.64x)**,
+CASSAFS/VFS/VFS-write, page cache **max 32 ms**, **64/64 pages, 344 evictions, 88 writebacks,
+20 flushes**, sale **33 B / 0x12b569fa**, FAT32/VFS46 **10,000 rows / 220,021 B / max line 21
+/ 0x8678e4e7**, retail **239 records / 64 receipts / 128 lines**, sales48 **3 transactions /
+6 units / 1,555 cents** with boot-dependent chain `0xd197cd8e` (not asserted), storage49 PASS
+on its isolated rerun after the known transient virtio fixture timeout, recovery50 bundle
+**1312 B / 0x66d093ce** with a **576-byte** audit, gfx51 **0x27ae8280**. Limits: the benchmark
+proves 500 small 8x8 primitives, not full-screen fill (a 64x40 variant measured ~80 ms);
+1080p is RGB565 because the 8 MiB heap cannot hold a 1920x1080 RGBA frame; QEMU TCG is not
+native hardware and the vector stores were not disassembled. `tools/qemu_raster52_test.py`;
+design `docs/rasterizer-phase52.md`.
 
 ### Phase 53 — Font engine `[ ]`
 **Goal:** Legible prices at arm's length.

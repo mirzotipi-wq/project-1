@@ -265,6 +265,75 @@ pub const Surface = struct {
         self.writePixelRaw(ux, uy, color);
     }
 
+    /// Fill an opaque horizontal span using the same checked surface path. The
+    /// 32-bit and RGB565 cases store four/eight pixels per vector operation;
+    /// RGB888 keeps the scalar fallback because its 3-byte stride is not a
+    /// natural vector width. Damage is the caller's responsibility.
+    pub fn fillSpan(self: *Surface, x: i32, y: i32, len: u32, color: Color) void {
+        if (len == 0 or y < 0) return;
+        const r = self.clip(.{ .x = x, .y = y, .w = @intCast(len), .h = 1 }) orelse return;
+        const count: usize = @intCast(r.w);
+        const row = self.pixels[@as(usize, @intCast(r.y)) * self.stride ..];
+        const start = @as(usize, @intCast(r.x)) * self.bpp();
+        const r8: u8 = @truncate(color >> 16);
+        const g8: u8 = @truncate(color >> 8);
+        const b8: u8 = @truncate(color);
+        var i: usize = 0;
+        switch (self.format) {
+            .bgrx8888 => {
+                const value: u32 = (@as(u32, r8) << 16) | (@as(u32, g8) << 8) | b8;
+                const Vec = @Vector(4, u32);
+                while (i + 4 <= count) : (i += 4) {
+                    const p: *align(1) Vec = @ptrCast(row.ptr + start + i * 4);
+                    p.* = @splat(value);
+                }
+                while (i < count) : (i += 1) {
+                    const p = row[start + i * 4 ..];
+                    p[0] = b8;
+                    p[1] = g8;
+                    p[2] = r8;
+                    p[3] = 0;
+                }
+            },
+            .rgba8888 => {
+                const value: u32 = @as(u32, r8) | (@as(u32, g8) << 8) | (@as(u32, b8) << 16) | (@as(u32, 255) << 24);
+                const Vec = @Vector(4, u32);
+                while (i + 4 <= count) : (i += 4) {
+                    const p: *align(1) Vec = @ptrCast(row.ptr + start + i * 4);
+                    p.* = @splat(value);
+                }
+                while (i < count) : (i += 1) {
+                    const p = row[start + i * 4 ..];
+                    p[0] = r8;
+                    p[1] = g8;
+                    p[2] = b8;
+                    p[3] = 255;
+                }
+            },
+            .rgb565 => {
+                const value: u16 = (@as(u16, r8 >> 3) << 11) | (@as(u16, g8 >> 2) << 5) | (b8 >> 3);
+                const Vec = @Vector(8, u16);
+                while (i + 8 <= count) : (i += 8) {
+                    const p: *align(1) Vec = @ptrCast(row.ptr + start + i * 2);
+                    p.* = @splat(value);
+                }
+                while (i < count) : (i += 1) {
+                    const p = row[start + i * 2 ..];
+                    p[0] = @truncate(value);
+                    p[1] = @truncate(value >> 8);
+                }
+            },
+            .rgb888 => {
+                while (i < count) : (i += 1) {
+                    const p = row[start + i * 3 ..];
+                    p[0] = r8;
+                    p[1] = g8;
+                    p[2] = b8;
+                }
+            },
+        }
+    }
+
     pub fn pixelAt(self: *const Surface, x: i32, y: i32) Color {
         if (x < 0 or y < 0) return 0;
         const ux: u32 = @intCast(x);
@@ -291,7 +360,9 @@ pub const Surface = struct {
         return 0xFF000000 | (r << 16) | (g << 8) | b;
     }
 
-    fn compositePixel(self: *Surface, x: i32, y: i32, color: Color, opacity: u8) void {
+    /// Composite one source pixel over the destination through the surface
+    /// clip. This is the single per-pixel blending entry used by the rasterizer.
+    pub fn blendPixel(self: *Surface, x: i32, y: i32, color: Color, opacity: u8) void {
         const pixel = self.clip(.{ .x = x, .y = y, .w = 1, .h = 1 }) orelse return;
         const dst = self.readPixel(@intCast(pixel.x), @intCast(pixel.y));
         self.writePixelRaw(@intCast(pixel.x), @intCast(pixel.y), blendColor(dst, color, opacity));
@@ -303,21 +374,13 @@ pub const Surface = struct {
         const r = self.clip(.{ .x = x, .y = y, .w = w, .h = h }) orelse return;
         const alpha: u8 = @truncate(color >> 24);
         if (alpha == 255) {
-            const r8: u8 = @truncate(color >> 16);
-            const g8: u8 = @truncate(color >> 8);
-            const b8: u8 = @truncate(color);
             var yy: i32 = r.y;
-            while (yy < r.bottom()) : (yy += 1) {
-                var xx: i32 = r.x;
-                while (xx < r.right()) : (xx += 1) {
-                    self.writePixelRaw(@intCast(xx), @intCast(yy), 0xFF000000 | (@as(u32, r8) << 16) | (@as(u32, g8) << 8) | b8);
-                }
-            }
+            while (yy < r.bottom()) : (yy += 1) self.fillSpan(r.x, yy, @intCast(r.w), color);
         } else {
             var yy: i32 = r.y;
             while (yy < r.bottom()) : (yy += 1) {
                 var xx: i32 = r.x;
-                while (xx < r.right()) : (xx += 1) self.compositePixel(xx, yy, color, 255);
+                while (xx < r.right()) : (xx += 1) self.blendPixel(xx, yy, color, 255);
             }
         }
         self.damage.add(r);
@@ -348,7 +411,7 @@ pub const Surface = struct {
                 if (sx < 0 or sy < 0) continue;
                 if (sx >= @as(i32, @intCast(src.width)) or sy >= @as(i32, @intCast(src.height))) continue;
                 const color = src.pixelAt(sx, sy);
-                self.compositePixel(xx, yy, color, opacity);
+                self.blendPixel(xx, yy, color, opacity);
             }
         }
         self.damage.add(d);
@@ -556,5 +619,24 @@ test "format snapshots are stable" {
         try testing.expectEqual(expected, snapshot);
         const damage = s.damage.bounds() orelse return error.TestUnexpectedResult;
         try testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 16, .h = 12 }, damage);
+    }
+}
+
+test "fillSpan writes vector bodies and scalar tails in every format" {
+    inline for (.{ Format.bgrx8888, Format.rgba8888, Format.rgb888, Format.rgb565 }) |format| {
+        const bpp = format.bytesPerPixel();
+        var buf = [_]u8{0} ** (24 * 4 * 4);
+        var s = try Surface.init(&buf, 24, 4, 24 * bpp, format);
+        s.clear(rgb(0, 0, 0));
+        s.fillSpan(3, 1, 19, rgb(10, 20, 30));
+        var x: i32 = 3;
+        while (x < 22) : (x += 1) {
+            const p = s.pixelAt(x, 1);
+            try std.testing.expect((p >> 16) & 0xFF >= 8 and (p >> 16) & 0xFF <= 10);
+            try std.testing.expect((p >> 8) & 0xFF >= 16 and (p >> 8) & 0xFF <= 20);
+            try std.testing.expect(p & 0xFF >= 24 and (p & 0xFF) <= 30);
+        }
+        try std.testing.expectEqual(rgb(0, 0, 0), s.pixelAt(2, 1));
+        try std.testing.expectEqual(rgb(0, 0, 0), s.pixelAt(22, 1));
     }
 }
