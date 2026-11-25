@@ -222,13 +222,13 @@ The observations were:
 
 | Harness | Observed |
 |---|---|
-| `qemu_input_test.py` | `4006381333931 (13 chars, 258–260 ms burst)`; suffix-to-queue delivery `0–1 ms`; no-input boot PASS |
+| `qemu_input_test.py` | `4006381333931 (13 chars)` becomes one barcode event; suffix-to-queue delivery stays within the 20 ms budget; no-input boot PASS |
 | `qemu_usb_test.py` | **4/4** scenarios: HID, hub, FTDI serial, no-controller |
-| `qemu_power_test.py` | normal 2365–2380 ms → critical 3866–3952 ms (**1.63–1.67x**; final validation 1.63x); brownout, fallback and dashboard PASS. The harness asserts throttling, not a fixed ratio. |
+| `qemu_power_test.py` | normal → critical throttling PASS; brownout, fallback and dashboard PASS. The harness asserts throttling, not a fixed ratio, so wall-clock timings are not claimed as constants. |
 | `qemu_cassafs_test.py` | format/verify/read-back/reboot/fallback/corruption/absence PASS |
 | `qemu_vfs_test.py` | mount/read/refusals/fallback/reboot PASS |
 | `qemu_vfs_write_test.py` | write/overwrite, out-of-space and corruption refusal PASS |
-| `qemu_page_cache_test.py` | 23/64 pages, 79% hit; 21 hit/6 miss cold; 22 readahead; max sale commit **27–31 ms**/100 ms (final validation 28 ms); 64/64 pages, 344 evictions, 88 writebacks, 20 flushes; harness-asserted sale CRC `0x12b569fa`; drop/remount/host verify PASS |
+| `qemu_page_cache_test.py` | 23/64 pages, 79% hit; 21 hit/6 miss cold; 22 readahead; sale commit within the 100 ms budget; 64/64 pages, 344 evictions, 88 writebacks, 20 flushes; harness-asserted sale CRC `0x12b569fa`; drop/remount/host verify PASS |
 | `qemu_fat32_test.py` | **10,000 rows / 220,021 B / max line 21 / CRC32C `0x8678e4e7`**; read-only, remount, reboot, corrupt-chain and one-partition cases PASS |
 | `qemu_vfs46_test.py` | three-backend paths, tmpfs, chmod, locks, watches, remount PASS |
 | `qemu_retail_test.py` | 239 records, 64 receipts, 128 lines; cache drop/remount/reboot and `RecordCorrupt` refusal PASS |
@@ -239,11 +239,10 @@ The page-cache harness asserts the 33-byte sale file's `0x12b569fa` CRC rather
 than printing it, so that is a checked value, not a transcript line.
 
 The phase-48 sale-chain CRC is timestamp-dependent because each committed record
-carries the boot's uptime. Validation boots printed `0x0b36f980`, `0xe3f9638e`,
-`0xef7c61cc` and `0x7b9e804f`; the authoring run printed `0x5d5b8d8b`. The harness asserts
-chain validity and `PASS`, not a fixed CRC. The support bundle was `1312 B` /
-`0x66d093ce` in those runs; the harness checks its size, readback and internal
-CRC rather than hard-coding the printed value.
+carries the boot's uptime. The harness asserts chain validity and `PASS`, not a
+fixed CRC. The support bundle was `1312 B` / `0x66d093ce` in the observed runs;
+the harness checks its size, readback and internal CRC rather than hard-coding the
+printed value.
 
 ## Limits (honest)
 
