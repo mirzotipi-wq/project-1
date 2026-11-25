@@ -68,7 +68,7 @@ QEMU 8.2.2, `tools/qemu_page_cache_test.py`:
 - mount scan: **23/64 pages resident, 35% pressure, 79% hit (19 hit / 5 miss)**;
 - after a cache drop and cold range read: 21 hit / 6 miss, 77% hit,
   **22 cumulative readahead reads**, 0 readahead errors;
-- benchmark: **8 sale-sized commits, max 35 ms / 100 ms**, catalog
+- benchmark: **8 sale-sized commits, 27–35 ms observed / 100 ms across verification runs**, catalog
   **16 reads / 1,264 B**, 88% hit;
 - pressure: **64/64 pages, 344 evictions, 88 writebacks, 20 flushes**, 0 dirty
   after the commits;
@@ -100,6 +100,6 @@ KiB. The phase-42/43/44 QEMU runs are stable after the fix.
 - The format is still limited to 128 inodes/records, eight extents per file and
   128 KiB per file. A 64-page cache does not remove the larger-format work
   required for the 100k-file target.
-- The 35 ms result is a QEMU demo workload; the real checkout remains a later
+- The 27–35 ms result is a QEMU demo workload; the real checkout remains a later
   phase, and “under 100 ms while a catalog import runs” is demonstrated by the
   interleaved storage probe rather than concurrent POS traffic.

@@ -2421,7 +2421,7 @@ validation, VFS namespace and write path are unchanged.
   **23/64 pages**, **35% pressure**, **79% hit (19 hit / 5 miss)**. After `vfs cache drop` and
   a cold range read, cumulative counters are **21 hit / 6 miss**, **77% hit**, **22 readahead
   reads**, 0 readahead errors.
-- `vfs cache bench` runs 8 sale-sized commits and reports **max 35 ms over a 100 ms budget**
+- `vfs cache bench` runs 8 sale-sized commits and reports **27–35 ms across verification runs over a 100 ms budget**
   while interleaving **16 catalog reads / 1,264 B**; cache hit rate reaches **88%**. The
   pressure run ends at **64/64 pages, 344 evictions, 88 writebacks, 20 flushes, 0 dirty**.
   The committed `/receipts/sale44.tmp` is **33 bytes, CRC32C `0x12b569fa`** and is identical
@@ -2441,7 +2441,15 @@ mount. The cache now owns its 4 KiB bounce page off the stack, and kernel thread
 **32 pages / 128 KiB per thread, up from 16 pages / 64 KiB**. The mount/read/write QEMU runs are stable
 after the fix.
 
-**Limits.** The POS checkout is not implemented until a later phase; the 35 ms number is a
+**Second real bug found during independent verification.** `uart.Writer.print` called the raw
+PL011 writer for each formatted chunk without the console lock, so four cores could interleave a
+boot log inside the shell prompt (`cas` + scheduler line + `sa> `). That made
+`tools/qemu_input_test.py` wait for a prompt that never existed as one contiguous string. The
+formatted-output path now holds `console_lock` for the whole record and uses the raw writer only
+inside that critical section; `zig build test` remains at 225/225 and the input harness passes
+without raising its 90 s boot wait or its 15 s barcode wait.
+
+**Limits.** The POS checkout is not implemented until a later phase; the 27–35 ms result is a
 **sale-sized storage commit** through the VFS under an interleaved single-threaded catalog
 read loop, not a concurrent checkout. There is one cache for the one mounted CASSAFS
 volume, no background writeback thread, no per-process cache pressure/throttling and no
@@ -2824,4 +2832,4 @@ to the OS.
 | 2026-11-25 | 41 | CASSAFS format 1: 4 KiB log-structured volume with A/B superblocks, 64-byte record headers and payload CRC32C, 268-byte inode tree with names/parents, ordered byte extents, free-space bitmap and checkpoint; kernel `cassafs info/format/demo/dump/verify/cat/viz`, host read-only reader, shell integration; 208 host tests (+11); QEMU 8.2.2: 20-block demo with 9 records and 5 inodes, verify PASS, 73-byte CSV CRC `0x3b60dc1d`, reboot persistence, B-superblock fallback to A, data-payload corruption rejected by both kernel and host reader, no-disk absence PASS; 64 KiB kernel stacks fix a real scan-stack overflow caught as a corrupt frame; `tools/qemu_cassafs_test.py`; screenshot `docs/screenshots/phase41-cassafs.png`  |
 | 2026-11-25 | 42 | Read-only VFS: backend-neutral node/mount/handle tables, canonical paths, stable readdir, range reads, CASSAFS backend, validate-before-mount, read-only checks, failure diagnostics; 217 host tests (+9); QEMU 8.2.2: 5-inode demo mounts at `/`, 73 B products CRC `0x3b60dc1d` matches `cassafs cat`, WELCOME.TXT 85 B, stable readdir, unmount/remount, byte-identical reads after a soft reboot; no-disk and bad-CRC mounts refused with no table entry; damaged B falls back to A; `tools/qemu_vfs_test.py`; fixed a format superblock write-buffer lifetime bug; screenshot `docs/screenshots/phase42-vfs.png` |
 | 2026-11-25 | 43 | CASSAFS append-only write path: create, offset write/extend, touched-chunk rebuild, latest-inode supersession, free-map/checkpoint commit, A/B superblocks with readback and full rescan; VFS `create`/`writeAt`/`write`, `vfs create/write/df`, writable access checks; 219 host tests (+2); QEMU 8.2.2: note.txt inode 6/8 B CRC `0x394478f0`, 7-byte and overwrite reads, 6 inodes/3 files/166 B after remount and soft reboot, phase-42 products CRC unchanged, host verifier PASS; 8-block volume 0 free refuses create with out-of-space and no entry; corrupted committed payload refused with CRC32C; all prior harnesses PASS; screenshot `docs/screenshots/phase43-write.png` |
-| 2026-11-25 | 44 | Bounded 4 KiB CASSAFS page cache: 64-page LRU, 16 dirty pages, four-page readahead, write-back eviction/flush, cache pressure stats, `vfs cache stats/flush/drop/bench`, unmount flush, dashboard line; 225 host tests (+6); QEMU: mount 23/64 pages/79% hit, cold-read readahead, 8 sale-sized commits max 35 ms/100 ms with 16 catalog reads/1,264 B, 64/64 pages/344 evictions/88 writebacks/20 flushes/0 dirty, sale 33 B CRC `0x12b569fa` survives cache drop/unmount/remount/host verify; fixed a real 64 KiB stack overflow after cache insertion by moving the bounce page off-stack and raising stacks to 128 KiB; all prior harnesses PASS; screenshot `docs/screenshots/phase44-cache.png` |
+| 2026-11-25 | 44 | Bounded 4 KiB CASSAFS page cache: 64-page LRU, 16 dirty pages, four-page readahead, write-back eviction/flush, cache pressure stats, `vfs cache stats/flush/drop/bench`, unmount flush, dashboard line; 225 host tests (+6); QEMU: mount 23/64 pages/79% hit, cold-read readahead, 8 sale-sized commits 27–35 ms/100 ms with 16 catalog reads/1,264 B, 64/64 pages/344 evictions/88 writebacks/20 flushes/0 dirty, sale 33 B CRC `0x12b569fa` survives cache drop/unmount/remount/host verify; fixed a real 64 KiB stack overflow after cache insertion by moving the bounce page off-stack and raising stacks to 128 KiB; all prior harnesses PASS; screenshot `docs/screenshots/phase44-cache.png` |

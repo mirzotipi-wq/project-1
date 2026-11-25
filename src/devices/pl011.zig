@@ -145,17 +145,24 @@ pub fn flush() void {
     if (console) |uart| uart.flush();
 }
 
-/// Writer used by the rest of the kernel for formatted output.
+/// Writer used by the rest of the kernel for formatted output. The console
+/// lock is held across the whole formatted record, not just each writeFn
+/// chunk: otherwise a four-core boot can interleave another log line inside
+/// a single shell prompt (`cas` + boot log + `sa> `).
 pub const Writer = struct {
     pub const Error = error{};
     pub const Context = void;
 
-    pub fn writeFn(_: Context, bytes: []const u8) Error!usize {
+    /// Only called by `print`, which holds `console_lock`; it must not take
+    /// the lock again because the console lock is not recursive.
+    fn writeFn(_: Context, bytes: []const u8) Error!usize {
         if (console) |uart| uart.writeAll(bytes);
         return bytes.len;
     }
 
     pub fn print(comptime fmt: []const u8, args: anytype) void {
+        const flags = console_lock.acquire();
+        defer console_lock.release(flags);
         const writer = std.io.GenericWriter(Context, Error, writeFn){ .context = {} };
         std.fmt.format(writer, fmt, args) catch {};
     }
