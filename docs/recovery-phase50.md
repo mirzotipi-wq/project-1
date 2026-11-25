@@ -141,7 +141,8 @@ phase-45/47/48/49 two-partition disk. It first proves the layers underneath:
 retail seed   : 239 record(s), 64 receipt(s), 128 line(s)
 sales commit: seq 1, terminal T1
 sales verify : PASS, 1 transaction(s)
-blk health: healthy; blk fsck: PASS
+blk health      : healthy, warnings 0, retries 0, recovered 0, unrecovered 0, bad blocks 0
+blk fsck    : PASS, 37 record(s), 7 inode(s), 4 file(s), 62214 data byte(s), 16284 free block(s)
 ```
 
 It then creates and changes configuration:
@@ -189,7 +190,7 @@ recovery reset : PASS, generation 1, 128-byte config, snapshot reset
 recovery reset : audit preserved: /catalog/sales.log, 576 byte(s)
 recovery verify : PASS, generation 1, ... store "Cassa Store"
 sales verify : PASS, 1 transaction(s)
-recovery reset : REFUSED: UnsupportedPolicy   (factory-reset wipe)
+recovery reset : REFUSED: UnsupportedPolicy
 ```
 
 Finally, a deliberately corrupted snapshot header is refused rather than
@@ -223,11 +224,11 @@ The observations were:
 |---|---|
 | `qemu_input_test.py` | `4006381333931 (13 chars, 260 ms burst)`; suffix-to-queue delivery `0 ms`; no-input boot PASS |
 | `qemu_usb_test.py` | **4/4** scenarios: HID, hub, FTDI serial, no-controller |
-| `qemu_power_test.py` | normal 2340 ms → critical 3914 ms (**1.67x**); brownout, fallback and dashboard PASS. The harness asserts throttling, not a fixed ratio. |
+| `qemu_power_test.py` | normal 2380 ms → critical 3952 ms (**1.66x**; 1.67x in the authoring run); brownout, fallback and dashboard PASS. The harness asserts throttling, not a fixed ratio. |
 | `qemu_cassafs_test.py` | format/verify/read-back/reboot/fallback/corruption/absence PASS |
 | `qemu_vfs_test.py` | mount/read/refusals/fallback/reboot PASS |
 | `qemu_vfs_write_test.py` | write/overwrite, out-of-space and corruption refusal PASS |
-| `qemu_page_cache_test.py` | 23/64 pages, 79% hit; 21 hit/6 miss cold; 22 readahead; max sale commit **31 ms**/100 ms; 64/64 pages, 344 evictions, 88 writebacks, 20 flushes; harness-asserted sale CRC `0x12b569fa`; drop/remount/host verify PASS |
+| `qemu_page_cache_test.py` | 23/64 pages, 79% hit; 21 hit/6 miss cold; 22 readahead; max sale commit **27 ms**/100 ms (31 ms in the authoring run); 64/64 pages, 344 evictions, 88 writebacks, 20 flushes; harness-asserted sale CRC `0x12b569fa`; drop/remount/host verify PASS |
 | `qemu_fat32_test.py` | **10,000 rows / 220,021 B / max line 21 / CRC32C `0x8678e4e7`**; read-only, remount, reboot, corrupt-chain and one-partition cases PASS |
 | `qemu_vfs46_test.py` | three-backend paths, tmpfs, chmod, locks, watches, remount PASS |
 | `qemu_retail_test.py` | 239 records, 64 receipts, 128 lines; cache drop/remount/reboot and `RecordCorrupt` refusal PASS |
@@ -236,6 +237,13 @@ The observations were:
 
 The page-cache harness asserts the 33-byte sale file's `0x12b569fa` CRC rather
 than printing it, so that is a checked value, not a transcript line.
+
+The phase-48 sale-chain CRC is timestamp-dependent because each committed record
+carries the boot's uptime. Validation boots printed `0x7b9e804f`, `0xef7c61cc`
+and `0xe3f9638e`; the authoring run printed `0x5d5b8d8b`. The harness asserts
+chain validity and `PASS`, not a fixed CRC. The support bundle was `1312 B` /
+`0x66d093ce` in those runs; the harness checks its size, readback and internal
+CRC rather than hard-coding the printed value.
 
 ## Limits (honest)
 

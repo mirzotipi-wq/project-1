@@ -89,6 +89,8 @@ def main_scenario() -> None:
         check("health      : healthy" in health, "storage was not healthy before recovery evidence:\n" + health[-2500:])
         fsck = machine.cmd("blk fsck")
         check("blk fsck    : PASS" in fsck, "storage fsck was not green before recovery evidence:\n" + fsck[-3000:])
+        log_guest(health, "blk health", "health      :")
+        log_guest(fsck, "blk fsck")
 
         init = require(machine, "recovery init", "recovery init : /catalog/config.cfg, 128 byte(s), generation 1")
         check("recovery init : /catalog/config.snap, snapshot slot 0, 4-slot bound" in init,
@@ -165,14 +167,19 @@ def main_scenario() -> None:
         log_guest(stat, "vfs stat")
         log(f"      support bundle: {bundle_size} B, {bundle_crc}, stat size matches")
 
-        require(machine, "recovery factory-reset preserve", "recovery reset : PASS, generation 1")
-        check("recovery reset : REFUSED: UnsupportedPolicy" in machine.cmd("recovery factory-reset wipe"),
+        reset = require(machine, "recovery factory-reset preserve", "recovery reset : PASS, generation 1")
+        wipe = machine.cmd("recovery factory-reset wipe")
+        check("recovery reset : REFUSED: UnsupportedPolicy" in wipe,
               "unsupported factory-reset policy did not refuse")
         verify_reset = require(machine, "recovery verify", "recovery verify : PASS, generation 1")
         check('store "Cassa Store"' in verify_reset, "factory reset did not restore defaults:\n" + verify_reset[-2500:])
         sale_after_reset = require(machine, "sales verify", "sales verify : PASS, 1 transaction(s)")
+        fsck_after_reset = require(machine, "blk fsck", "blk fsck    : PASS")
+        log_guest(reset, "recovery reset")
+        log_guest(wipe, "recovery reset")
+        log_guest(verify_reset, "recovery verify")
         log_guest(sale_after_reset, "sales verify")
-        require(machine, "blk fsck", "blk fsck    : PASS")
+        log_guest(fsck_after_reset, "blk fsck")
         log("      factory reset preserve: default config restored, sale audit still verifies")
 
         corrupt_snapshot = machine.cmd("recovery corrupt snapshot")
