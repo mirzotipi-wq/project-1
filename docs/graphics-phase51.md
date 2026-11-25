@@ -157,9 +157,9 @@ image. Observed evidence:
 
 | Harness | Observed result |
 |---|---|
-| input | `4006381333931 (13 chars, 259–260 ms burst)` across clean clones; delivery `0 ms`, budget `20 ms`; screenshot/fallback PASS |
+| input | `4006381333931 (13 chars, 258–260 ms burst)` across clean clones; delivery `0 ms`, budget `20 ms`; screenshot/fallback PASS |
 | usb | `USB scenarios: 4/4 PASS` |
-| power | normal `2372–2390 ms` → critical `3763–3893 ms` (**1.57–1.64x**) across clean clones; watchdog, poweroff, brownout, fallback PASS |
+| power | normal `2372–2471 ms` → critical `3763–3893 ms` (**1.54–1.64x**) across clean clones; watchdog, poweroff, brownout, fallback PASS |
 | cassafs | phase 41 CASSAFS evidence: PASS (format/verify, host reader, reboot, fallback, corruption, absence) |
 | vfs | phase 42 VFS evidence: PASS (mount, stable readdir, remount/reboot, refusals) |
 | vfs_write | `7 bytes, CRC32C 0xdb03992b`; `8 bytes, CRC32C 0x394478f0`; out-of-space/corruption PASS |
@@ -167,16 +167,17 @@ image. Observed evidence:
 | fat32 | `10000 rows, 220021 B, max line 21, CRC32C 0x8678e4e7` (three imports); corrupt chain and one-partition refusal PASS |
 | vfs46 | `10000 rows, 220021 B, max line 21, CRC32C 0x8678e4e7`; three-backend paths, tmpfs, chmod, locks, watches, remount PASS |
 | retail | `239 records, 64 receipts, 128 lines`; `subtotal 42020, units 160, cash 16540, variance 50`; top `100001 Croissant`; corruption refusal PASS |
-| sales48 | `3 transaction(s), 6 unit(s), subtotal 1555, tax 0, total 1555 cents`; observed boot-dependent chain CRCs `0x9ea23dc9`, `0x3afe457d`, `0x72b85792`; retry/conflict/corruption/reboot PASS |
+| sales48 | `3 transaction(s), 6 unit(s), subtotal 1555, tax 0, total 1555 cents`; observed boot-dependent chain CRCs `0x9ea23dc9`, `0x3afe457d`, `0x72b85792`, `0x63226e9e`; retry/conflict/corruption/reboot PASS |
 | storage49 | baseline fsck PASS; transient read/flush recovery; persistent failure `REFUSED: Io` then `REFUSED: BadBlock`; scrub cleared 1 bad entry and fsck PASS; `BadCrc` on separate fixture PASS |
 | recovery50 | config generation 3 in slot 3; `REFUSED: BadCrc` then one-command rollback; bundle **1312 B / CRC32C `0x66d093ce`**; audit **576 B**; factory reset preserve PASS |
 
 The sale-log chain CRC remains intentionally **boot-uptime dependent**. The
 record timestamp at bytes 80..87 is `timer.uptimeMs()` and is inside the record
 CRC, so no fixed sale-chain value is asserted. The phase-51 runs observed
-`0x9ea23dc9`, `0x3afe457d` and `0x72b85792` in sales48 (3 transactions)
-and `0x61fa4d8c`, `0x7eb2c829` and `0x74754b4a` in recovery50's one-sale
-check. All are evidence, not golden constants.
+`0x9ea23dc9`, `0x3afe457d`, `0x72b85792` and `0x63226e9e` in sales48
+(3 transactions), and `0x61fa4d8c`, `0x7eb2c829`, `0x74754b4a` and
+`0x68e99b05` in recovery50's one-sale check. Timer-sensitive values are
+representative observations, not golden constants; host load changes them.
 
 ## Limits
 
