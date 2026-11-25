@@ -20,6 +20,7 @@ const fat32_vfs = @import("../lib/fat32_vfs.zig");
 const catalog_csv = @import("../lib/catalog_csv.zig");
 const partition = @import("partition.zig");
 const vfs = @import("../lib/vfs.zig");
+const tmpfs = @import("../lib/tmpfs.zig");
 
 fn out(comptime fmt: []const u8, args: anytype) void {
     uart.Writer.print(fmt, args);
@@ -33,6 +34,8 @@ var g_fat_volume: fat32.Volume = undefined;
 var g_fat_table: partition.Table = .{};
 var g_root_mounted = false;
 var g_usb_mounted = false;
+var g_tmpfs_mounted = false;
+var g_tmpfs: tmpfs.Fs = .{};
 var import_buf: [4096]u8 = undefined;
 
 const demo_catalog = "sku,name,price_cents\n1001,Espresso,250\n1002,Croissant,180\n1003,Water,150\n";
@@ -54,6 +57,10 @@ fn reason(err: anyerror) []const u8 {
         error.Corrupt => "integrity failure (CRC32C or inode/extent corruption)",
         error.NameTooLong => "path or name is too long",
         error.InvalidPath => "invalid path (empty paths are rejected)",
+        error.LockConflict => "another handle holds a conflicting lock",
+        error.NotLocked => "this handle does not hold a lock",
+        error.AlreadyLocked => "this handle already holds a lock",
+        error.TooManyWatches => "the watch table is full",
         else => @errorName(err),
     };
 }
@@ -107,8 +114,8 @@ pub fn unmount() bool {
         out("  vfs unmount : refused: nothing is mounted\n", .{});
         return false;
     }
-    if (g_usb_mounted) {
-        out("  vfs unmount : refused: /media/usb is still mounted; unmount it first\n", .{});
+    if (g_usb_mounted or g_tmpfs_mounted) {
+        out("  vfs unmount : refused: a child mount is still mounted; unmount it first\n", .{});
         return false;
     }
     // The page cache is write-back: unmount must push every dirty page before
@@ -201,6 +208,51 @@ pub fn unmountUsb() bool {
     return true;
 }
 
+/// Attach the bounded in-memory scratch filesystem at `/tmp`. It is writable,
+/// volatile by design and has no block device behind it; the VFS path resolver,
+/// permission checks, locks and watches are identical to the persistent mounts.
+fn mountTmpfs() bool {
+    if (!mounted()) {
+        out("  vfs mount   : refused: mount the CASSAFS root at / first\n", .{});
+        return false;
+    }
+    if (g_tmpfs_mounted) {
+        out("  vfs mount   : refused: /tmp is already mounted\n", .{});
+        return false;
+    }
+    g_tmpfs.reset();
+    g_vfs.mount("/tmp", g_tmpfs.backend()) catch |err| {
+        out("  vfs mount   : refused by the VFS (no table entry was created): {s}\n", .{@errorName(err)});
+        return false;
+    };
+    g_tmpfs_mounted = true;
+    out("  vfs mount   : /tmp <- tmpfs, writable scratch, {d} node(s), {d} B/file, volatile\n", .{
+        tmpfs.max_nodes, tmpfs.max_file_bytes,
+    });
+    out("  vfs mount   : mount table {d}/8, node table {d}/{d}, open handles {d}/{d}\n", .{
+        g_vfs.mountCount(), g_vfs.stats().nodes, vfs.max_nodes, g_vfs.stats().handles, vfs.max_handles,
+    });
+    return true;
+}
+
+fn unmountTmpfs() bool {
+    if (!g_tmpfs_mounted) {
+        out("  vfs unmount : refused: /tmp is not mounted\n", .{});
+        return false;
+    }
+    g_vfs.unmount("/tmp") catch |err| {
+        if (err == error.Busy) {
+            out("  vfs unmount : refused: open handles still reference /tmp\n", .{});
+        } else {
+            printError(err);
+        }
+        return false;
+    };
+    g_tmpfs_mounted = false;
+    out("  vfs unmount : /tmp removed; scratch data discarded, mount table {d}/8\n", .{g_vfs.mountCount()});
+    return true;
+}
+
 fn info() void {
     if (!mounted()) {
         out("  vfs info    : no mounts; run 'vfs mount' to attach CASSAFS on partition 1\n", .{});
@@ -220,6 +272,9 @@ fn info() void {
     out("  vfs info    : node table {d}/{d}, open handles {d}/{d}, {d} lookup(s), {d} read(s), {d} write(s), {d} readdir(s)\n", .{
         stats.nodes, vfs.max_nodes, stats.handles, vfs.max_handles, g_vfs.lookups, stats.reads, stats.writes, g_vfs.readdirs,
     });
+    out("  vfs info    : {d} lock(s), {d} watch(es), {d} pending event(s), {d} dropped event(s)\n", .{
+        stats.locks, stats.watches, stats.pending_events, stats.dropped_events,
+    });
     const cache = cassafs.mountCacheStats();
     out("  vfs cache   : {d}/{d} page(s) resident ({d}% pressure), {d}/{d} dirty, hit rate {d}% ({d} hit / {d} miss)\n", .{
         cache.used, cache.capacity, cache.pressure(), cache.dirty, cache.max_dirty, cache.hitRate(), cache.hits, cache.misses,
@@ -230,6 +285,11 @@ fn info() void {
             geo.clusters, geo.cluster_bytes, geo.root_cluster,
         });
         out("  vfs info    : FAT32 directory entries are LFN-decoded on demand; writes are refused by the backend\n", .{});
+    }
+    if (g_tmpfs_mounted) {
+        out("  vfs info    : /tmp <- tmpfs, writable, {d} node(s) used, {d} data byte(s), {d} B/file bound\n", .{
+            g_tmpfs.usedNodes(), g_tmpfs.usedBytes(), tmpfs.max_file_bytes,
+        });
     }
 }
 
@@ -336,6 +396,119 @@ fn create(path: []const u8) void {
     out("  vfs create  : {s} (inode {d}, parent {d}, mode 0o{o:0>6})\n", .{ shown, st.ino, st.parent, st.mode });
 }
 
+fn mkdir(path: []const u8) void {
+    var canonical: [vfs.max_path]u8 = undefined;
+    const shown = canonicalPath(path, &canonical);
+    const st = g_vfs.mkdir(path, "/", 0o040755) catch |err| {
+        out("  vfs mkdir   : {s}: ", .{shown});
+        printReason(err);
+        return;
+    };
+    out("  vfs mkdir   : {s} (inode {d}, parent {d}, mode 0o{o:0>6})\n", .{ shown, st.ino, st.parent, st.mode });
+}
+
+fn chmod(path: []const u8, mode_text: []const u8) void {
+    const mode = std.fmt.parseInt(u16, mode_text, 8) catch {
+        out("  vfs chmod   : mode must be octal, for example 644\n", .{});
+        return;
+    };
+    if (mode > 0o7777) {
+        out("  vfs chmod   : mode must fit permission bits 0..7777\n", .{});
+        return;
+    }
+    var canonical: [vfs.max_path]u8 = undefined;
+    const shown = canonicalPath(path, &canonical);
+    const st = g_vfs.chmod(path, "/", mode) catch |err| {
+        out("  vfs chmod   : {s}: ", .{shown});
+        printReason(err);
+        return;
+    };
+    out("  vfs chmod   : {s} mode 0o{o:0>6}, inode {d}\n", .{ shown, st.mode, st.ino });
+}
+
+fn lockTest(path: []const u8) void {
+    const h1 = g_vfs.open(path, "/", .{}) catch |err| {
+        out("  vfs lock    : {s}: ", .{path});
+        printReason(err);
+        return;
+    };
+    defer g_vfs.close(h1) catch {};
+    const h2 = g_vfs.open(path, "/", .{}) catch |err| {
+        out("  vfs lock    : {s}: ", .{path});
+        printReason(err);
+        return;
+    };
+    defer g_vfs.close(h2) catch {};
+
+    g_vfs.lock(h1, .exclusive) catch |err| {
+        out("  vfs lock    : exclusive acquire failed: {s}\n", .{reason(err)});
+        return;
+    };
+    out("  vfs lock    : {s} exclusive acquired by handle {d}\n", .{ path, h1 });
+    const conflict = g_vfs.lock(h2, .exclusive);
+    if (conflict) |_| {
+        out("  vfs lock    : FAIL: second exclusive lock unexpectedly succeeded\n", .{});
+        return;
+    } else |err| {
+        out("  vfs lock    : {s}, second exclusive lock refused ({s}) PASS\n", .{ path, reason(err) });
+    }
+    g_vfs.unlock(h1) catch |err| {
+        out("  vfs lock    : unlock failed: {s}\n", .{reason(err)});
+        return;
+    };
+    g_vfs.lock(h1, .shared) catch |err| {
+        out("  vfs lock    : shared acquire failed: {s}\n", .{reason(err)});
+        return;
+    };
+    const shared = g_vfs.lock(h2, .shared);
+    if (shared) |_| {
+        out("  vfs lock    : shared locks coexist on {s} PASS\n", .{path});
+    } else |err| {
+        out("  vfs lock    : FAIL: shared lock was refused: {s}\n", .{reason(err)});
+    }
+    g_vfs.unlock(h2) catch {};
+    g_vfs.unlock(h1) catch {};
+}
+
+fn watch(path: []const u8) void {
+    const id = g_vfs.watch(path, "/") catch |err| {
+        out("  vfs watch   : {s}: ", .{path});
+        printReason(err);
+        return;
+    };
+    out("  vfs watch   : id {d} on {s}; pending {d}, dropped {d}\n", .{
+        id, path, g_vfs.pendingEvents(), g_vfs.stats().dropped_events,
+    });
+}
+
+fn unwatch(id_text: []const u8) void {
+    const id = std.fmt.parseInt(u32, id_text, 10) catch {
+        out("  vfs unwatch : id must be decimal\n", .{});
+        return;
+    };
+    g_vfs.unwatch(id) catch |err| {
+        out("  vfs unwatch : {d}: ", .{id});
+        printReason(err);
+        return;
+    };
+    out("  vfs unwatch : id {d} removed\n", .{id});
+}
+
+fn events() void {
+    var event: vfs.Event = .{};
+    var count: usize = 0;
+    while (g_vfs.nextEvent(&event)) {
+        out("  vfs event   : seq {d} {s} {s}\n", .{
+            event.seq, @tagName(event.kind), event.pathSlice(),
+        });
+        count += 1;
+        if (count >= vfs.max_events) break;
+    }
+    out("  vfs events  : {d} event(s), {d} still pending, {d} dropped\n", .{
+        count, g_vfs.pendingEvents(), g_vfs.stats().dropped_events,
+    });
+}
+
 fn write(path: []const u8, offset_text: []const u8, text: []const u8) void {
     const offset = std.fmt.parseInt(u64, offset_text, 10) catch {
         out("  vfs write   : offset must be a decimal byte offset\n", .{});
@@ -375,6 +548,11 @@ fn df() void {
     });
     if (g_usb_mounted) {
         out("  vfs df      : /media/usb is FAT32 read-only; free-cluster scan is not run on the import path\n", .{});
+    }
+    if (g_tmpfs_mounted) {
+        out("  vfs df      : /tmp tmpfs {d}/{d} node(s), {d}/{d} byte(s), volatile\n", .{
+            g_tmpfs.usedNodes(), tmpfs.max_nodes, g_tmpfs.usedBytes(), tmpfs.max_nodes * tmpfs.max_file_bytes,
+        });
     }
 }
 
@@ -843,17 +1021,21 @@ pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
             _ = mount();
         } else if (std.mem.eql(u8, which.?, "usb") or std.mem.eql(u8, which.?, "fat") or std.mem.eql(u8, which.?, "/media/usb")) {
             _ = mountUsb();
+        } else if (std.mem.eql(u8, which.?, "tmpfs") or std.mem.eql(u8, which.?, "tmp") or std.mem.eql(u8, which.?, "/tmp")) {
+            _ = mountTmpfs();
         } else {
-            out("  usage: vfs mount [usb]\n", .{});
+            out("  usage: vfs mount [usb|tmpfs]\n", .{});
         }
     } else if (std.mem.eql(u8, sub, "unmount") or std.mem.eql(u8, sub, "umount")) {
         const which = tokens.next() orelse "/";
         if (std.mem.eql(u8, which, "usb") or std.mem.eql(u8, which, "/media/usb")) {
             _ = unmountUsb();
+        } else if (std.mem.eql(u8, which, "tmpfs") or std.mem.eql(u8, which, "tmp") or std.mem.eql(u8, which, "/tmp")) {
+            _ = unmountTmpfs();
         } else if (std.mem.eql(u8, which, "/")) {
             _ = unmount();
         } else {
-            out("  usage: vfs unmount [/|usb]\n", .{});
+            out("  usage: vfs unmount [/|usb|tmpfs]\n", .{});
         }
     } else if (std.mem.eql(u8, sub, "info")) {
         info();
@@ -868,6 +1050,38 @@ pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
             out("  usage: vfs create <path>\n", .{});
             return;
         });
+    } else if (std.mem.eql(u8, sub, "mkdir")) {
+        mkdir(tokens.next() orelse {
+            out("  usage: vfs mkdir <path>\n", .{});
+            return;
+        });
+    } else if (std.mem.eql(u8, sub, "chmod")) {
+        const path = tokens.next() orelse {
+            out("  usage: vfs chmod <path> <octal-mode>\n", .{});
+            return;
+        };
+        const mode_text = tokens.next() orelse {
+            out("  usage: vfs chmod <path> <octal-mode>\n", .{});
+            return;
+        };
+        chmod(path, mode_text);
+    } else if (std.mem.eql(u8, sub, "lock")) {
+        lockTest(tokens.next() orelse {
+            out("  usage: vfs lock <path>\n", .{});
+            return;
+        });
+    } else if (std.mem.eql(u8, sub, "watch")) {
+        watch(tokens.next() orelse {
+            out("  usage: vfs watch <path>\n", .{});
+            return;
+        });
+    } else if (std.mem.eql(u8, sub, "unwatch")) {
+        unwatch(tokens.next() orelse {
+            out("  usage: vfs unwatch <id>\n", .{});
+            return;
+        });
+    } else if (std.mem.eql(u8, sub, "events")) {
+        events();
     } else if (std.mem.eql(u8, sub, "write")) {
         const path = tokens.next() orelse {
             out("  usage: vfs write <path> <offset> <text>\n", .{});
@@ -914,6 +1128,6 @@ pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
         const seconds = std.fmt.parseInt(u32, tokens.next() orelse "8", 10) catch 8;
         viz(seconds);
     } else {
-        out("  usage: vfs [mount [usb]|unmount [/|usb]|info|df|cache [stats|flush|drop|bench]|ls [path]|stat <path>|cat <path>|create <path>|write <path> <offset> <text>|read <path> <offset> <len>|import <csv>|selftest|viz <s>]\n", .{});
+        out("  usage: vfs [mount [usb|tmpfs]|unmount [/|usb|tmpfs]|info|df|cache [stats|flush|drop|bench]|ls [path]|stat <path>|cat <path>|create <path>|mkdir <path>|chmod <path> <octal>|lock <path>|watch <path>|unwatch <id>|events|write <path> <offset> <text>|read <path> <offset> <len>|import <csv>|selftest|viz <s>]\n", .{});
     }
 }

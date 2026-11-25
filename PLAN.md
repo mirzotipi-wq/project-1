@@ -2526,11 +2526,77 @@ schema. File sizes are the FAT 32-bit size field, and there is no FAT write,
 hotplug. Larger formats, multiple FAT32 mounts and the 100k-item catalog remain
 future work.
 
-### Phase 46 — VFS `[ ]`
+### Phase 46 — VFS `[x]`
 **Goal:** One interface for all storage.
 **Build:** Mount points, path resolution, file operations, permissions, file locking,
 inotify-style change notifications.
 **Done when:** Paths resolve identically across CASSAFS, FAT32 and tmpfs.
+
+**Shipped.** The VFS now presents three backends through one namespace: writable
+CASSAFS at `/`, read-only FAT32 at `/media/usb`, and a bounded writable **tmpfs**
+at `/tmp`. `src/lib/tmpfs.zig` is a 16-node, 4 KiB-per-file, zero-allocation
+backend with root and nested directories, create/write/read/readdir, and chmod.
+The core gained optional backend `mkdir_fn`/`chmod_fn` callbacks, permission
+checks driven by on-disk mode bits, advisory whole-file shared/exclusive locks
+that follow handles, and a bounded inotify-style watch/event interface
+(8 watches, 16 queued events) with created/modified/mounted/unmounted events and
+explicit dropped-event accounting. Handles carry their canonical path so write
+events name the exact file; the VFS event ring overwrites the oldest event when a
+slow consumer falls behind, never grows without bound.
+
+The shell exposes `vfs mount tmpfs`, `vfs unmount tmpfs`, `vfs mkdir`, `vfs chmod`,
+`vfs lock`, `vfs watch`, `vfs unwatch` and `vfs events`; `vfs info`/`vfs df`
+report locks, watches, pending/dropped events and tmpfs usage. `vfs lock <path>`
+proves exclusive refusal and shared coexistence in one booted command.
+
+A latent input bug surfaced when the larger VFS image shifted timing: the shell
+loop's `virtio_input.pollAll()` could drain a virtqueue concurrently with the
+device IRQ handler. The two paths had no lock, so keyboard completions could be
+freed/reposted twice and barcode digits were lost. `src/devices/virtio_input.zig`
+now serialises every drain with an IRQ-safe spinlock; the unchanged input harness
+again captures all 13 digits.
+
+**Evidence.**
+- `zig build` clean; `zig build test --summary all` reports **233/233**, up from
+  231 (+2: nested tmpfs path/create/write/readdir; chmod, lock conflict/sharing,
+  watch and event queue).
+- `python3 tools/qemu_vfs46_test.py` **PASS** on QEMU 8.2.2. With CASSAFS, FAT32
+  and tmpfs mounted, `mount table 3/8` is reported. Canonicalisation of
+  `./catalog/products.db`, `./media/usb/./store-catalog-2026.csv` and
+  `./tmp/spool/../spool/notice.txt` resolves to `/catalog/products.db`,
+  `/media/usb/store-catalog-2026.csv` and `/tmp/spool/notice.txt` through the
+  same resolver.
+- tmpfs is proved end to end: `/tmp/spool` is created, a 7-byte `notice.txt` is
+  written (CRC32C `0x6d6a12e7`), chmod `444` makes the next write fail with
+  `permission denied` while reads stay allowed, chmod `644` restores writes, and
+  the appended 9-byte file reads back with CRC32C `0x9e9cac38`. `vfs lock`
+  acquires exclusive, refuses a second exclusive handle, then allows two shared
+  locks. A watch on `/tmp` delivers exactly two events: `created` and `modified`
+  for `/tmp/spool/event.txt`.
+- tmpfs unmount discards scratch data, the CASSAFS root remains readable, and a
+  remount starts at one root node / zero data bytes. The FAT32 path still streams
+  **10,000 rows / 220,021 bytes / max line 21 / CRC32C `0x8678e4e7`** through the
+  same VFS and importer before the tmpfs mount is removed.
+- All eight pre-existing harnesses PASS unchanged, one at a time on an idle host:
+  input (13-char `4006381333931`, 259 ms, 0 ms suffix-to-queue, HID/no-input),
+  USB (4/4), power (thermal **2379 -> 3853 ms, 1.62x**), CASSAFS, VFS, VFS write
+  (7-byte CRC `0xdb03992b`, 8-byte CRC `0x394478f0`), page cache (23/64 pages,
+  79% hit, 21/6 cold, **29 ms** max sale commit, **64/64 pages**, 344 evictions,
+  88 writebacks, sale CRC `0x12b569fa`) and FAT32 (10,000 rows / 220,021 B /
+  `0x8678e4e7`, corrupt-chain refusal). No assertion, check or timeout changed.
+- Design and limits: `docs/vfs-phase46.md`; the VFS contract is in `docs/vfs.md`.
+
+**Limits.** tmpfs is volatile and strictly bounded (16 nodes, 4 KiB per file, no
+allocation, no swap), so it is scratch/spool storage, not durable POS storage.
+Permissions are POSIX mode bits only: there is no uid/gid, ACL, capability check
+at the VFS layer, or `chmod` on CASSAFS/FAT32 (CASSAFS returns `Unsupported`;
+FAT32 is read-only). Locks are advisory, whole-file, non-blocking and carry no
+deadlock detection; they protect cooperating processes, not hostile ones.
+Watches are in-kernel and bounded, cover create/write/mount events only, and are
+not yet exposed as a user-space syscall; there is no unlink/rename/truncate event
+because those operations are not implemented. There is one tmpfs mount, one
+FAT32 mount and one CASSAFS root, and the VFS tables remain single-threaded
+kernel-owned state.
 
 ### Phase 47 — Retail data model `[ ]`
 **Goal:** The schema a store actually needs.
@@ -2895,3 +2961,4 @@ to the OS.
 | 2026-11-25 | 43 | CASSAFS append-only write path: create, offset write/extend, touched-chunk rebuild, latest-inode supersession, free-map/checkpoint commit, A/B superblocks with readback and full rescan; VFS `create`/`writeAt`/`write`, `vfs create/write/df`, writable access checks; 219 host tests (+2); QEMU 8.2.2: note.txt inode 6/8 B CRC `0x394478f0`, 7-byte and overwrite reads, 6 inodes/3 files/166 B after remount and soft reboot, phase-42 products CRC unchanged, host verifier PASS; 8-block volume 0 free refuses create with out-of-space and no entry; corrupted committed payload refused with CRC32C; all prior harnesses PASS; screenshot `docs/screenshots/phase43-write.png` |
 | 2026-11-25 | 44 | Bounded 4 KiB CASSAFS page cache: 64-page LRU, 16 dirty pages, four-page readahead, write-back eviction/flush, cache pressure stats, `vfs cache stats/flush/drop/bench`, unmount flush, dashboard line; 225 host tests (+6); QEMU: mount 23/64 pages/79% hit, cold-read readahead, 8 sale-sized commits 27–38 ms/100 ms with 16 catalog reads/1,264 B, 64/64 pages/344 evictions/88 writebacks/20 flushes/0 dirty, sale 33 B CRC `0x12b569fa` survives cache drop/unmount/remount/host verify; fixed a real 64 KiB stack overflow after cache insertion by moving the bounce page off-stack and raising stacks to 128 KiB; all prior harnesses PASS; screenshot `docs/screenshots/phase44-cache.png` |
 | 2026-11-25 | 45 | Read-only FAT32 reader backend: LFN lookup, stable slot-derived inodes, bounded chain/range reads, exact chain validation, `/media/usb` mount on partition 2, read-only enforcement, streaming `vfs import` CSV parser; 231 host tests (+6); QEMU: 22-char LFN `store-catalog-2026.csv`, 10,000 rows/220,021 B/max line 21/CRC32C `0x8678e4e7`, long-name readdir and stat, read-only write/create refusal, unmount/remount and soft-reboot reimport, looped FAT chain refused with CASSAFS root intact, one-partition USB mount refused; all seven prior harnesses PASS unchanged; `tools/qemu_fat32_test.py`; design `docs/fat32-reader.md` |
+| 2026-11-25 | 46 | Unified VFS across three backends: bounded writable tmpfs at `/tmp` (16 nodes, 4 KiB/file, nested dirs), optional backend mkdir/chmod, mode-bit permissions, advisory shared/exclusive file locks, 8-watch/16-event inotify-style queue with created/modified/mounted/unmounted events and drop accounting; `vfs mount tmpfs`, `mkdir`, `chmod`, `lock`, `watch`, `unwatch`, `events`; 233 host tests (+2); QEMU 8.2.2: 3 mounts, identical canonical paths for CASSAFS/FAT32/tmpfs, 7 B CRC `0x6d6a12e7`, chmod 444 refusal then 644 append to 9 B CRC `0x9e9cac38`, exclusive conflict/shared coexistence, 2 events, remount; FAT32 import 10,000 rows/220,021 B/`0x8678e4e7`; all eight prior harnesses PASS; fixed a real virtio-input drain race between IRQ and shell polling (IRQ-safe lock); `tools/qemu_vfs46_test.py`; design `docs/vfs-phase46.md` |

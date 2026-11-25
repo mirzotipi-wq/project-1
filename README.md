@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–45 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–46 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -92,8 +92,9 @@ goes to the serial console is now also on the screen. See
 | 43 | CASSAFS write path: append-only create and offset write/extend, touched-chunk rebuild, latest-inode supersession, free-map allocation, new checkpoint, A/B superblock generation with readback, writable VFS handles and repair-free rescan; `vfs create/write/df`, `vfs selftest` write checks | QEMU 8.2.2: create `/catalog/note.txt` inode 6, write 7 bytes CRC `0xdb03992b`, overwrite to 8 bytes CRC `0x394478f0`; 6 inodes/3 files/166 data bytes read back after unmount/remount and a soft reboot; 73-byte products CRC unchanged; host `cassafs verify` PASS; 8-block 0-free volume refuses create with out-of-space and no entry; corrupted committed payload refused with CRC32C; 219 host tests (+2); `tools/qemu_vfs_write_test.py`; screenshot `docs/screenshots/phase43-write.png` |
 | 44 | CASSAFS page cache: bounded 4 KiB LRU between VFS and the partition view, 64 resident pages (256 KiB), 16-page write-back bound (64 KiB), four-page readahead, dirty-written-before-eviction/flush, pressure accounting, `vfs cache stats/flush/drop/bench`, unmount flush, dashboard cache line, 19-check `vfs selftest` | QEMU 8.2.2: mount warms 23/64 pages, 35% pressure, 79% hit (19/5); after cache drop and cold read 21 hit/6 miss, 22 readahead reads, 0 errors; 8 sale-sized VFS commits **27–38 ms** observed / 100 ms while interleaving 16 catalog reads/1,264 B; 64/64 pages, 344 evictions, 88 writebacks, 20 flushes, 0 dirty; sale 33 B CRC `0x12b569fa` survives cache drop, unmount/remount and host verify; 225 host tests (+6); fixes: 4 KiB cache bounce page moved off-stack and thread stacks raised to 128 KiB after a real post-mount stack overflow, plus the console writer now holds its lock across a whole formatted record so four-core boot logs cannot split the shell prompt; `tools/qemu_page_cache_test.py`; screenshot `docs/screenshots/phase44-cache.png` |
 | 45 | Read-only FAT32 reader at `/media/usb`: BPB/LFN/cluster-chain validation, stable inode mapping, range reads, read-only backend and mount integration on partition 2; bounded streaming catalog CSV parser and `vfs import`; `vfs mount usb`, `vfs unmount usb`, `vfs selftest` LFN/read-only checks | QEMU 8.2.2: foreign-formatted partition 2 has 201,616 clusters of 512 B, root cluster 2; long name `store-catalog-2026.csv`; import reads **10,000 rows / 220,021 B / max line 21 / CRC32C `0x8678e4e7`** across cache-free 4 KiB VFS reads and repeats after unmount/remount and soft reboot; readdir/stat expose the LFN, write/create refuse as read-only, a looped FAT chain is refused with `integrity failure`, a one-partition disk refuses the USB mount, and the CASSAFS root stays intact; 231 host tests (+6); `tools/qemu_fat32_test.py`; design `docs/fat32-reader.md` |
+| 46 | Unified VFS: bounded writable tmpfs at `/tmp` (16 nodes, 4 KiB/file, nested directories), optional backend `mkdir`/`chmod`, mode-bit permissions, advisory shared/exclusive whole-file locks, 8-watch/16-event inotify-style queue with created/modified/mounted/unmounted events and dropped-event accounting; `vfs mount tmpfs`, `mkdir`, `chmod`, `lock`, `watch`, `unwatch`, `events`; same resolver for CASSAFS, FAT32 and tmpfs | QEMU 8.2.2: `mount table 3/8`; `./catalog/products.db`, `./media/usb/./store-catalog-2026.csv` and `./tmp/spool/../spool/notice.txt` canonicalise identically through one resolver; tmpfs 7 B `notice.txt` CRC `0x6d6a12e7`, chmod 444 refuses writes while reads stay allowed, chmod 644 appends to 9 B CRC `0x9e9cac38`; exclusive lock conflict and two shared locks PASS; watch `/tmp` delivers exactly `created` + `modified` events for `/tmp/spool/event.txt`; unmount discards /tmp and remount starts at 1 node/0 bytes; FAT32 import still **10,000 rows / 220,021 B / CRC32C `0x8678e4e7`**; 233 host tests (+2); all eight prior harnesses PASS (input 13 chars/259 ms, page cache 64/64 pages + sale CRC `0x12b569fa`); fixes a real virtio-input drain race between IRQ and shell polling; `tools/qemu_vfs46_test.py`; design `docs/vfs-phase46.md` |
 
-The remaining 55 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 54 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -147,6 +148,11 @@ disk (CASSAFS root and a foreign-formatted FAT32 stick), mounts the stick read-o
 refusal, unmounts/remounts, soft-reboots and imports again, then corrupts the file's FAT chain
 and proves the import is refused instead of returning a partial catalog. Design and limits:
 [docs/fat32-reader.md](docs/fat32-reader.md).
+The phase-46 VFS adds `python3 tools/qemu_vfs46_test.py`: it mounts all three backends, resolves
+relative/dot-dot paths to the same canonical form, creates and reads a tmpfs file, proves
+chmod enforcement and restoration, exercises exclusive/shared locks, watches a directory for
+created and modified events, remounts tmpfs, and reimports the FAT32 catalog through the same
+VFS. Design and limits: [docs/vfs-phase46.md](docs/vfs-phase46.md).
 The kernel
 console is the first PL011 UART; press Enter for a prompt and type `help`. Concurrency can be
 inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
@@ -300,7 +306,7 @@ src/lib/             freestanding helpers (device tree, EDID, 5x7 font, display 
                      keymap, scanner, USB descriptors/HID/xHCI arithmetic, power policy,
                      CASSAFS codec/format/verify/range-read/write path, page cache,
                      backend-neutral VFS, CASSAFS VFS adapter, read-only FAT32
-                     VFS adapter, bounded catalog CSV parser)
+                     VFS adapter, bounded writable tmpfs, bounded catalog CSV parser)
 tools/mkimage.zig    host-side Image wrapper used by the build
 tools/cassafs.zig    read-only host reference reader for CASSAFS images
 tools/qemu_input_test.py  boots with virtio keyboard/tablet, drives them over HMP/QMP
@@ -314,11 +320,14 @@ tools/qemu_page_cache_test.py  proves cache hits/readahead/eviction/write-back a
                                sale-commit budget in the booted image
 tools/qemu_fat32_test.py        mounts partition 2 read-only, imports a 10k-row LFN catalog,
                                proves read-only/remount/reboot and corrupt-chain refusal
+tools/qemu_vfs46_test.py        proves one resolver across CASSAFS/FAT32/tmpfs, tmpfs writes,
+                               chmod, locks, two change events and remount
 src/tests.zig        host unit-test root
 docs/cassafs-format.md  the CASSAFS v1 on-disk contract, write path and limits
 docs/vfs.md             the VFS contract, write path, backend interface and limits
 docs/page-cache.md      phase-44 page-cache policy, commands, evidence and limits
 docs/fat32-reader.md    phase-45 FAT32/LFN/cluster reader and catalog-import contract
+docs/vfs-phase46.md     phase-46 tmpfs, permissions, locks, watches and evidence
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan
 ```

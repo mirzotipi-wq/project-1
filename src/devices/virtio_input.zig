@@ -22,6 +22,7 @@ const driver = @import("../kernel/driver.zig");
 const klog = @import("../kernel/klog.zig");
 const fdt = @import("../lib/fdt.zig");
 const fb = @import("../kernel/fb.zig");
+const sync = @import("../kernel/sync.zig");
 
 pub const input_device: u32 = 18;
 pub const max_input_devices = 2;
@@ -118,6 +119,11 @@ pub const InputDevice = struct {
 var devices: [max_input_devices]InputDevice = [_]InputDevice{.{}} ** max_input_devices;
 var device_count: usize = 0;
 var stats: Stats = .{};
+/// `pollAll` runs on the shell thread while the device IRQ can run on another
+/// core. Draining a split virtqueue is not re-entrant, so both paths take this
+/// IRQ-safe lock; without it a completion can be freed twice or an event buffer
+/// can be reposted while the other drainer is still reading it.
+var drain_lock: sync.IrqSpinLock = .{};
 
 pub fn info() []const InputDevice {
     return devices[0..device_count];
@@ -363,6 +369,8 @@ fn decodeBuffer(dev: *InputDevice, bytes: []const u8) void {
 }
 
 fn drain(dev: *InputDevice, from_irq: bool) usize {
+    const flags = drain_lock.acquire();
+    defer drain_lock.release(flags);
     if (from_irq) stats.interrupts += 1;
     var drained: usize = 0;
     while (dev.event_queue.popUsed()) |elem| {

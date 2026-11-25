@@ -109,8 +109,9 @@ fn printHelp() void {
         \\  fat <sub>            FAT32 on partition 1: info, ls, cat, put, rm, check
         \\  cassafs <sub>        CASSAFS format 1: info, format [empty|demo], demo,
         \\                       dump, verify, cat <path>, viz <s>
-        \\  vfs <sub>            VFS: mount [usb], unmount [/|usb], info, ls, stat,
-        \\                       cat, read, import <csv>, selftest, viz <s>
+        \\  vfs <sub>            VFS: mount [usb|tmpfs], unmount [/|usb|tmpfs], info,
+        \\                       ls, stat, cat, mkdir, chmod, create, write, read,
+        \\                       lock, watch, unwatch, events, import <csv>, selftest
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path

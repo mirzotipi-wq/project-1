@@ -44,6 +44,7 @@ test {
     _ = @import("lib/vfs.zig");
     _ = @import("lib/cassafs_vfs.zig");
     _ = @import("lib/fat32_vfs.zig");
+    _ = @import("lib/tmpfs.zig");
     _ = @import("lib/page_cache.zig");
     _ = @import("kernel/input.zig");
     _ = @import("lib/edid.zig");

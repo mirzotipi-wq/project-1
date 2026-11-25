@@ -1,14 +1,15 @@
-//! A small, backend-neutral VFS (phase 42).
+//! A small, backend-neutral VFS (phases 42-46).
 //!
-//! This module owns the namespace policy and the visible node/handle tables.
-//! Filesystems plug in through `Backend` callbacks, so CASSAFS is one backend
-//! today and a second backend can be added without touching path resolution,
-//! mount lookup, handles or access checks.
+//! This module owns the namespace policy, node/handle tables, advisory locks and
+//! the change-notification queue. Filesystems plug in through `Backend`
+//! callbacks, so CASSAFS, FAT32 and tmpfs share one path resolver and one access
+//! policy. Mounts are longest-prefix mappings; a mount at `/` is the normal
+//! case, and a mount at `/media/usb` shadows only that subtree.
 //!
-//! The VFS is deliberately read-only in phase 42. `open` rejects a write flag
-//! with `ReadOnly` and checks the backend's mode bits before handing out a
-//! handle. Mounts are longest-prefix mappings; a mount at `/` is the normal
-//! case, and a mount at `/mnt/data` already shadows only that subtree.
+//! Permissions are the traditional mode bits on `Stat.mode`; the VFS enforces
+//! read/write bits before it asks a backend for a handle. A writable backend may
+//! provide `chmod_fn` and `mkdir_fn`; read-only backends leave them null and the
+//! VFS returns `Unsupported` or `ReadOnly` without guessing.
 
 const std = @import("std");
 
@@ -17,8 +18,25 @@ pub const max_name = 63;
 pub const max_mounts = 8;
 pub const max_nodes = 128;
 pub const max_handles = 32;
+pub const max_watches = 8;
+pub const max_events = 16;
 
 pub const Kind = enum { file, directory };
+
+pub const LockMode = enum { shared, exclusive };
+
+pub const EventKind = enum { created, modified, mounted, unmounted };
+
+pub const Event = struct {
+    seq: u64 = 0,
+    kind: EventKind = .created,
+    path: [max_path]u8 = [_]u8{0} ** max_path,
+    path_len: u16 = 0,
+
+    pub fn pathSlice(self: *const Event) []const u8 {
+        return self.path[0..self.path_len];
+    }
+};
 
 pub const Error = error{
     InvalidPath,
@@ -40,6 +58,10 @@ pub const Error = error{
     Unsupported,
     Backend,
     Corrupt,
+    LockConflict,
+    NotLocked,
+    AlreadyLocked,
+    TooManyWatches,
 };
 
 pub const Stat = struct {
@@ -87,6 +109,10 @@ pub const Backend = struct {
     readdir_fn: *const fn (ctx: *anyopaque, ino: u64, index: u32, out: *DirEntry) Error!bool,
     create_fn: *const fn (ctx: *anyopaque, parent: u64, name: []const u8, mode: u16) Error!Stat,
     write_fn: *const fn (ctx: *anyopaque, ino: u64, offset: u64, data: []const u8) Error!WriteResult,
+    /// Optional operations. A read-only backend leaves them null; a writable
+    /// backend that does not implement a capability returns `Unsupported`.
+    mkdir_fn: ?*const fn (ctx: *anyopaque, parent: u64, name: []const u8, mode: u16) Error!Stat = null,
+    chmod_fn: ?*const fn (ctx: *anyopaque, ino: u64, mode: u16) Error!void = null,
 };
 
 const Mount = struct {
@@ -110,18 +136,44 @@ const Handle = struct {
     node: u8 = 0,
     offset: u64 = 0,
     flags: OpenFlags = .{},
+    lock: ?LockMode = null,
+    path: [max_path]u8 = [_]u8{0} ** max_path,
+    path_len: u16 = 0,
+
+    fn pathSlice(self: *const Handle) []const u8 {
+        return self.path[0..self.path_len];
+    }
+};
+
+const Watch = struct {
+    used: bool = false,
+    id: u32 = 0,
+    path: [max_path]u8 = [_]u8{0} ** max_path,
+    path_len: u16 = 0,
+
+    fn pathSlice(self: *const Watch) []const u8 {
+        return self.path[0..self.path_len];
+    }
 };
 
 pub const Vfs = struct {
     mounts: [max_mounts]Mount = [_]Mount{.{}} ** max_mounts,
     nodes: [max_nodes]Node = [_]Node{.{}} ** max_nodes,
     handles: [max_handles]Handle = [_]Handle{.{}} ** max_handles,
+    watches: [max_watches]Watch = [_]Watch{.{}} ** max_watches,
+    events: [max_events]Event = [_]Event{.{}} ** max_events,
+    event_head: u8 = 0,
+    event_count: u8 = 0,
+    event_seq: u64 = 0,
+    events_dropped: u64 = 0,
+    watch_counter: u32 = 0,
     mount_count: u8 = 0,
     generation: u32 = 1,
     reads: u64 = 0,
     writes: u64 = 0,
     lookups: u64 = 0,
     readdirs: u64 = 0,
+    locks_held: u32 = 0,
 
     pub fn init() Vfs {
         return .{};
@@ -269,6 +321,7 @@ pub const Vfs = struct {
         @memcpy(self.mounts[slot].point[0..canonical.len], canonical);
         self.mount_count += 1;
         self.generation +%= 1;
+        self.notify(.mounted, canonical);
     }
 
     fn parentPath(path: []const u8) []const u8 {
@@ -302,6 +355,7 @@ pub const Vfs = struct {
         self.mounts[index] = .{};
         self.mount_count -= 1;
         self.generation +%= 1;
+        self.notify(.unmounted, canonical);
     }
 
     pub fn mountCount(self: *const Vfs) usize {
@@ -348,13 +402,33 @@ pub const Vfs = struct {
         return count;
     }
 
-    pub fn stats(self: *const Vfs) struct { mounts: usize, nodes: usize, handles: usize, reads: u64, writes: u64 } {
+    pub const Stats = struct {
+        mounts: usize,
+        nodes: usize,
+        handles: usize,
+        reads: u64,
+        writes: u64,
+        locks: u32,
+        watches: usize,
+        pending_events: usize,
+        dropped_events: u64,
+    };
+
+    pub fn stats(self: *const Vfs) Stats {
+        var watches: usize = 0;
+        for (self.watches) |entry| if (entry.used) {
+            watches += 1;
+        };
         return .{
             .mounts = self.mount_count,
             .nodes = nodeCount(self),
             .handles = handleCount(self),
             .reads = self.reads,
             .writes = self.writes,
+            .locks = self.locks_held,
+            .watches = watches,
+            .pending_events = self.event_count,
+            .dropped_events = self.events_dropped,
         };
     }
 
@@ -436,7 +510,7 @@ pub const Vfs = struct {
         return null;
     }
 
-    fn openNode(self: *Vfs, node_index: usize, flags: OpenFlags) Error!u32 {
+    fn openNode(self: *Vfs, node_index: usize, flags: OpenFlags, canonical: []const u8) Error!u32 {
         const stat = self.nodes[node_index].stat;
         const backend = &self.mounts[self.nodes[node_index].mount].backend;
         if (flags.write) {
@@ -446,8 +520,16 @@ pub const Vfs = struct {
         }
         if (flags.read and (stat.mode & 0o444) == 0) return error.AccessDenied;
         if (!flags.read and !flags.write) return error.AccessDenied;
+        if (canonical.len > max_path) return error.NameTooLong;
         const h = self.freeHandle() orelse return error.TooManyHandles;
-        self.handles[h] = .{ .used = true, .node = @intCast(node_index), .offset = 0, .flags = flags };
+        self.handles[h] = .{
+            .used = true,
+            .node = @intCast(node_index),
+            .offset = 0,
+            .flags = flags,
+            .path_len = @intCast(canonical.len),
+        };
+        @memcpy(self.handles[h].path[0..canonical.len], canonical);
         self.nodes[node_index].refs += 1;
         return @intCast(h);
     }
@@ -466,9 +548,7 @@ pub const Vfs = struct {
         return .{ .parent = canonical[0 .. i - 1], .name = canonical[i..] };
     }
 
-    fn createOpen(self: *Vfs, path: []const u8, cwd: []const u8, flags: OpenFlags) Error!u32 {
-        var canonical_buf: [max_path]u8 = undefined;
-        const canonical = try normalizePath(cwd, path, &canonical_buf);
+    fn createOpen(self: *Vfs, canonical: []const u8, flags: OpenFlags) Error!u32 {
         if (canonical.len <= 1) return error.IsDirectory;
         const split = splitParent(canonical);
         if (split.name.len == 0) return error.InvalidPath;
@@ -486,8 +566,16 @@ pub const Vfs = struct {
         const st = try backend.create_fn(backend.ctx, parent_stat.ino, split.name, 0o100644);
         const node = try self.nodeForStat(mount_index, st);
         const h = self.freeHandle() orelse return error.TooManyHandles;
-        self.handles[h] = .{ .used = true, .node = @intCast(node), .offset = 0, .flags = flags };
+        self.handles[h] = .{
+            .used = true,
+            .node = @intCast(node),
+            .offset = 0,
+            .flags = flags,
+            .path_len = @intCast(canonical.len),
+        };
+        @memcpy(self.handles[h].path[0..canonical.len], canonical);
         self.nodes[node].refs += 1;
+        self.notify(.created, canonical);
         return @intCast(h);
     }
 
@@ -500,21 +588,24 @@ pub const Vfs = struct {
     }
 
     pub fn open(self: *Vfs, path: []const u8, cwd: []const u8, flags: OpenFlags) Error!u32 {
+        var canonical_buf: [max_path]u8 = undefined;
+        const canonical = try normalizePath(cwd, path, &canonical_buf);
         if (flags.create) {
             if (!flags.write) return error.AccessDenied;
-            if (self.resolve(path, cwd)) |node| {
-                return self.openNode(node, flags);
+            if (self.resolveCanonical(canonical)) |node| {
+                return self.openNode(node, flags, canonical);
             } else |err| {
                 if (err != error.NotFound) return err;
-                return self.createOpen(path, cwd, flags);
+                return self.createOpen(canonical, flags);
             }
         }
-        const node = try self.resolve(path, cwd);
-        return self.openNode(node, flags);
+        const node = try self.resolveCanonical(canonical);
+        return self.openNode(node, flags, canonical);
     }
 
     pub fn close(self: *Vfs, handle: u32) Error!void {
         if (handle >= max_handles or !self.handles[handle].used) return error.BadHandle;
+        if (self.handles[handle].lock != null) self.locks_held -= 1;
         const node = self.handles[handle].node;
         if (self.nodes[node].refs > 0) self.nodes[node].refs -= 1;
         self.handles[handle] = .{};
@@ -566,6 +657,7 @@ pub const Vfs = struct {
         const result = try backend.write_fn(backend.ctx, node.ino, offset, data);
         node.stat = result.stat;
         self.writes += 1;
+        if (result.written != 0) self.notify(.modified, h.pathSlice());
         return result.written;
     }
 
@@ -590,6 +682,160 @@ pub const Vfs = struct {
         );
         if (more) self.readdirs += 1;
         return more;
+    }
+
+    // ----------------------------------------------------------- permissions
+
+    /// Change permission bits on a writable backend that implements chmod.
+    /// The file type bits are preserved by the backend; callers pass 0o755 etc.
+    pub fn chmod(self: *Vfs, path: []const u8, cwd: []const u8, mode: u16) Error!Stat {
+        const node_index = try self.resolve(path, cwd);
+        const node = &self.nodes[node_index];
+        const backend = &self.mounts[node.mount].backend;
+        if (!backend.writable) return error.ReadOnly;
+        const chmod_fn = backend.chmod_fn orelse return error.Unsupported;
+        try chmod_fn(backend.ctx, node.ino, mode);
+        var refreshed: Stat = .{};
+        try backend.stat_fn(backend.ctx, node.ino, &refreshed);
+        node.stat = refreshed;
+        return refreshed;
+    }
+
+    // ---------------------------------------------------------------- mkdir
+
+    pub fn mkdir(self: *Vfs, path: []const u8, cwd: []const u8, mode: u16) Error!Stat {
+        var canonical_buf: [max_path]u8 = undefined;
+        const canonical = try normalizePath(cwd, path, &canonical_buf);
+        if (canonical.len <= 1) return error.Exists;
+        const split = splitParent(canonical);
+        if (split.name.len == 0 or split.name.len > max_name) return error.InvalidPath;
+        const parent_node = try self.resolveCanonical(split.parent);
+        const parent_stat = self.nodes[parent_node].stat;
+        if (parent_stat.kind != .directory) return error.NotDirectory;
+        if (self.resolveCanonical(canonical)) |_| return error.Exists else |err| {
+            if (err != error.NotFound) return err;
+        }
+        const mount_index = self.nodes[parent_node].mount;
+        const backend = &self.mounts[mount_index].backend;
+        if (!backend.writable) return error.ReadOnly;
+        const mkdir_fn = backend.mkdir_fn orelse return error.Unsupported;
+        if (self.freeNodeSlot() == null) return error.TooManyNodes;
+        const st = try mkdir_fn(backend.ctx, parent_stat.ino, split.name, mode & 0o7777);
+        _ = try self.nodeForStat(mount_index, st);
+        self.notify(.created, canonical);
+        return st;
+    }
+
+    // --------------------------------------------------------------- locking
+
+    /// Advisory whole-file locks. Shared locks may coexist; any exclusive lock
+    /// conflicts with every other lock on the same node. The lock follows the
+    /// handle and is released by close/unmount (handles already block unmount).
+    pub fn lock(self: *Vfs, handle: u32, mode: LockMode) Error!void {
+        if (handle >= max_handles or !self.handles[handle].used) return error.BadHandle;
+        if (self.handles[handle].lock != null) return error.AlreadyLocked;
+        const node_index = self.handles[handle].node;
+        for (self.handles) |other| {
+            if (!other.used or other.node != node_index or other.lock == null) continue;
+            if (mode == .exclusive or other.lock.? == .exclusive) return error.LockConflict;
+        }
+        self.handles[handle].lock = mode;
+        self.locks_held += 1;
+    }
+
+    pub fn unlock(self: *Vfs, handle: u32) Error!void {
+        if (handle >= max_handles or !self.handles[handle].used) return error.BadHandle;
+        if (self.handles[handle].lock == null) return error.NotLocked;
+        self.handles[handle].lock = null;
+        self.locks_held -= 1;
+    }
+
+    pub fn lockMode(self: *const Vfs, handle: u32) ?LockMode {
+        if (handle >= max_handles or !self.handles[handle].used) return null;
+        return self.handles[handle].lock;
+    }
+
+    // ------------------------------------------------------- change events
+
+    /// Register a watch on an existing path. A directory watch covers its whole
+    /// subtree; a file watch matches only that file. Events are queued in a
+    /// bounded ring, so a slow consumer loses old events rather than RAM.
+    pub fn watch(self: *Vfs, path: []const u8, cwd: []const u8) Error!u32 {
+        var canonical_buf: [max_path]u8 = undefined;
+        const canonical = try normalizePath(cwd, path, &canonical_buf);
+        _ = try self.resolveCanonical(canonical);
+        var slot: usize = 0;
+        while (slot < max_watches and self.watches[slot].used) : (slot += 1) {}
+        if (slot == max_watches) return error.TooManyWatches;
+        self.watch_counter +%= 1;
+        if (self.watch_counter == 0) self.watch_counter = 1;
+        self.watches[slot] = .{
+            .used = true,
+            .id = self.watch_counter,
+            .path_len = @intCast(canonical.len),
+        };
+        @memcpy(self.watches[slot].path[0..canonical.len], canonical);
+        return self.watch_counter;
+    }
+
+    pub fn unwatch(self: *Vfs, id: u32) Error!void {
+        for (&self.watches) |*entry| {
+            if (entry.used and entry.id == id) {
+                entry.* = .{};
+                return;
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// Pop the oldest queued event. Returns false when the queue is empty.
+    pub fn nextEvent(self: *Vfs, out: *Event) bool {
+        if (self.event_count == 0) return false;
+        out.* = self.events[self.event_head];
+        self.event_head = (self.event_head + 1) % max_events;
+        self.event_count -= 1;
+        return true;
+    }
+
+    pub fn pendingEvents(self: *const Vfs) usize {
+        return self.event_count;
+    }
+
+    fn watchMatches(watch_path: []const u8, event_path: []const u8) bool {
+        if (std.mem.eql(u8, watch_path, event_path)) return true;
+        if (std.mem.eql(u8, watch_path, "/")) return event_path.len > 1 and event_path[0] == '/';
+        return event_path.len > watch_path.len and
+            std.mem.startsWith(u8, event_path, watch_path) and
+            event_path[watch_path.len] == '/';
+    }
+
+    fn notify(self: *Vfs, kind: EventKind, path: []const u8) void {
+        var watched = false;
+        for (self.watches) |entry| {
+            if (entry.used and watchMatches(entry.pathSlice(), path)) {
+                watched = true;
+                break;
+            }
+        }
+        if (!watched) return;
+
+        self.event_seq +%= 1;
+        const event = Event{
+            .seq = self.event_seq,
+            .kind = kind,
+            .path_len = @intCast(@min(path.len, max_path)),
+        };
+        var stored = event;
+        @memcpy(stored.path[0..stored.path_len], path[0..stored.path_len]);
+        if (self.event_count == max_events) {
+            self.events[self.event_head] = stored;
+            self.event_head = (self.event_head + 1) % max_events;
+            self.events_dropped += 1;
+        } else {
+            const index = (self.event_head + self.event_count) % max_events;
+            self.events[index] = stored;
+            self.event_count += 1;
+        }
     }
 };
 
