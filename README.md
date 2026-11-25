@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–42 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–43 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -89,8 +89,9 @@ goes to the serial console is now also on the screen. See
 | 40 | Watchdog and power: real i6300ESB PCI watchdog with a two-stage 4 s reset and previous-reset flag, core-0 scheduler heartbeat, brown-out hooks and emergency service path, FAT32-backed `POWER.JNL` with 72-byte CRC32 records and a 96-record ring, thermal ladder with 0/25/50/75% idle injection, PSCI poweroff/reboot with storage flush, `power`, `thermal`, `watchdog`, `poweroff` | QEMU 8.2.2: forced hang resets in 4 s and the next boot reports `watchdog_boot` with an unclean journal and intact FAT32 file; poweroff and brownout exit 0 and the next boot is clean with the file intact; thermal benchmark 2212 → 3604 ms (1.63x) at critical/75% with 12,990 idle ticks; no-watchdog/no-disk boot PASS with two `OK (degraded)` and `power hang` refused; 197 host tests; `tools/qemu_power_test.py` |
 | 41 | CASSAFS format 1: 4 KiB log-structured volume, A/B superblocks with CRC32C, 64-byte record headers with header and payload CRC32C, 268-byte inode tree (parent/name), ordered byte extents, free-space bitmap, checkpoint, on-disk versioning; kernel `cassafs info/format/demo/dump/verify/cat/viz`, read-only host reference reader, shell integration | QEMU 8.2.2: 64 MiB MBR partition formats to 20 blocks/9 records/5 inodes/2 files/158 data bytes with 16,364 free; verify PASS covers every CRC, tree edge, extent, data CRC and bitmap bit; 73-byte CSV CRC `0x3b60dc1d` read by guest and host; reboot persistence; damaged B superblock falls back to A; corrupted data payload rejected by both; no-disk absence PASS; 208 host tests (+11); `tools/qemu_cassafs_test.py`; screenshot `docs/screenshots/phase41-cassafs.png` |
 | 42 | Read-only VFS: backend-neutral node and mount tables, canonical absolute/relative paths with `.` and `..`, open/close handles, sequential and offset reads, stable readdir, stat, read-only access checks, validate-before-mount; CASSAFS backend on partition 1; `vfs` shell commands | QEMU 8.2.2: 5-inode demo mounts at `/` and reads 73-byte products.db CRC `0x3b60dc1d` and 85-byte WELCOME.TXT, both matching `cassafs cat`; stable root order, unmount/remount, byte-identical reads after a soft reboot; no-disk and bad-CRC mounts refused with zero table entries; damaged B superblock falls back to A; 217 host tests (+9); `tools/qemu_vfs_test.py`; screenshot `docs/screenshots/phase42-vfs.png` |
+| 43 | CASSAFS write path: append-only create and offset write/extend, touched-chunk rebuild, latest-inode supersession, free-map allocation, new checkpoint, A/B superblock generation with readback, writable VFS handles and repair-free rescan; `vfs create/write/df`, `vfs selftest` write checks | QEMU 8.2.2: create `/catalog/note.txt` inode 6, write 7 bytes CRC `0xdb03992b`, overwrite to 8 bytes CRC `0x394478f0`; 6 inodes/3 files/166 data bytes read back after unmount/remount and a soft reboot; 73-byte products CRC unchanged; host `cassafs verify` PASS; 8-block 0-free volume refuses create with out-of-space and no entry; corrupted committed payload refused with CRC32C; 219 host tests (+2); `tools/qemu_vfs_write_test.py`; screenshot `docs/screenshots/phase43-write.png` |
 
-The remaining 58 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 57 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -106,9 +107,9 @@ zig build run-elf   # boot the ELF directly (no device-tree handoff)
 zig build image     # only the flat arm64 Image container
 ```
 
-`zig build` also installs `zig-out/bin/cassafs`, the read-only host reference reader for the
-phase-41 CASSAFS format. It uses the same Zig library as the kernel and takes an image plus an
-MBR partition number or raw byte offset:
+`zig build` also installs `zig-out/bin/cassafs`, the host-side reference reader for the phase-41
+CASSAFS format. It is deliberately read-only (the kernel is the writer) and takes an image plus
+an MBR partition number or raw byte offset:
 
 ```sh
 zig-out/bin/cassafs verify --image disk.img --partition 1
@@ -129,7 +130,10 @@ no disk at all. The format contract is in [docs/cassafs-format.md](docs/cassafs-
 and read path has its own black-box run: `python3 tools/qemu_vfs_test.py` formats a volume,
 mounts it, walks the tree, reads both files, checks no-disk and bad-CRC refusals, exercises A/B
 fallback, unmounts and remounts, then soft-reboots the same guest and reads the same bytes again.
-The VFS contract is in [docs/vfs.md](docs/vfs.md).
+The phase-43 write path adds `python3 tools/qemu_vfs_write_test.py`: it creates and overwrites a
+file through the VFS, compares read-back bytes and CRCs, unmounts/remounts and soft-reboots on
+the same medium, runs the host verifier, then proves an 8-block volume refuses a create and a
+damaged committed payload is refused at mount. The VFS contract is in [docs/vfs.md](docs/vfs.md).
 The kernel
 console is the first PL011 UART; press Enter for a prompt and type `help`. Concurrency can be
 inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
@@ -192,17 +196,23 @@ data CRC and bitmap bit; `cassafs dump` prints the log and extents; `cassafs cat
 the extents; `cassafs viz` is the live dashboard. The host reader `zig-out/bin/cassafs` verifies
 the same image outside the guest and is the reference dump/verify tool the phase requires. A
 machine with no disk reports the absence and still passes its self-tests; formatting refuses
-while the phase-40 FAT journal is mounted, because that journal is CASSAFS work in phase 43.
+while the phase-40 FAT journal is mounted, because formatting would invalidate its storage.
 Screenshot: [phase41-cassafs.png](docs/screenshots/phase41-cassafs.png).
 
 The VFS is now mounted above CASSAFS. `vfs mount` scans partition 1, verifies every CRC and the
 inode tree, and registers the volume at `/`; `vfs ls` walks the real directory order, `vfs stat`
 reports inode/parent/size/mode, and `vfs cat` reads through opened handles. Path resolution
 normalises `.`, `..`, repeated and trailing slashes and rejects empty paths. The core
-(`src/lib/vfs.zig`) is backend-neutral; CASSAFS is the first adapter. The VFS is read-only in
-this phase: writes, journal replay and garbage collection are phase 43. A failed mount leaves no
-table entry and reports the specific cause, including a missing disk, a bad CRC, or A/B fallback.
-Screenshot: [phase42-vfs.png](docs/screenshots/phase42-vfs.png); design and limits:
+(`src/lib/vfs.zig`) is backend-neutral; CASSAFS is the first adapter and phase 43 makes it
+writable. `vfs create` allocates a new inode, `vfs write` writes at an offset through a write
+handle, and `vfs df` reports the commit head, free blocks, record budget and next inode. A write
+rebuilds only the 16 KiB chunks it touches, appends a new inode/free map/checkpoint and both
+superblocks, then rescans the committed medium before the mounted view changes. A failed or
+full write leaves the old view intact. This is append-only: journal replay, GC, truncate and
+concurrent writers are still future work. A failed mount leaves no table entry and reports the
+specific cause, including a missing disk, a bad CRC, or A/B fallback. Screenshots:
+[phase42-vfs.png](docs/screenshots/phase42-vfs.png),
+[phase43-write.png](docs/screenshots/phase43-write.png); design and limits:
 [docs/vfs.md](docs/vfs.md).
 
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
@@ -262,7 +272,7 @@ src/devices/         PL011, PL031, virtio-mmio, virtio-blk, virtio-input, bochs-
                      i6300esb
 src/lib/             freestanding helpers (device tree, EDID, 5x7 font, display modes,
                      keymap, scanner, USB descriptors/HID/xHCI arithmetic, power policy,
-                     CASSAFS codec/format/verify/range-read path, backend-neutral VFS,
+                     CASSAFS codec/format/verify/range-read/write path, backend-neutral VFS,
                      CASSAFS VFS adapter)
 tools/mkimage.zig    host-side Image wrapper used by the build
 tools/cassafs.zig    read-only host reference reader for CASSAFS images
@@ -271,9 +281,11 @@ tools/qemu_usb_test.py    boots xHCI with HID/tablet/hub/FTDI, drives QMP and ch
 tools/qemu_power_test.py  watchdog hang/reset, poweroff, brownout, thermal and fallback
 tools/qemu_cassafs_test.py  formats/verifies, reboots, corrupts and checks absence
 tools/qemu_vfs_test.py      mounts CASSAFS through the VFS, reads, refuses bad mounts, reboots
+tools/qemu_vfs_write_test.py  creates/writes/overwrites through the VFS, remounts, reboots,
+                              checks out-of-space and committed-payload corruption
 src/tests.zig        host unit-test root
-docs/cassafs-format.md  the CASSAFS v1 on-disk contract and limits
-docs/vfs.md             the read-only VFS contract, backend interface and limits
+docs/cassafs-format.md  the CASSAFS v1 on-disk contract, write path and limits
+docs/vfs.md             the VFS contract, write path, backend interface and limits
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan
 ```

@@ -2,7 +2,7 @@
 
 CASSAFS is the crash-safe, log-structured filesystem Cassa is building for till workloads.
 Phase 41 defines the on-disk format, the reference formatter, the verifier and the read-only
-dump/cat path. Mounting and ordinary writes arrive in phases 42–43.
+dump/cat path. Phase 42 mounts it through the VFS; phase 43 adds the append-only write path.
 
 The authoritative implementation is `src/lib/cassafs.zig`; the kernel adapter is
 `src/kernel/cassafs.zig`; the host reference reader is `tools/cassafs.zig`. All three use the
@@ -15,7 +15,9 @@ same codec, CRC32C and verifier.
 - Superblock A: block 0. Superblock B: block 1. Each is 512 bytes inside a zeroed 4 KiB block.
 - Append-only log: starts at block 2. A record occupies one header block followed by
   `ceil(payload_len / 4096)` payload blocks.
-- The penultimate log record is the **free-space map**; the last is the **checkpoint**.
+- A commit appends data records, a new inode record, a new free-space map and a new checkpoint;
+  the last record at the selected log head is always the checkpoint named by the superblock.
+  Earlier free-map/checkpoint pairs are historical and remain in the log.
 - The free map covers every block in the volume. Phase 41 records are appended, so the map is
   an exact used prefix followed by free blocks. A future allocator can reuse the same bitmap.
 
@@ -81,10 +83,12 @@ The scanner also enforces:
 
 - sequence numbers are exactly `1..N` with no gap or reorder;
 - `total_blocks == 1 + ceil(payload_len / 4096)` and every record stays below the log head;
-- exactly one free-map record and one checkpoint record, in that order, at the end;
-- the checkpoint's free-map block/sequence, log head, total blocks, inode counts and data
-  bytes agree with the scanned log;
-- the free-map bitmap marks exactly `[0, log_head)` used and the rest free.
+- the selected checkpoint is the last record at the selected log head, and its free-map record
+  and sequence agree with it; earlier free-map/checkpoint records are valid history;
+- each free-map bitmap marks exactly `[0, its_declared_log_head)` used and the rest free; the
+  map named by the selected checkpoint must declare the selected log head itself;
+- later inode records with the same inode number supersede earlier records for validation and
+  readback, while the checkpoint's `record_count` still counts every log record.
 
 ## Inodes
 
@@ -108,7 +112,9 @@ An inode payload is **268 bytes**:
 Every non-root inode has a parent that is a directory, and every child name is unique within
 its parent. The scanner walks each inode to the root, detects cycles and depth overflow, and
 rejects a parent pointer that is not a directory or a sibling-name duplicate. This is the inode
-tree phase 42 mounts through the VFS.
+tree phase 42 mounts through the VFS. In phase 43 an update appends a fresh inode payload for the
+same inode number; the scanner keeps the latest copy and its original slot in the unique inode
+list, so directory iteration order does not churn.
 
 ## Extents
 
@@ -124,8 +130,8 @@ Each extent is 24 bytes:
 Extents are ordered and contiguous in logical space: the first starts at 0, each next starts
 where the previous ended, and the final end equals the inode's size. The scanner checks every
 extent against a data record's payload range, computes the file CRC from the extents in order
-and compares it with the inode's `data_crc`. A 16 KiB data chunk becomes one extent; the phase-42
-VFS reads a file by walking these records with no copy layer.
+and compares it with the inode's `data_crc`. A 16 KiB data chunk becomes one extent; the phase-42 VFS reads a file by walking these records
+with no copy layer, and phase 43 rebuilds only the chunks an offset write touches.
 
 ## Free-space map and checkpoint
 
@@ -139,7 +145,33 @@ used. The checkpoint payload (120 bytes) records:
 
 The checkpoint is the atomic commit point: a superblock points at one checkpoint, and the
 checkpoint points at the free map. Because both the checkpoint and free-map records carry their
-own CRC32C, a reader can prove the pointers and allocation state before exposing a file.
+own CRC32C, a reader can prove the pointers and allocation state before exposing a file. The
+phase-43 writer appends the new records, writes the new checkpoint, flushes, then writes both
+superblocks with a higher generation and reads both back. If the new superblock pair is not
+durable, the older pair still points at the older log prefix; the newly appended records are
+simply ignored by the next mount. There is no GC or journal replay yet, so the log only grows.
+
+## Write path (phase 43)
+
+The writer is append-only and keeps the phase-41 structures:
+
+1. A new file allocates the next inode number and appends one inode record.
+2. A write reads the old chunks it needs, rewrites only the touched 16 KiB chunks as new data
+   records, and reuses untouched extents. Offset writes may extend a file; a gap introduced by
+   writing past EOF is zero-filled. One chunk is one data record, so the eight-extent ceiling
+   also caps a file at 128 KiB.
+3. A new inode record carries the final size, CRC32C, extents and modification time.
+4. A new free-map record marks the whole committed prefix used. The map is capacity
+   accounting and the append head; old blocks are not reclaimed.
+5. The new checkpoint, then both superblocks with `generation = max(A,B)+1`, are written. The
+   write returns only after a flush, both superblock readbacks, and the caller's full rescan.
+
+The VFS exposes this as `vfs create <path>`, `vfs write <path> <offset> <text>` and `vfs df`.
+A write handle is opened through the backend-neutral VFS; create is an open with
+`create+write`. Directories reject write opens, missing files require `create`, and a full
+volume returns `NoSpace` without changing the mounted report. The adapter rescans the committed
+medium after every successful write, so a mounted view never claims bytes that did not pass the
+same CRC/tree/extent/bitmap validation as mount.
 
 ## Versioning
 
@@ -172,19 +204,21 @@ zig-out/bin/cassafs dump   --image disk.img --partition 1
 zig-out/bin/cassafs cat    --image disk.img --partition 1 --path /catalog/products.db
 ```
 
-`--offset BYTES` reads a volume at a raw byte offset instead of an MBR partition. The reference
-tool only reads; the kernel is the only writer in phase 41.
+`--offset BYTES` reads a volume at a raw byte offset instead of an MBR partition. The host
+reference tool only reads; the kernel owns the write path.
 
-## Phase 41 limits
+## Limits
 
-- The log is append-only; there is no garbage collection, in-place update or atomic rename yet
-  (phase 43). Formatting rewrites the volume.
-- `cassafs cat` is a read-only diagnostic path. Phase 42 mounts the same tree through the VFS
-  (`vfs cat`, `vfs ls`, `vfs stat`); writes and recovery are phase 43.
-- Eight extents and 128 inodes/records are the phase-41 reference bounds; they are compile-time
-  constants so the formatter's memory use is bounded on a till.
+- The log is append-only; phase 43 does **not** implement garbage collection, journal replay,
+  arbitrary-power-loss recovery, atomic rename, unlink/truncate, or an `fsync` API. A clean
+  unmount/reboot and a deliberately corrupted image are the evidence shipped here; 1,000
+  randomized power-cut injections are not.
+- There is one writer and no concurrent VFS handle-table locking. The adapter rescans after a
+  write, which is correct but not a multi-reader/writer design.
+- Eight extents and 128 inodes/records are the reference bounds; a volume also has a 128-record
+  log budget. A file is capped at 128 KiB. The free map is capacity accounting, not reuse: a
+  long-lived volume eventually exhausts free blocks or records.
+- A/B fallback covers a damaged **superblock**. A damaged checkpoint or record is reported as a
+  failure; redundant checkpoints are not implemented.
 - The power journal is still FAT-backed on partition 1. Formatting a volume while that journal
-  is mounted is refused rather than invalidating it; phase 43 integrates the journal with
-  CASSAFS.
-- A/B fallback covers a damaged **superblock**. A damaged checkpoint is reported as a failure;
-  redundant checkpoints are part of phase 43's recovery work.
+  is mounted is refused rather than invalidating it.

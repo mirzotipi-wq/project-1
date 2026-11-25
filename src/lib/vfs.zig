@@ -35,6 +35,9 @@ pub const Error = error{
     NotMounted,
     AlreadyMounted,
     BadHandle,
+    NoSpace,
+    Exists,
+    Unsupported,
     Backend,
     Corrupt,
 };
@@ -63,6 +66,12 @@ pub const DirEntry = struct {
 pub const OpenFlags = struct {
     read: bool = true,
     write: bool = false,
+    create: bool = false,
+};
+
+pub const WriteResult = struct {
+    written: usize,
+    stat: Stat,
 };
 
 /// A filesystem backend. `root` is the backend inode used for the mount point.
@@ -71,10 +80,13 @@ pub const OpenFlags = struct {
 pub const Backend = struct {
     ctx: *anyopaque,
     root: u64,
+    writable: bool = false,
     stat_fn: *const fn (ctx: *anyopaque, ino: u64, out: *Stat) Error!void,
     lookup_fn: *const fn (ctx: *anyopaque, parent: u64, name: []const u8, out: *Stat) Error!void,
     read_fn: *const fn (ctx: *anyopaque, ino: u64, offset: u64, out: []u8) Error!usize,
     readdir_fn: *const fn (ctx: *anyopaque, ino: u64, index: u32, out: *DirEntry) Error!bool,
+    create_fn: *const fn (ctx: *anyopaque, parent: u64, name: []const u8, mode: u16) Error!Stat,
+    write_fn: *const fn (ctx: *anyopaque, ino: u64, offset: u64, data: []const u8) Error!WriteResult,
 };
 
 const Mount = struct {
@@ -107,6 +119,7 @@ pub const Vfs = struct {
     mount_count: u8 = 0,
     generation: u32 = 1,
     reads: u64 = 0,
+    writes: u64 = 0,
     lookups: u64 = 0,
     readdirs: u64 = 0,
 
@@ -335,8 +348,14 @@ pub const Vfs = struct {
         return count;
     }
 
-    pub fn stats(self: *const Vfs) struct { mounts: usize, nodes: usize, handles: usize, reads: u64 } {
-        return .{ .mounts = self.mount_count, .nodes = nodeCount(self), .handles = handleCount(self), .reads = self.reads };
+    pub fn stats(self: *const Vfs) struct { mounts: usize, nodes: usize, handles: usize, reads: u64, writes: u64 } {
+        return .{
+            .mounts = self.mount_count,
+            .nodes = nodeCount(self),
+            .handles = handleCount(self),
+            .reads = self.reads,
+            .writes = self.writes,
+        };
     }
 
     fn findNode(self: *Vfs, mount_index: usize, ino: u64) ?usize {
@@ -409,21 +428,89 @@ pub const Vfs = struct {
 
     // ----------------------------------------------------------------- handles
 
-    pub fn open(self: *Vfs, path: []const u8, cwd: []const u8, flags: OpenFlags) Error!u32 {
-        if (flags.write) return error.ReadOnly;
-        const node = try self.resolve(path, cwd);
-        const stat = self.nodes[node].stat;
-        if ((stat.mode & 0o444) == 0) return error.AccessDenied;
-        if (!flags.read) return error.AccessDenied;
+    fn freeHandle(self: *const Vfs) ?usize {
         var h: usize = 0;
         while (h < max_handles) : (h += 1) {
-            if (!self.handles[h].used) {
-                self.handles[h] = .{ .used = true, .node = @intCast(node), .offset = 0, .flags = flags };
-                self.nodes[node].refs += 1;
-                return @intCast(h);
+            if (!self.handles[h].used) return h;
+        }
+        return null;
+    }
+
+    fn openNode(self: *Vfs, node_index: usize, flags: OpenFlags) Error!u32 {
+        const stat = self.nodes[node_index].stat;
+        const backend = &self.mounts[self.nodes[node_index].mount].backend;
+        if (flags.write) {
+            if (!backend.writable) return error.ReadOnly;
+            if (stat.kind != .file) return error.IsDirectory;
+            if ((stat.mode & 0o222) == 0) return error.AccessDenied;
+        }
+        if (flags.read and (stat.mode & 0o444) == 0) return error.AccessDenied;
+        if (!flags.read and !flags.write) return error.AccessDenied;
+        const h = self.freeHandle() orelse return error.TooManyHandles;
+        self.handles[h] = .{ .used = true, .node = @intCast(node_index), .offset = 0, .flags = flags };
+        self.nodes[node_index].refs += 1;
+        return @intCast(h);
+    }
+
+    const ParentSplit = struct {
+        parent: []const u8,
+        name: []const u8,
+    };
+
+    fn splitParent(canonical: []const u8) ParentSplit {
+        var i = canonical.len;
+        while (i > 0) : (i -= 1) {
+            if (canonical[i - 1] == '/') break;
+        }
+        if (i <= 1) return .{ .parent = "/", .name = canonical[1..] };
+        return .{ .parent = canonical[0 .. i - 1], .name = canonical[i..] };
+    }
+
+    fn createOpen(self: *Vfs, path: []const u8, cwd: []const u8, flags: OpenFlags) Error!u32 {
+        var canonical_buf: [max_path]u8 = undefined;
+        const canonical = try normalizePath(cwd, path, &canonical_buf);
+        if (canonical.len <= 1) return error.IsDirectory;
+        const split = splitParent(canonical);
+        if (split.name.len == 0) return error.InvalidPath;
+        if (split.name.len > max_name) return error.NameTooLong;
+        const parent_node = try self.resolveCanonical(split.parent);
+        const parent_stat = self.nodes[parent_node].stat;
+        if (parent_stat.kind != .directory) return error.NotDirectory;
+        const mount_index = self.nodes[parent_node].mount;
+        const backend = &self.mounts[mount_index].backend;
+        if (!backend.writable) return error.ReadOnly;
+        if (self.freeHandle() == null) return error.TooManyHandles;
+        // Reserve a node slot before creating so a full table cannot leave a
+        // newly-created file without a VFS node.
+        if (self.freeNodeSlot() == null) return error.TooManyNodes;
+        const st = try backend.create_fn(backend.ctx, parent_stat.ino, split.name, 0o100644);
+        const node = try self.nodeForStat(mount_index, st);
+        const h = self.freeHandle() orelse return error.TooManyHandles;
+        self.handles[h] = .{ .used = true, .node = @intCast(node), .offset = 0, .flags = flags };
+        self.nodes[node].refs += 1;
+        return @intCast(h);
+    }
+
+    fn freeNodeSlot(self: *const Vfs) ?usize {
+        var i: usize = 0;
+        while (i < max_nodes) : (i += 1) {
+            if (!self.nodes[i].used) return i;
+        }
+        return null;
+    }
+
+    pub fn open(self: *Vfs, path: []const u8, cwd: []const u8, flags: OpenFlags) Error!u32 {
+        if (flags.create) {
+            if (!flags.write) return error.AccessDenied;
+            if (self.resolve(path, cwd)) |node| {
+                return self.openNode(node, flags);
+            } else |err| {
+                if (err != error.NotFound) return err;
+                return self.createOpen(path, cwd, flags);
             }
         }
-        return error.TooManyHandles;
+        const node = try self.resolve(path, cwd);
+        return self.openNode(node, flags);
     }
 
     pub fn close(self: *Vfs, handle: u32) Error!void {
@@ -463,6 +550,30 @@ pub const Vfs = struct {
         if (handle >= max_handles or !self.handles[handle].used) return error.BadHandle;
         const offset = self.handles[handle].offset;
         const got = try self.readAt(handle, offset, out);
+        self.handles[handle].offset += got;
+        return got;
+    }
+
+    pub fn writeAt(self: *Vfs, handle: u32, offset: u64, data: []const u8) Error!usize {
+        if (handle >= max_handles or !self.handles[handle].used) return error.BadHandle;
+        const h = &self.handles[handle];
+        if (!h.flags.write) return error.AccessDenied;
+        const node = &self.nodes[h.node];
+        if (node.stat.kind != .file) return error.IsDirectory;
+        const backend = &self.mounts[node.mount].backend;
+        if (!backend.writable) return error.ReadOnly;
+        if ((node.stat.mode & 0o222) == 0) return error.AccessDenied;
+        const result = try backend.write_fn(backend.ctx, node.ino, offset, data);
+        node.stat = result.stat;
+        self.writes += 1;
+        return result.written;
+    }
+
+    /// Sequential write: uses and advances the handle's offset.
+    pub fn write(self: *Vfs, handle: u32, data: []const u8) Error!usize {
+        if (handle >= max_handles or !self.handles[handle].used) return error.BadHandle;
+        const offset = self.handles[handle].offset;
+        const got = try self.writeAt(handle, offset, data);
         self.handles[handle].offset += got;
         return got;
     }
@@ -553,14 +664,25 @@ const TestBackend = struct {
         return false;
     }
 
+    fn createFn(_: *anyopaque, _: u64, _: []const u8, _: u16) Error!Stat {
+        return error.Unsupported;
+    }
+
+    fn writeFn(_: *anyopaque, _: u64, _: u64, _: []const u8) Error!WriteResult {
+        return error.Unsupported;
+    }
+
     fn backend(self: *TestBackend) Backend {
         return .{
             .ctx = self,
             .root = 1,
+            .writable = false,
             .stat_fn = statFn,
             .lookup_fn = lookupFn,
             .read_fn = readFn,
             .readdir_fn = readdirFn,
+            .create_fn = createFn,
+            .write_fn = writeFn,
         };
     }
 };
@@ -606,6 +728,8 @@ test "mount table rejects duplicates and failed backends without half state" {
         .lookup_fn = TestBackend.lookupFn,
         .read_fn = TestBackend.readFn,
         .readdir_fn = TestBackend.readdirFn,
+        .create_fn = TestBackend.createFn,
+        .write_fn = TestBackend.writeFn,
     };
     try std.testing.expectError(error.NotFound, state.vfs.mount("/mnt", bad));
     try std.testing.expectEqual(@as(usize, 1), state.vfs.mountCount());
@@ -620,6 +744,8 @@ test "mount failure does not add a table entry" {
         .lookup_fn = TestBackend.lookupFn,
         .read_fn = TestBackend.readFn,
         .readdir_fn = TestBackend.readdirFn,
+        .create_fn = TestBackend.createFn,
+        .write_fn = TestBackend.writeFn,
     };
     try std.testing.expectError(error.NotFound, state.vfs.mount("/", bad));
     try std.testing.expectEqual(@as(usize, 0), state.vfs.mountCount());

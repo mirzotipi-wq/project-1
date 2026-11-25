@@ -26,21 +26,32 @@ var g_source: cassafs.MountSource = undefined;
 const demo_catalog = "sku,name,price_cents\n1001,Espresso,250\n1002,Croissant,180\n1003,Water,150\n";
 const demo_welcome = "Welcome to Cassa POS.\nThis volume was formatted by the phase 41 reference formatter.\n";
 
+fn reason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NotFound => "no such file or directory",
+        error.NotDirectory => "not a directory",
+        error.IsDirectory => "is a directory",
+        error.AccessDenied => "permission denied",
+        error.ReadOnly => "this filesystem is read-only",
+        error.NoSpace => "out of space (free map, inode table or record budget)",
+        error.Exists => "file already exists",
+        error.Unsupported => "operation is not supported by this backend",
+        error.NotMounted => "no CASSAFS volume is mounted; run 'vfs mount'",
+        error.Busy => "volume is busy; close every open handle first",
+        error.BadHandle => "invalid file handle",
+        error.Corrupt => "integrity failure (CRC32C or inode/extent corruption)",
+        error.NameTooLong => "path or name is too long",
+        error.InvalidPath => "invalid path (empty paths are rejected)",
+        else => @errorName(err),
+    };
+}
+
+fn printReason(err: anyerror) void {
+    out("  {s}\n", .{reason(err)});
+}
+
 fn printError(err: anyerror) void {
-    switch (err) {
-        error.NotFound => out("  vfs         : no such file or directory\n", .{}),
-        error.NotDirectory => out("  vfs         : not a directory\n", .{}),
-        error.IsDirectory => out("  vfs         : is a directory\n", .{}),
-        error.AccessDenied => out("  vfs         : permission denied\n", .{}),
-        error.ReadOnly => out("  vfs         : the VFS is read-only (write path is phase 43)\n", .{}),
-        error.NotMounted => out("  vfs         : no CASSAFS volume is mounted; run 'vfs mount'\n", .{}),
-        error.Busy => out("  vfs         : volume is busy; close every open handle first\n", .{}),
-        error.BadHandle => out("  vfs         : invalid file handle\n", .{}),
-        error.Corrupt => out("  vfs         : integrity failure (CRC32C or inode/extent corruption)\n", .{}),
-        error.NameTooLong => out("  vfs         : path or name is too long\n", .{}),
-        error.InvalidPath => out("  vfs         : invalid path (empty paths are rejected)\n", .{}),
-        else => out("  vfs         : {s}\n", .{@errorName(err)}),
-    }
+    out("  vfs         : {s}\n", .{reason(err)});
 }
 
 fn canonicalPath(path: []const u8, buf: *[vfs.max_path]u8) []const u8 {
@@ -61,7 +72,7 @@ pub fn mount() bool {
         cassafs.explain(err);
         return false;
     };
-    g_adapter = cassafs_vfs.Adapter.init(source.device, source.report);
+    g_adapter = cassafs_vfs.Adapter.init(source.device, source.report, source.workspace, source.inode_storage);
     g_vfs.mount("/", g_adapter.backend()) catch |err| {
         out("  vfs mount   : refused by the VFS (no table entry was created): {s}\n", .{@errorName(err)});
         return false;
@@ -111,8 +122,8 @@ fn info() void {
         if (report.active == .a) "A" else "B", if (report.fallback) " (the other superblock copy is damaged)" else "",
     });
     const stats = g_vfs.stats();
-    out("  vfs info    : node table {d}/{d}, open handles {d}/{d}, {d} path lookup(s), {d} read(s), {d} readdir(s)\n", .{
-        stats.nodes, vfs.max_nodes, stats.handles, vfs.max_handles, g_vfs.lookups, stats.reads, g_vfs.readdirs,
+    out("  vfs info    : node table {d}/{d}, open handles {d}/{d}, {d} lookup(s), {d} read(s), {d} write(s), {d} readdir(s)\n", .{
+        stats.nodes, vfs.max_nodes, stats.handles, vfs.max_handles, g_vfs.lookups, stats.reads, stats.writes, g_vfs.readdirs,
     });
 }
 
@@ -121,7 +132,7 @@ fn statPath(path: []const u8) void {
     const shown = canonicalPath(path, &canonical);
     const st = g_vfs.statPath(path, "/") catch |err| {
         out("  vfs stat    : {s}: ", .{shown});
-        printError(err);
+        printReason(err);
         return;
     };
     out("  vfs stat    : {s}\n", .{shown});
@@ -135,7 +146,7 @@ fn list(path: []const u8) void {
     const shown = canonicalPath(path, &canonical);
     const h = g_vfs.open(path, "/", .{}) catch |err| {
         out("  vfs ls      : {s}: ", .{shown});
-        printError(err);
+        printReason(err);
         return;
     };
     defer g_vfs.close(h) catch {};
@@ -172,7 +183,7 @@ fn cat(path: []const u8) void {
     const shown = canonicalPath(path, &canonical);
     const h = g_vfs.open(path, "/", .{}) catch |err| {
         out("  vfs cat     : {s}: ", .{shown});
-        printError(err);
+        printReason(err);
         return;
     };
     defer g_vfs.close(h) catch {};
@@ -200,6 +211,57 @@ fn cat(path: []const u8) void {
     if (total == 0) uart.writeAll("\n");
     out("  vfs cat     : {s}, {d} byte(s), CRC32C 0x{x:0>8}, read to EOF (0)\n", .{
         shown, total, ~crc_state,
+    });
+}
+
+fn create(path: []const u8) void {
+    var canonical: [vfs.max_path]u8 = undefined;
+    const shown = canonicalPath(path, &canonical);
+    const h = g_vfs.open(path, "/", .{ .read = false, .write = true, .create = true }) catch |err| {
+        out("  vfs create  : {s}: ", .{shown});
+        printReason(err);
+        return;
+    };
+    defer g_vfs.close(h) catch {};
+    const st = g_vfs.statHandle(h) catch |err| {
+        printError(err);
+        return;
+    };
+    out("  vfs create  : {s} (inode {d}, parent {d}, mode 0o{o:0>6})\n", .{ shown, st.ino, st.parent, st.mode });
+}
+
+fn write(path: []const u8, offset_text: []const u8, text: []const u8) void {
+    const offset = std.fmt.parseInt(u64, offset_text, 10) catch {
+        out("  vfs write   : offset must be a decimal byte offset\n", .{});
+        return;
+    };
+    const h = g_vfs.open(path, "/", .{ .read = false, .write = true }) catch |err| {
+        out("  vfs write   : {s}: ", .{path});
+        printReason(err);
+        return;
+    };
+    defer g_vfs.close(h) catch {};
+    const n = g_vfs.writeAt(h, offset, text) catch |err| {
+        printError(err);
+        return;
+    };
+    const st = g_vfs.statHandle(h) catch |err| {
+        printError(err);
+        return;
+    };
+    out("  vfs write   : {s} offset {d}, wrote {d} byte(s), size {d} B\n", .{
+        path, offset, n, st.size,
+    });
+}
+
+fn df() void {
+    if (!mounted()) {
+        out("  vfs df      : no mounts; run 'vfs mount'\n", .{});
+        return;
+    }
+    const r = g_source.report;
+    out("  vfs df      : log head {d}/{d} block(s), {d} free, {d} record(s)/{d}, next inode {d}\n", .{
+        r.log_head, r.total_blocks, r.free_blocks, r.records, cassafs_lib.max_records, r.next_ino,
     });
 }
 
@@ -378,8 +440,18 @@ fn selfTest() bool {
     suite.check(seen >= 2 and stable, "root readdir returns a stable ordered set");
     g_vfs.close(dir_h) catch {};
 
-    const write_open = g_vfs.open("/catalog/products.db", "/", .{ .write = true });
-    suite.check(if (write_open) |_| false else |err| err == error.ReadOnly, "write open is refused (read-only access check)");
+    const write_open = g_vfs.open("/catalog/products.db", "/", .{ .read = false, .write = true });
+    var write_ok = false;
+    if (write_open) |h| {
+        write_ok = true;
+        g_vfs.close(h) catch {};
+    } else |_| {}
+    suite.check(write_ok, "write open is accepted on the writable CASSAFS backend");
+    const dir_write = g_vfs.open("/", "/", .{ .read = false, .write = true });
+    suite.check(if (dir_write) |_| false else |err| err == error.IsDirectory, "write open on a directory is refused");
+    if (dir_write) |h| {
+        g_vfs.close(h) catch {};
+    } else |_| {}
 
     out("  vfs selftest: {s} ({d} passed, {d} failed)\n", .{
         if (suite.failed == 0) "PASS" else "FAIL", suite.passed, suite.failed,
@@ -438,14 +510,14 @@ fn drawViz() void {
     _ = surface.drawText(24, 92, headline, 1, fb.Palette.green);
 
     const stats = g_vfs.stats();
-    const tables = std.fmt.bufPrint(&line, "NODE TABLE {d}/{d}   OPEN HANDLES {d}/{d}   LOOKUPS {d}   READS {d}   READDIRS {d}", .{
-        stats.nodes, vfs.max_nodes, stats.handles, vfs.max_handles, g_vfs.lookups, stats.reads, g_vfs.readdirs,
+    const tables = std.fmt.bufPrint(&line, "NODE TABLE {d}/{d}   OPEN HANDLES {d}/{d}   LOOKUPS {d}   READS {d}   WRITES {d}   READDIRS {d}", .{
+        stats.nodes, vfs.max_nodes, stats.handles, vfs.max_handles, g_vfs.lookups, stats.reads, stats.writes, g_vfs.readdirs,
     }) catch "tables";
     _ = surface.drawText(24, 116, tables, 1, fb.Palette.text_dim);
     _ = surface.drawText(32, 150, "TREE (real readdir order)", 1, fb.Palette.text_dim);
     var y: i32 = 174;
     drawTree(surface, "/", 0, &y);
-    _ = surface.drawText(24, 748, "VFS is read-only in phase 42; write path, journal replay and GC are phase 43.", 1, fb.Palette.text_dim);
+    _ = surface.drawText(24, 748, "CASSAFS write path is live; journal replay, GC and concurrent writers remain future work.", 1, fb.Palette.text_dim);
 }
 
 fn viz(seconds: u32) void {
@@ -473,6 +545,24 @@ pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
         cat(tokens.next() orelse "/");
     } else if (std.mem.eql(u8, sub, "stat")) {
         statPath(tokens.next() orelse "/");
+    } else if (std.mem.eql(u8, sub, "create")) {
+        create(tokens.next() orelse {
+            out("  usage: vfs create <path>\n", .{});
+            return;
+        });
+    } else if (std.mem.eql(u8, sub, "write")) {
+        const path = tokens.next() orelse {
+            out("  usage: vfs write <path> <offset> <text>\n", .{});
+            return;
+        };
+        const offset = tokens.next() orelse "0";
+        const text = tokens.next() orelse {
+            out("  usage: vfs write <path> <offset> <text>\n", .{});
+            return;
+        };
+        write(path, offset, text);
+    } else if (std.mem.eql(u8, sub, "df")) {
+        df();
     } else if (std.mem.eql(u8, sub, "read")) {
         const path = tokens.next() orelse {
             out("  usage: vfs read <path> <offset> <length>\n", .{});
@@ -487,6 +577,6 @@ pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
         const seconds = std.fmt.parseInt(u32, tokens.next() orelse "8", 10) catch 8;
         viz(seconds);
     } else {
-        out("  usage: vfs [mount|unmount|info|ls [path]|stat <path>|cat <path>|read <path> <offset> <len>|selftest|viz <s>]\n", .{});
+        out("  usage: vfs [mount|unmount|info|df|ls [path]|stat <path>|cat <path>|create <path>|write <path> <offset> <text>|read <path> <offset> <len>|selftest|viz <s>]\n", .{});
     }
 }

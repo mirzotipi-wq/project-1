@@ -11,21 +11,46 @@ const vfs = @import("vfs.zig");
 
 pub const Adapter = struct {
     device: cassafs.Device,
-    report: *const cassafs.Report,
+    report: *cassafs.Report,
+    workspace: []u8,
+    inode_storage: []cassafs.Inode,
 
-    pub fn init(device: cassafs.Device, report: *const cassafs.Report) Adapter {
-        return .{ .device = device, .report = report };
+    pub fn init(
+        device: cassafs.Device,
+        report: *cassafs.Report,
+        workspace: []u8,
+        inode_storage: []cassafs.Inode,
+    ) Adapter {
+        return .{
+            .device = device,
+            .report = report,
+            .workspace = workspace,
+            .inode_storage = inode_storage,
+        };
     }
 
     pub fn backend(self: *Adapter) vfs.Backend {
         return .{
             .ctx = self,
             .root = self.report.root_ino,
+            .writable = true,
             .stat_fn = statFn,
             .lookup_fn = lookupFn,
             .read_fn = readFn,
             .readdir_fn = readdirFn,
+            .create_fn = createFn,
+            .write_fn = writeFn,
         };
+    }
+
+    fn refresh(self: *Adapter) vfs.Error!void {
+        const fresh = cassafs.scan(self.device, self.workspace, self.inode_storage) catch |err| return mapError(err);
+        self.report.* = fresh;
+    }
+
+    fn statFor(self: *Adapter, ino: u64, out: *vfs.Stat) vfs.Error!void {
+        const idx = inodeIndex(self.report, ino) orelse return error.NotFound;
+        fillStat(&self.report.inodes[idx], out);
     }
 
     fn selfFrom(ctx: *anyopaque) *Adapter {
@@ -53,8 +78,13 @@ pub const Adapter = struct {
     fn mapError(err: cassafs.Error) vfs.Error {
         return switch (err) {
             error.PathNotFound => error.NotFound,
-            error.BadCrc, error.BadInode, error.BadExtent => error.Corrupt,
-            error.Io, error.OutOfRange => error.Backend,
+            error.NotDirectory => error.NotDirectory,
+            error.InvalidPath => error.InvalidPath,
+            error.Exists => error.Exists,
+            error.NoSpace, error.FileTooLarge, error.TooManyNodes, error.TooManyRecords => error.NoSpace,
+            error.ReadOnly => error.ReadOnly,
+            error.BadCrc, error.BadInode, error.BadExtent, error.BadRecord, error.BadCheckpoint, error.BadFreeMap, error.BadSuperblock => error.Corrupt,
+            error.Io, error.OutOfRange, error.Unsupported => error.Backend,
             else => error.Backend,
         };
     }
@@ -63,6 +93,25 @@ pub const Adapter = struct {
         const self = selfFrom(ctx);
         const idx = inodeIndex(self.report, ino) orelse return error.NotFound;
         fillStat(&self.report.inodes[idx], out);
+    }
+
+    fn createFn(ctx: *anyopaque, parent: u64, name: []const u8, mode: u16) vfs.Error!vfs.Stat {
+        _ = mode;
+        const self = selfFrom(ctx);
+        const ino = cassafs.createFile(self.device, self.report, parent, name, 0, self.workspace) catch |err| return mapError(err);
+        self.refresh() catch |err| return err;
+        var out: vfs.Stat = .{};
+        self.statFor(ino, &out) catch return error.Backend;
+        return out;
+    }
+
+    fn writeFn(ctx: *anyopaque, ino: u64, offset: u64, data: []const u8) vfs.Error!vfs.WriteResult {
+        const self = selfFrom(ctx);
+        cassafs.writeFile(self.device, self.report, ino, offset, data, 0, self.workspace) catch |err| return mapError(err);
+        self.refresh() catch |err| return err;
+        var out: vfs.Stat = .{};
+        self.statFor(ino, &out) catch return error.Backend;
+        return .{ .written = data.len, .stat = out };
     }
 
     fn lookupFn(ctx: *anyopaque, parent: u64, name: []const u8, out: *vfs.Stat) vfs.Error!void {
@@ -155,8 +204,8 @@ test "CASSAFS mounts through the VFS and reads byte-identical ranges" {
     _ = try cassafs.format(disk.device(32), .{ .nodes = &test_nodes, .label = "VFS Test", .uuid = [_]u8{0x42} ** 16 }, &workspace);
 
     var inodes: [cassafs.max_nodes]cassafs.Inode = undefined;
-    const report = try cassafs.scan(disk.device(32), &workspace, &inodes);
-    var adapter = Adapter.init(disk.device(32), &report);
+    var report = try cassafs.scan(disk.device(32), &workspace, &inodes);
+    var adapter = Adapter.init(disk.device(32), &report, &workspace, &inodes);
     var fs: vfs.Vfs = .{};
     try fs.mount("/", adapter.backend());
 
@@ -196,6 +245,75 @@ test "CASSAFS mounts through the VFS and reads byte-identical ranges" {
     try std.testing.expectEqual(@as(usize, 0), fs.mountCount());
 }
 
+test "create and write through the VFS round-trip and survive a fresh scan" {
+    var storage: [256 * 1024]u8 = [_]u8{0} ** (256 * 1024);
+    var disk = TestDisk{ .blocks = storage[0 .. 64 * cassafs.block_size] };
+    var workspace: [cassafs.workspaceRequired(64)]u8 = undefined;
+    _ = try cassafs.format(disk.device(64), .{ .nodes = &test_nodes }, &workspace);
+
+    var inodes: [cassafs.max_nodes]cassafs.Inode = undefined;
+    var report = try cassafs.scan(disk.device(64), &workspace, &inodes);
+    var adapter = Adapter.init(disk.device(64), &report, &workspace, &inodes);
+    var fs: vfs.Vfs = .{};
+    try fs.mount("/", adapter.backend());
+
+    const created = try fs.open("/catalog/new.txt", "/", .{ .read = false, .write = true, .create = true });
+    const new_stat = try fs.statHandle(created);
+    try std.testing.expectEqual(@as(u64, 0), new_stat.size);
+    try std.testing.expectEqual(vfs.Kind.file, new_stat.kind);
+    try std.testing.expectEqual(@as(usize, 14), try fs.write(created, "lot 43 created"));
+    try fs.close(created);
+
+    const reader = try fs.open("/catalog/new.txt", "/", .{});
+    var buf: [64]u8 = undefined;
+    const first = try fs.read(reader, &buf);
+    try std.testing.expectEqualStrings("lot 43 created", buf[0..first]);
+    try std.testing.expectEqual(@as(usize, 0), try fs.read(reader, &buf));
+    try fs.close(reader);
+
+    const writer = try fs.open("/catalog/new.txt", "/", .{ .read = false, .write = true });
+    try std.testing.expectEqual(@as(usize, 1), try fs.writeAt(writer, 4, "X"));
+    try fs.close(writer);
+    const after = try fs.statPath("/catalog/new.txt", "/");
+    try std.testing.expectEqual(@as(u64, 14), after.size);
+    const reader2 = try fs.open("/catalog/new.txt", "/", .{});
+    try std.testing.expectEqual(@as(usize, 14), try fs.readAt(reader2, 0, &buf));
+    try std.testing.expectEqualStrings("lot X3 created", buf[0..14]);
+    try fs.close(reader2);
+
+    // Prove the bytes and CRC are in the committed log, not just the adapter's
+    // in-memory report: unmount and scan the same device into fresh storage.
+    try fs.unmount("/");
+    var fresh_inodes: [cassafs.max_nodes]cassafs.Inode = undefined;
+    var fresh_workspace: [cassafs.workspaceRequired(64)]u8 = undefined;
+    const fresh = try cassafs.scan(disk.device(64), &fresh_workspace, &fresh_inodes);
+    var whole: [64]u8 = undefined;
+    const n = try cassafs.readFile(disk.device(64), &fresh, "/catalog/new.txt", &whole);
+    try std.testing.expectEqualStrings("lot X3 created", whole[0..n]);
+    try std.testing.expectEqual(@as(u32, 6), fresh.inode_count);
+    try std.testing.expectEqual(@as(u64, 61), fresh.data_bytes);
+}
+
+test "out of space and directory writes fail without leaving a mount claim" {
+    var storage: [8 * cassafs.block_size]u8 = [_]u8{0} ** (8 * cassafs.block_size);
+    var disk = TestDisk{ .blocks = &storage };
+    var workspace: [cassafs.workspaceRequired(8)]u8 = undefined;
+    const empty = [_]cassafs.Node{.{ .ino = 1, .parent = 0, .kind = .inode, .name = "" }};
+    _ = try cassafs.format(disk.device(8), .{ .nodes = &empty }, &workspace);
+    var inodes: [cassafs.max_nodes]cassafs.Inode = undefined;
+    var report = try cassafs.scan(disk.device(8), &workspace, &inodes);
+    var adapter = Adapter.init(disk.device(8), &report, &workspace, &inodes);
+    var fs: vfs.Vfs = .{};
+    try fs.mount("/", adapter.backend());
+
+    try std.testing.expectError(vfs.Error.NoSpace, fs.open("/full", "/", .{ .read = false, .write = true, .create = true }));
+    try std.testing.expectError(vfs.Error.NotFound, fs.statPath("/full", "/"));
+    try std.testing.expectError(vfs.Error.IsDirectory, fs.open("/", "/", .{ .read = false, .write = true }));
+    try std.testing.expectError(vfs.Error.AccessDenied, fs.open("/missing", "/", .{ .create = true }));
+    try std.testing.expectError(vfs.Error.NotFound, fs.open("/missing", "/", .{}));
+    try std.testing.expectError(vfs.Error.InvalidPath, fs.statPath("", "/"));
+}
+
 test "a damaged B superblock still mounts through the VFS with fallback" {
     var storage: [128 * 1024]u8 = [_]u8{0} ** (128 * 1024);
     var disk = TestDisk{ .blocks = storage[0 .. 32 * cassafs.block_size] };
@@ -204,10 +322,10 @@ test "a damaged B superblock still mounts through the VFS with fallback" {
     disk.blocks[cassafs.block_size + 200] ^= 0x40;
 
     var inodes: [cassafs.max_nodes]cassafs.Inode = undefined;
-    const report = try cassafs.scan(disk.device(32), &workspace, &inodes);
+    var report = try cassafs.scan(disk.device(32), &workspace, &inodes);
     try std.testing.expect(report.fallback);
     try std.testing.expectEqual(cassafs.Slot.a, report.active);
-    var adapter = Adapter.init(disk.device(32), &report);
+    var adapter = Adapter.init(disk.device(32), &report, &workspace, &inodes);
     var fs: vfs.Vfs = .{};
     try fs.mount("/", adapter.backend());
     const stat = try fs.statPath("/receipts/WELCOME.TXT", "/");

@@ -374,7 +374,8 @@ def main_scenario() -> None:
             "readdir on a file is refused",
             "read at EOF returns zero bytes",
             "read past EOF returns zero bytes",
-            "write open is refused (read-only access check)",
+            "write open is accepted on the writable CASSAFS backend",
+            "write open on a directory is refused",
             "root readdir returns a stable ordered set",
         ):
             check(f"[ok]   {label}" in selftest, f"selftest did not prove: {label}\n" + selftest[-4000:])

@@ -90,6 +90,9 @@ pub const Error = error{
     PathNotFound,
     BufferTooSmall,
     Unsupported,
+    InvalidPath,
+    Exists,
+    NotDirectory,
 };
 
 pub const Device = struct {
@@ -245,6 +248,10 @@ pub const Report = struct {
     free_map_seq: u64 = 0,
     uuid: [16]u8 = [_]u8{0} ** 16,
     label: [32]u8 = [_]u8{0} ** 32,
+    created_sec: u64 = 0,
+    features: u64 = 1,
+    compat: u32 = 0,
+    incompat: u32 = 1,
 };
 
 pub const Node = struct {
@@ -1034,6 +1041,10 @@ pub fn scan(device: Device, workspace: []u8, inode_storage: []Inode) Error!Repor
     report.free_blocks = chosen.free_blocks;
     report.uuid = chosen.uuid;
     report.label = chosen.label;
+    report.created_sec = chosen.created_sec;
+    report.features = chosen.features;
+    report.compat = chosen.compat;
+    report.incompat = chosen.incompat;
     if (chosen.total_blocks != device.blocks) return error.BadSuperblock;
     if (chosen.log_head < 2 or chosen.log_head > chosen.total_blocks) return error.BadSuperblock;
     if (chosen.checkpoint_block < 2 or chosen.checkpoint_block >= chosen.log_head) return error.BadSuperblock;
@@ -1057,8 +1068,8 @@ pub fn scan(device: Device, workspace: []u8, inode_storage: []Inode) Error!Repor
     var expected_seq: u64 = 1;
     var last_kind: ?Kind = null;
     var last_seq: u64 = 0;
-    var free_map_seen = false;
-    var checkpoint_seen = false;
+    var chosen_free_map_seen = false;
+    var chosen_checkpoint_seen = false;
     var record_count: u32 = 0;
     var dirs: u32 = 0;
     var files: u32 = 0;
@@ -1090,14 +1101,27 @@ pub fn scan(device: Device, workspace: []u8, inode_storage: []Inode) Error!Repor
         switch (header.kind) {
             .inode => {
                 if (header.payload_len != inode_payload_size) return error.BadInode;
-                if (inode_count >= inode_storage.len or inode_count >= max_nodes) return error.TooManyNodes;
                 const inode = decodeInode(workspace[0..inode_payload_size]) catch return error.BadInode;
-                var i: usize = 0;
-                while (i < inode_count) : (i += 1) {
-                    if (inode_storage[i].ino == inode.ino) return error.DuplicateInode;
+                // The log is append-only: a later inode record supersedes an
+                // earlier one with the same inode number. Only the latest copy
+                // is exposed, and the unique inode list keeps its first slot so
+                // directory order stays stable across updates.
+                if (findInode(inode_storage[0..inode_count], inode.ino)) |existing| {
+                    const previous = inode_storage[existing];
+                    if (previous.kind == .inode) {
+                        if (dirs == 0) return error.CountMismatch;
+                        dirs -= 1;
+                    } else {
+                        if (files == 0 or data_bytes < previous.size) return error.CountMismatch;
+                        files -= 1;
+                        data_bytes -= previous.size;
+                    }
+                    inode_storage[existing] = inode;
+                } else {
+                    if (inode_count >= inode_storage.len or inode_count >= max_nodes) return error.TooManyNodes;
+                    inode_storage[inode_count] = inode;
+                    inode_count += 1;
                 }
-                inode_storage[inode_count] = inode;
-                inode_count += 1;
                 if (inode.kind == .inode) {
                     dirs += 1;
                 } else {
@@ -1107,31 +1131,41 @@ pub fn scan(device: Device, workspace: []u8, inode_storage: []Inode) Error!Repor
             },
             .data => {},
             .free_map => {
-                if (free_map_seen) return error.BadFreeMap;
-                free_map_seen = true;
-                free_map_seq = header.seq;
-                free_map_block = block;
                 if (header.payload_len != freeMapPayloadLen(chosen.total_blocks)) return error.BadFreeMap;
                 const map = workspace[0..header.payload_len];
                 if (readU32(map, 0) != chosen.total_blocks) return error.BadFreeMap;
-                if (readU32(map, 4) != chosen.log_head) return error.BadFreeMap;
+                const map_log_head = readU32(map, 4);
+                if (map_log_head < 2 or map_log_head > chosen.log_head) return error.BadFreeMap;
                 var i: u32 = 0;
                 while (i < chosen.total_blocks) : (i += 1) {
                     const set = (map[8 + i / 8] & (@as(u8, 1) << @intCast(i % 8))) != 0;
-                    const expected = i < chosen.log_head;
+                    const expected = i < map_log_head;
                     if (set != expected) return error.BadFreeMap;
+                }
+                // Older free maps are part of the append-only history. The map
+                // named by the chosen checkpoint is the one that must describe
+                // the current log head exactly.
+                if (block == checkpoint.free_map_block) {
+                    if (chosen_free_map_seen or map_log_head != chosen.log_head) return error.BadFreeMap;
+                    chosen_free_map_seen = true;
+                    free_map_seq = header.seq;
+                    free_map_block = block;
                 }
             },
             .checkpoint => {
-                if (checkpoint_seen or block != chosen.checkpoint_block) return error.BadCheckpoint;
-                checkpoint_seen = true;
+                if (block == chosen.checkpoint_block) {
+                    if (chosen_checkpoint_seen) return error.BadCheckpoint;
+                    chosen_checkpoint_seen = true;
+                } else if (block > chosen.checkpoint_block) {
+                    return error.BadCheckpoint;
+                }
             },
         }
         block += total;
     }
     if (block != chosen.log_head) return error.BadRecord;
-    if (!checkpoint_seen or last_kind != .checkpoint or last_seq != chosen.checkpoint_seq) return error.BadCheckpoint;
-    if (!free_map_seen or free_map_seq != checkpoint.free_map_seq or free_map_block != checkpoint.free_map_block) return error.BadFreeMap;
+    if (!chosen_checkpoint_seen or last_kind != .checkpoint or last_seq != chosen.checkpoint_seq) return error.BadCheckpoint;
+    if (!chosen_free_map_seen or free_map_seq != checkpoint.free_map_seq or free_map_block != checkpoint.free_map_block) return error.BadFreeMap;
     if (inode_count != checkpoint.inode_count) return error.CountMismatch;
     if (dirs != checkpoint.dir_count or files != checkpoint.file_count) return error.CountMismatch;
     if (data_bytes != checkpoint.data_bytes) return error.CountMismatch;
@@ -1206,6 +1240,292 @@ pub fn scan(device: Device, workspace: []u8, inode_storage: []Inode) Error!Repor
         }
     }
     return report;
+}
+
+// ---------------------------------------------------------------------------
+// Append-only write path (phase 43)
+// ---------------------------------------------------------------------------
+
+/// Commit-owned superblock buffers, for the same lifetime reason as the
+/// formatter's buffers: a transport must never be able to retire a write into
+/// a reused stack frame after the commit has returned.
+var commit_superblock_raw: [superblock_size]u8 = undefined;
+var commit_superblock_block: [block_size]u8 = undefined;
+
+fn findExactExtent(inode: *const Inode, logical: u64, length: u32) ?Extent {
+    var i: usize = 0;
+    while (i < inode.extent_count) : (i += 1) {
+        const extent = inode.extents[i];
+        if (extent.logical_offset == logical and extent.length == length) return extent;
+    }
+    return null;
+}
+
+/// Append one inode record, the new free map and the new checkpoint, then write
+/// both superblocks with a higher generation. `start_block`/`start_seq` are the
+/// first free log position after any data records this commit already wrote;
+/// `records_before_inode` counts those data records. The on-disk commit is
+/// complete only after the flush and the superblock readback; the caller then
+/// rescans into its mounted report.
+fn commitInode(
+    device: Device,
+    report: *const Report,
+    inode: *const Inode,
+    start_block: u32,
+    start_seq: u64,
+    records_before_inode: u32,
+    data_bytes_after: u64,
+    is_new: bool,
+    workspace: []u8,
+    timestamp: u64,
+) Error!void {
+    if (workspace.len < workspaceRequired(device.blocks)) return error.BufferTooSmall;
+    if (is_new and report.inode_count >= max_nodes) return error.TooManyNodes;
+    if (is_new and report.next_ino == 0) return error.BadInode;
+
+    const free_payload_len = freeMapPayloadLen(device.blocks);
+    const map_blocks = recordBlocks(free_payload_len);
+    const reserve = map_blocks + 2;
+    const inode_blocks: u32 = recordBlocks(inode_payload_size);
+    if (start_block > device.blocks or inode_blocks > device.blocks - start_block) return error.NoSpace;
+    if (reserve > device.blocks - start_block - inode_blocks) return error.NoSpace;
+    const used_blocks = start_block + inode_blocks + reserve;
+    const new_record_count = report.record_info_count + records_before_inode + 3;
+    if (new_record_count > max_records) return error.TooManyRecords;
+    const inode_count_after = report.inode_count + @as(u32, if (is_new) 1 else 0);
+    const next_ino_after = if (is_new) report.next_ino + 1 else report.next_ino;
+
+    var payload: [inode_payload_size]u8 = undefined;
+    encodeInode(inode, &payload);
+    var next = start_block;
+    var seq = start_seq;
+    seq += 1;
+    next += try writeRecordChecked(device, next, reserve, seq, .inode, &payload, timestamp);
+    if (next != start_block + inode_blocks) return error.BadRecord;
+
+    const free_map_block = next;
+    const free_map_seq = seq + 1;
+    const bitmap = workspace[0..free_payload_len];
+    @memset(bitmap, 0);
+    writeU32(bitmap, 0, device.blocks);
+    writeU32(bitmap, 4, used_blocks);
+    var b: u32 = 0;
+    while (b < used_blocks) : (b += 1) {
+        bitmap[8 + b / 8] |= @as(u8, 1) << @intCast(b % 8);
+    }
+    seq = free_map_seq;
+    const map_written = try writeRecord(device, free_map_block, free_map_seq, .free_map, bitmap, timestamp);
+    if (map_written != map_blocks) return error.BadRecord;
+    next += map_written;
+    if (next != free_map_block + map_blocks) return error.BadRecord;
+
+    const checkpoint_block = next;
+    const checkpoint_seq = seq + 1;
+    var checkpoint = Checkpoint{
+        .root_ino = report.root_ino,
+        .next_ino = next_ino_after,
+        .inode_count = inode_count_after,
+        .dir_count = report.dirs,
+        .file_count = report.files + @as(u32, if (is_new) 1 else 0),
+        .record_count = new_record_count,
+        .log_head = used_blocks,
+        .total_blocks = device.blocks,
+        .used_blocks = used_blocks,
+        .free_blocks = device.blocks - used_blocks,
+        .free_map_block = free_map_block,
+        .free_map_seq = free_map_seq,
+        .data_bytes = data_bytes_after,
+        .uuid = report.uuid,
+        .label = report.label,
+    };
+    var checkpoint_payload: [checkpoint_payload_size]u8 = undefined;
+    encodeCheckpoint(&checkpoint, &checkpoint_payload);
+    seq = checkpoint_seq;
+    next += try writeRecordChecked(device, checkpoint_block, 0, seq, .checkpoint, &checkpoint_payload, timestamp);
+    if (next != used_blocks) return error.BadRecord;
+
+    const checkpoint_header = RecordHeader{
+        .kind = .checkpoint,
+        .seq = checkpoint_seq,
+        .payload_len = checkpoint_payload_size,
+        .total_blocks = 2,
+        .record_crc = crc32c(&checkpoint_payload),
+        .timestamp = timestamp,
+    };
+    var generation: u64 = 1;
+    if (report.a.valid and report.a.generation >= generation) generation = report.a.generation + 1;
+    if (report.b.valid and report.b.generation >= generation) generation = report.b.generation + 1;
+    const sb = Superblock{
+        .magic = superblock_magic,
+        .total_blocks = device.blocks,
+        .generation = generation,
+        .checkpoint_block = checkpoint_block,
+        .checkpoint_seq = checkpoint_seq,
+        .checkpoint_crc = checkpoint_header.record_crc,
+        .root_ino = report.root_ino,
+        .log_head = used_blocks,
+        .free_blocks = device.blocks - used_blocks,
+        .inode_count = inode_count_after,
+        .created_sec = report.created_sec,
+        .features = report.features,
+        .compat = report.compat,
+        .incompat = report.incompat,
+        .uuid = report.uuid,
+        .label = report.label,
+    };
+    // Make the checkpoint and every record it references durable before any
+    // superblock can point at them. Without this barrier a power cut could
+    // leave a valid new A superblock pointing at a checkpoint whose payload
+    // never reached the medium, and the scanner would reject the volume
+    // instead of falling back to the older pair.
+    try device.flush();
+    encodeSuperblock(sb, &commit_superblock_raw);
+    @memset(&commit_superblock_block, 0);
+    @memcpy(commit_superblock_block[0..superblock_size], &commit_superblock_raw);
+    try device.write(0, &commit_superblock_block);
+    encodeSuperblock(sb, &commit_superblock_raw);
+    @memset(&commit_superblock_block, 0);
+    @memcpy(commit_superblock_block[0..superblock_size], &commit_superblock_raw);
+    try device.write(1, &commit_superblock_block);
+    try device.flush();
+
+    // The caller's mounted report is not changed until the medium is proven
+    // readable. A failed readback leaves the old superblock/checkpoint in
+    // place for the next mount, and leaves the in-memory view on its old,
+    // still-valid state.
+    var verify_block: [block_size]u8 = undefined;
+    try device.read(0, &verify_block);
+    const check_a = decodeSuperblock(verify_block[0..superblock_size]) catch return error.BadSuperblock;
+    try device.read(1, &verify_block);
+    const check_b = decodeSuperblock(verify_block[0..superblock_size]) catch return error.BadSuperblock;
+    if (check_a.generation != generation or check_b.generation != generation) return error.BadSuperblock;
+}
+
+/// Create an empty regular file under an existing directory. The inode number
+/// comes from the checkpoint's `next_ino`; the free-space allocation is the
+/// append position, and the new free map marks the whole committed prefix used.
+pub fn createFile(
+    device: Device,
+    report: *const Report,
+    parent: u64,
+    name: []const u8,
+    timestamp: u64,
+    workspace: []u8,
+) Error!u64 {
+    if (workspace.len < workspaceRequired(device.blocks)) return error.BufferTooSmall;
+    if (name.len == 0) return error.InvalidPath;
+    if (name.len > max_name) return error.NameTooLong;
+    const parent_index = findInode(report.inodes, parent) orelse return error.PathNotFound;
+    if (report.inodes[parent_index].kind != .inode) return error.NotDirectory;
+    if (report.inode_count >= max_nodes) return error.TooManyNodes;
+    if (report.next_ino < 2) return error.BadInode;
+
+    for (report.inodes) |inode| {
+        if (inode.parent == parent and nameEql(inode.nameSlice(), name)) return error.Exists;
+    }
+
+    var inode = Inode{
+        .ino = report.next_ino,
+        .parent = parent,
+        .kind = .data,
+        .name_len = @intCast(name.len),
+        .size = 0,
+        .mode = 0o100644,
+        .mtime = timestamp,
+        .extent_count = 0,
+    };
+    copyName(&inode.name, name);
+    try commitInode(device, report, &inode, report.log_head, report.last_seq, 0, report.data_bytes, true, workspace, timestamp);
+    return inode.ino;
+}
+
+/// Write at a byte offset, extending the file as needed. The function rebuilds
+/// only the 16 KiB chunks that the write touches; untouched chunks keep their
+/// existing extents. A full chunk is a single data record, so a 128 KiB file
+/// uses at most the format's eight extents. On success the caller rescans; on
+/// any error the old superblock and checkpoint are still the committed state.
+pub fn writeFile(
+    device: Device,
+    report: *const Report,
+    ino: u64,
+    offset: u64,
+    data: []const u8,
+    timestamp: u64,
+    workspace: []u8,
+) Error!void {
+    if (workspace.len < workspaceRequired(device.blocks)) return error.BufferTooSmall;
+    if (data.len == 0) return;
+    const idx = findInode(report.inodes, ino) orelse return error.PathNotFound;
+    const old = report.inodes[idx];
+    if (old.kind != .data) return error.BadInode;
+    const end = std.math.add(u64, offset, @as(u64, @intCast(data.len))) catch return error.FileTooLarge;
+    const new_size = @max(old.size, end);
+    if (new_size > max_file_bytes) return error.FileTooLarge;
+    const chunk_count: u32 = @intCast((new_size + max_record_payload - 1) / max_record_payload);
+    if (chunk_count > max_extents) return error.FileTooLarge;
+
+    const free_payload_len = freeMapPayloadLen(device.blocks);
+    const reserve = recordBlocks(free_payload_len) + 2;
+    var new_inode = old;
+    new_inode.size = new_size;
+    new_inode.mtime = timestamp;
+    new_inode.extent_count = @intCast(chunk_count);
+    new_inode.extents = [_]Extent{.{}} ** max_extents;
+
+    var next = report.log_head;
+    var seq = report.last_seq;
+    var records_before_inode: u32 = 0;
+    var crc_state: u32 = 0xffff_ffff;
+    var chunk_index: u32 = 0;
+    while (chunk_index < chunk_count) : (chunk_index += 1) {
+        const start = @as(u64, chunk_index) * max_record_payload;
+        const end_of_chunk = @min(start + max_record_payload, new_size);
+        const length: usize = @intCast(end_of_chunk - start);
+        const scratch = workspace[0..length];
+        @memset(scratch, 0);
+
+        const old_length: usize = if (start < old.size)
+            @intCast(@min(@as(u64, length), old.size - start))
+        else
+            0;
+        if (old_length != 0) {
+            const got = try readInodeRange(device, report, ino, start, scratch[0..old_length]);
+            if (got != old_length) return error.BadExtent;
+        }
+
+        const write_end = offset + data.len;
+        const patch_start = @max(offset, start);
+        const patch_end = @min(write_end, end_of_chunk);
+        const touched = patch_start < patch_end;
+        if (touched) {
+            const patch_len: usize = @intCast(patch_end - patch_start);
+            @memcpy(
+                scratch[@intCast(patch_start - start)..][0..patch_len],
+                data[@intCast(patch_start - offset)..][0..patch_len],
+            );
+        }
+
+        const exact = findExactExtent(&old, start, @intCast(length));
+        if (!touched and exact != null and old_length == length) {
+            new_inode.extents[chunk_index] = exact.?;
+        } else {
+            seq += 1;
+            const placed = next;
+            const blocks = try writeRecordChecked(device, next, reserve, seq, .data, scratch, timestamp);
+            next += blocks;
+            records_before_inode += 1;
+            new_inode.extents[chunk_index] = .{
+                .logical_offset = start,
+                .physical_block = placed + 1,
+                .physical_offset = 0,
+                .length = @intCast(length),
+            };
+        }
+        crc_state = crc32cUpdate(crc_state, scratch);
+    }
+    new_inode.data_crc = ~crc_state;
+    const data_bytes_after = report.data_bytes + (new_size - old.size);
+    try commitInode(device, report, &new_inode, next, seq, records_before_inode, data_bytes_after, false, workspace, timestamp);
 }
 
 // ---------------------------------------------------------------------------

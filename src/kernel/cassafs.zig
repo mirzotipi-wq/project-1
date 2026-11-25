@@ -105,7 +105,9 @@ fn attach() !cassafs.Device {
 
 pub const MountSource = struct {
     device: cassafs.Device,
-    report: *const cassafs.Report,
+    report: *cassafs.Report,
+    workspace: []u8,
+    inode_storage: []cassafs.Inode,
 };
 
 /// Attach partition 1 and scan the volume into the mount workspace. This is the
@@ -115,7 +117,12 @@ pub const MountSource = struct {
 pub fn mountVolume() !MountSource {
     const device = try attachTo(&mount_view);
     mount_report = try cassafs.scan(device, &mount_workspace, &mount_inode_storage);
-    return .{ .device = device, .report = &mount_report };
+    return .{
+        .device = device,
+        .report = &mount_report,
+        .workspace = mount_workspace[0..],
+        .inode_storage = mount_inode_storage[0..],
+    };
 }
 
 pub fn explain(err: anyerror) void {

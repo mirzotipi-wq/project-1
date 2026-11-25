@@ -2339,12 +2339,61 @@ bounds and the phase-44 page cache; phase 42 proves the mount/read path on the s
 The mount table and backend interface already admit a second backend, but none is implemented.
 The kernel mounts partition 1 only and does not auto-mount at boot.
 
-### Phase 43 — Write path and recovery `[ ]`
-**Goal:** Power cut at any instant, no corruption.
-**Build:** Append-only journal, checkpointing, garbage collection, atomic rename,
-`fsync` semantics, replay on mount.
-**Done when:** 1,000 randomized power-cut injections leave a mountable filesystem with all
-acknowledged writes present.
+### Phase 43 — Write path and recovery `[x]`
+**Goal:** Make CASSAFS writable through the mounted VFS without weakening the phase-42
+validation, and prove the bytes survive a clean shutdown, remount and soft reboot.
+**Build:** File create and offset write/extend, append-only allocation from the log head into
+the free map, inode supersession, chunk CRCs, new free map/checkpoint, A/B superblock generation
+and readback, VFS write handles, host write tests and a real QEMU write-path harness.
+
+**Shipped.** CASSAFS now has an append-only write path. `cassafs.createFile` allocates
+`checkpoint.next_ino`, validates the parent and sibling name, appends a new inode record and
+commits a new free map, checkpoint and both superblocks. `cassafs.writeFile` reads the old chunks,
+rebuilds only the 16 KiB chunks touched by an offset write (zero-filling a gap past EOF), reuses
+untouched extents, computes the final CRC32C, appends new data and inode records, then commits
+the same way. A commit starts from `report.log_head`/`last_seq`, writes the new free map marking
+the whole committed prefix used, writes the checkpoint, flushes, writes both superblocks with
+`generation = max(A,B)+1`, and reads both superblocks back. The caller then rescans the complete
+medium with the unchanged CRC/tree/extent/bitmap validator before updating the mounted report.
+The VFS gained writable backend callbacks, `create` open flags, `writeAt`/`write`, stat refresh
+from the backend, and `NoSpace`/`Exists`/`IsDirectory`/`NotFound` reasons. The shell exposes
+`vfs create <path>`, `vfs write <path> <offset> <text>` and `vfs df`; `vfs selftest` now proves
+write opens work and directory write opens are refused. The scanner accepts a later inode record
+for the same inode number (latest copy wins, original directory slot preserved) and validates
+historical free-map/checkpoint pairs while requiring the selected checkpoint's map to describe
+the selected log head. Existing phase-41/42 read results remain unchanged.
+
+**Evidence.**
+- `zig build` is clean; `zig build test` passes **219/219**, up from 217: two new host tests
+  cover create/write/overwrite, a fresh post-unmount scan, a tiny-volume `NoSpace` refusal,
+  missing-path and directory-write refusals.
+- `python3 tools/qemu_vfs_write_test.py` **PASS** (four scenarios): create `/catalog/note.txt`
+  as inode 6/parent 2; write 7 bytes `hello43` CRC32C `0xdb03992b`; overwrite at offset 5 with
+  `43!` to 8 bytes CRC32C `0x394478f0`; unmount/remount and soft reboot both mount
+  **6 inodes, 3 files, 166 data bytes** and read the same 8 bytes/CRC. The original 73-byte
+  products.db CRC `0x3b60dc1d` and WELCOME.TXT are unchanged. The host verifier
+  `zig-out/bin/cassafs verify --partition 1` accepts the written image after shutdown.
+- Out-of-space scenario: an 8-block empty volume reports `log head 8/8 block(s), 0 free`;
+  `vfs create /full` refuses with `out of space (free map, inode table or record budget)` and
+  leaves no directory entry. Corruption scenario: a committed 13-byte payload is damaged on the
+  medium; mount refuses the written volume with `CRC32C mismatch; the volume is damaged` and
+  leaves zero mounts. The kernel self-tests still PASS.
+- All pre-existing QEMU scripts PASS after the change: `qemu_vfs_test.py`,
+  `qemu_cassafs_test.py`, `qemu_input_test.py`, `qemu_usb_test.py`, `qemu_power_test.py`.
+- Screenshot: `docs/screenshots/phase43-write.png` (1280x800) shows the mounted tree with
+  `note.txt` (inode 6, 15 B), `WRITES 1`, 6 inodes/3 files/173 data bytes. Format contract:
+  `docs/cassafs-format.md`; VFS contract: `docs/vfs.md`.
+
+**Limits.** Phase 43 implements the **append-only write path and commit validation**, not the
+full phase goal of power-cut recovery. There is no journal replay, no garbage collection, no
+checkpoint redundancy, no atomic rename, no unlink/truncate, no `fsync` API, and no 1,000
+randomized power-cut injection run. A clean shutdown, soft reboot, remount and deliberate
+corruption are proven; arbitrary torn-superblock/checkpoint recovery is not. There is one
+writer and no concurrent handle-table locking. The log grows forever and the free map is
+capacity accounting, not reuse. The 128-inode/128-record/eight-extent limits remain, so a file
+is capped at 128 KiB and a long-lived volume eventually returns `NoSpace`; the phase-44 page
+cache and a larger format are still out. The VFS remains backend-neutral, but CASSAFS is the
+only writable backend and partition 1 is the only mount.
 
 ### Phase 44 — Block and page cache `[ ]`
 **Goal:** Predictable performance under load.
@@ -2723,3 +2772,4 @@ to the OS.
 | 2026-11-18 | 40 | Watchdog and power: real QEMU i6300ESB PCI watchdog with two-stage 4 s reset and previous-reset flag, core-0 scheduler heartbeat every 250 ms, fault-injection hang, brown-out hook/service path, FAT32-backed `POWER.JNL` (72-byte CRC32 records, 96-record ring, boot/clean/brownout/reboot/watchdog/selftest), thermal ladder with 0/25/50/75% `wfi` idle injection, PSCI poweroff/reboot with storage flush, `power`, `thermal`, `watchdog`, `poweroff`; 197 host tests (+10); QEMU 8.2.2: forced hang reset → watchdog_boot/unclean journal/file intact, poweroff and brownout both exit 0 with clean next boot, thermal 2212 → 3604 ms (1.63x) at critical/75%, no-watchdog/no-disk boot PASS with two `OK (degraded)`, phase 38/39 harnesses PASS; `tools/qemu_power_test.py`; screenshot `docs/screenshots/phase40-power.png` |
 | 2026-11-25 | 41 | CASSAFS format 1: 4 KiB log-structured volume with A/B superblocks, 64-byte record headers and payload CRC32C, 268-byte inode tree with names/parents, ordered byte extents, free-space bitmap and checkpoint; kernel `cassafs info/format/demo/dump/verify/cat/viz`, host read-only reader, shell integration; 208 host tests (+11); QEMU 8.2.2: 20-block demo with 9 records and 5 inodes, verify PASS, 73-byte CSV CRC `0x3b60dc1d`, reboot persistence, B-superblock fallback to A, data-payload corruption rejected by both kernel and host reader, no-disk absence PASS; 64 KiB kernel stacks fix a real scan-stack overflow caught as a corrupt frame; `tools/qemu_cassafs_test.py`; screenshot `docs/screenshots/phase41-cassafs.png`  |
 | 2026-11-25 | 42 | Read-only VFS: backend-neutral node/mount/handle tables, canonical paths, stable readdir, range reads, CASSAFS backend, validate-before-mount, read-only checks, failure diagnostics; 217 host tests (+9); QEMU 8.2.2: 5-inode demo mounts at `/`, 73 B products CRC `0x3b60dc1d` matches `cassafs cat`, WELCOME.TXT 85 B, stable readdir, unmount/remount, byte-identical reads after a soft reboot; no-disk and bad-CRC mounts refused with no table entry; damaged B falls back to A; `tools/qemu_vfs_test.py`; fixed a format superblock write-buffer lifetime bug; screenshot `docs/screenshots/phase42-vfs.png` |
+| 2026-11-25 | 43 | CASSAFS append-only write path: create, offset write/extend, touched-chunk rebuild, latest-inode supersession, free-map/checkpoint commit, A/B superblocks with readback and full rescan; VFS `create`/`writeAt`/`write`, `vfs create/write/df`, writable access checks; 219 host tests (+2); QEMU 8.2.2: note.txt inode 6/8 B CRC `0x394478f0`, 7-byte and overwrite reads, 6 inodes/3 files/166 B after remount and soft reboot, phase-42 products CRC unchanged, host verifier PASS; 8-block volume 0 free refuses create with out-of-space and no entry; corrupted committed payload refused with CRC32C; all prior harnesses PASS; screenshot `docs/screenshots/phase43-write.png` |
