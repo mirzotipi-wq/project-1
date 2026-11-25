@@ -53,6 +53,7 @@ test {
     _ = @import("kernel/input.zig");
     _ = @import("lib/edid.zig");
     _ = @import("lib/display_mode.zig");
+    _ = @import("lib/gfx.zig");
     _ = @import("kernel/fb.zig");
 }
 

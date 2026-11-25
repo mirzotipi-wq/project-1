@@ -149,6 +149,12 @@ pub const Framebuffer = struct {
         self.pixels_written += 1;
     }
 
+    /// The mapped pixel bytes, for the phase-51 graphics core. The slice is
+    /// bounded by the driver-reported frame size, not by an untrusted length.
+    pub fn rawBytes(self: *Framebuffer) []u8 {
+        return self.base[0..@intCast(self.mode.frameBytes())];
+    }
+
     pub fn pixelAt(self: *const Framebuffer, x: u32, y: u32) Color {
         if (x >= self.mode.width or y >= self.mode.height) return 0;
         const row = self.rowPtr(y);
