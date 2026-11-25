@@ -94,6 +94,13 @@ pub fn unmount() bool {
         out("  vfs unmount : refused: nothing is mounted\n", .{});
         return false;
     }
+    // The page cache is write-back: unmount must push every dirty page before
+    // it is allowed to forget the mount. A failed flush is a refusal, not a
+    // silent loss of bytes that the mounted view already accepted.
+    cassafs.flushMountCache() catch |err| {
+        out("  vfs unmount : refused: page-cache flush failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
     g_vfs.unmount("/") catch |err| {
         if (err == error.Busy) {
             out("  vfs unmount : refused: open handles still reference the volume\n", .{});
@@ -102,7 +109,8 @@ pub fn unmount() bool {
         }
         return false;
     };
-    out("  vfs unmount : / removed; mount table 0/1, no dangling nodes or handles\n", .{});
+    cassafs.invalidateMountCache();
+    out("  vfs unmount : / removed and page cache flushed; mount table 0/1, no dangling nodes or handles\n", .{});
     return true;
 }
 
@@ -124,6 +132,10 @@ fn info() void {
     const stats = g_vfs.stats();
     out("  vfs info    : node table {d}/{d}, open handles {d}/{d}, {d} lookup(s), {d} read(s), {d} write(s), {d} readdir(s)\n", .{
         stats.nodes, vfs.max_nodes, stats.handles, vfs.max_handles, g_vfs.lookups, stats.reads, stats.writes, g_vfs.readdirs,
+    });
+    const cache = cassafs.mountCacheStats();
+    out("  vfs cache   : {d}/{d} page(s) resident ({d}% pressure), {d}/{d} dirty, hit rate {d}% ({d} hit / {d} miss)\n", .{
+        cache.used, cache.capacity, cache.pressure(), cache.dirty, cache.max_dirty, cache.hitRate(), cache.hits, cache.misses,
     });
 }
 
@@ -263,6 +275,110 @@ fn df() void {
     out("  vfs df      : log head {d}/{d} block(s), {d} free, {d} record(s)/{d}, next inode {d}\n", .{
         r.log_head, r.total_blocks, r.free_blocks, r.records, cassafs_lib.max_records, r.next_ino,
     });
+    const cache = cassafs.mountCacheStats();
+    out("  vfs cache   : {d}/{d} page(s), {d}% pressure, {d} dirty\n", .{
+        cache.used, cache.capacity, cache.pressure(), cache.dirty,
+    });
+}
+
+fn cacheStats() void {
+    if (!mounted()) {
+        out("  vfs cache   : no mounts; run 'vfs mount'\n", .{});
+        return;
+    }
+    const s = cassafs.mountCacheStats();
+    out("  vfs cache   : {d}/{d} page(s) resident ({d}% pressure), {d}/{d} dirty, hit rate {d}% ({d} hit / {d} miss)\n", .{
+        s.used, s.capacity, s.pressure(), s.dirty, s.max_dirty, s.hitRate(), s.hits, s.misses,
+    });
+    out("              : {d} read(s), {d} write(s), {d} eviction(s), {d} writeback(s), {d} flush(es), readahead {d} read(s)/{d} hit(s)/{d} error(s)\n", .{
+        s.read_calls, s.write_calls, s.evictions, s.writebacks, s.flushes, s.readahead_reads, s.readahead_hits, s.readahead_errors,
+    });
+}
+
+fn cacheDrop() void {
+    if (!mounted()) {
+        out("  vfs cache   : no mounts; run 'vfs mount'\n", .{});
+        return;
+    }
+    g_source.cache.drop() catch |err| {
+        out("  vfs cache   : drop refused: page-cache flush failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    out("  vfs cache   : every resident page dropped after a successful write-back flush\n", .{});
+}
+
+fn cacheFlush() void {
+    if (!mounted()) {
+        out("  vfs cache   : no mounts; run 'vfs mount'\n", .{});
+        return;
+    }
+    g_source.cache.flush() catch |err| {
+        out("  vfs cache   : flush failed: {s}; dirty pages retained\n", .{@errorName(err)});
+        return;
+    };
+    out("  vfs cache   : dirty pages written back and the backing device flushed\n", .{});
+}
+
+/// A storage-level latency probe for the phase-44 exit criterion. The POS
+/// checkout itself is a later phase, so this measures the same CASSAFS commit
+/// path a sale will use: a small sale-sized write through the VFS, interleaved
+/// with a catalog read loop. It is intentionally not called a concurrent
+/// benchmark; the shell is single-threaded and the result records that limit.
+fn cacheBench() void {
+    if (!mounted()) {
+        out("  vfs bench   : no mounts; run 'vfs mount'\n", .{});
+        return;
+    }
+    const sale = "sale=43 sku=1001 qty=1 total=250\n";
+    const h = g_vfs.open("/receipts/sale44.tmp", "/", .{ .read = false, .write = true, .create = true }) catch |err| {
+        out("  vfs bench   : cannot open sale file: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer g_vfs.close(h) catch {};
+    const products = g_vfs.open("/catalog/products.db", "/", .{}) catch |err| {
+        out("  vfs bench   : cannot open catalog: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer g_vfs.close(products) catch {};
+    const welcome = g_vfs.open("/receipts/WELCOME.TXT", "/", .{}) catch |err| {
+        out("  vfs bench   : cannot open welcome file: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer g_vfs.close(welcome) catch {};
+
+    const iterations: u32 = 8;
+    const budget_ms: u64 = 100;
+    var max_ms: u64 = 0;
+    var catalog_reads: u32 = 0;
+    var catalog_bytes: u64 = 0;
+    var catalog_buf: [128]u8 = undefined;
+    var iter: u32 = 0;
+    while (iter < iterations) : (iter += 1) {
+        const pn = g_vfs.readAt(products, 0, &catalog_buf) catch |err| {
+            out("  vfs bench   : catalog read failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const wn = g_vfs.readAt(welcome, 0, &catalog_buf) catch |err| {
+            out("  vfs bench   : catalog read failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        catalog_reads += 2;
+        catalog_bytes += pn + wn;
+        const started = timer.uptimeMs();
+        _ = g_vfs.writeAt(h, 0, sale) catch |err| {
+            out("  vfs bench   : sale commit failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const elapsed = timer.uptimeMs() - started;
+        if (elapsed > max_ms) max_ms = elapsed;
+    }
+    const stats = cassafs.mountCacheStats();
+    out("  vfs bench   : {d} sale-sized commit(s), max {d} ms (budget {d} ms), catalog {d} read(s)/{d} B, cache {d}% hit\n", .{
+        iterations, max_ms, budget_ms, catalog_reads, catalog_bytes, stats.hitRate(),
+    });
+    out("  vfs bench   : {s}; interleaved single-threaded catalog load, not concurrent checkout\n", .{
+        if (max_ms <= budget_ms) "PASS" else "FAIL",
+    });
 }
 
 fn readRange(path: []const u8, offset_text: []const u8, length_text: []const u8) void {
@@ -394,8 +510,12 @@ fn selfTest() bool {
     };
     suite.check(file.ino == 3 and file.parent == 2 and file.size == demo_catalog.len, "stat returns type, size, inode and parent");
 
+    const cache_before = cassafs.mountCacheStats();
     checkFile(&suite, report, "/catalog/products.db", demo_catalog);
     checkFile(&suite, report, "/receipts/WELCOME.TXT", demo_welcome);
+    const cache_after = cassafs.mountCacheStats();
+    suite.check(cache_before.capacity == 64 and cache_after.used > 0, "page cache is bounded and resident");
+    suite.check(cache_after.hits > cache_before.hits or cache_after.misses > cache_before.misses, "page cache accounts for VFS read traffic");
 
     const file_h = g_vfs.open("/catalog/products.db", "/", .{}) catch {
         suite.check(false, "open products.db");
@@ -486,6 +606,10 @@ fn drawTree(surface: *fb.Framebuffer, path: []const u8, depth: u32, y: *i32) voi
 }
 
 fn drawViz() void {
+    if (!mounted()) {
+        out("  vfs viz     : no mounts; run 'vfs mount'\n", .{});
+        return;
+    }
     const surface = fb.screen() orelse {
         out("  vfs viz     : no framebuffer; use 'vfs info' and 'vfs ls'\n", .{});
         return;
@@ -514,10 +638,15 @@ fn drawViz() void {
         stats.nodes, vfs.max_nodes, stats.handles, vfs.max_handles, g_vfs.lookups, stats.reads, stats.writes, g_vfs.readdirs,
     }) catch "tables";
     _ = surface.drawText(24, 116, tables, 1, fb.Palette.text_dim);
-    _ = surface.drawText(32, 150, "TREE (real readdir order)", 1, fb.Palette.text_dim);
-    var y: i32 = 174;
+    const cache = cassafs.mountCacheStats();
+    const cache_line = std.fmt.bufPrint(&line, "CACHE {d}/{d} PAGES  {d}% PRESSURE  {d} DIRTY  HIT {d}%  {d} HIT / {d} MISS", .{
+        cache.used, cache.capacity, cache.pressure(), cache.dirty, cache.hitRate(), cache.hits, cache.misses,
+    }) catch "cache";
+    _ = surface.drawText(24, 136, cache_line, 1, fb.Palette.green);
+    _ = surface.drawText(32, 162, "TREE (real readdir order)", 1, fb.Palette.text_dim);
+    var y: i32 = 186;
     drawTree(surface, "/", 0, &y);
-    _ = surface.drawText(24, 748, "CASSAFS write path is live; journal replay, GC and concurrent writers remain future work.", 1, fb.Palette.text_dim);
+    _ = surface.drawText(24, 748, "CASSAFS write path and 64-page LRU cache are live; journal replay, GC and concurrent writers remain future work.", 1, fb.Palette.text_dim);
 }
 
 fn viz(seconds: u32) void {
@@ -563,6 +692,19 @@ pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
         write(path, offset, text);
     } else if (std.mem.eql(u8, sub, "df")) {
         df();
+    } else if (std.mem.eql(u8, sub, "cache")) {
+        const action = tokens.next() orelse "stats";
+        if (std.mem.eql(u8, action, "stats")) {
+            cacheStats();
+        } else if (std.mem.eql(u8, action, "flush")) {
+            cacheFlush();
+        } else if (std.mem.eql(u8, action, "drop")) {
+            cacheDrop();
+        } else if (std.mem.eql(u8, action, "bench")) {
+            cacheBench();
+        } else {
+            out("  usage: vfs cache [stats|flush|drop|bench]\n", .{});
+        }
     } else if (std.mem.eql(u8, sub, "read")) {
         const path = tokens.next() orelse {
             out("  usage: vfs read <path> <offset> <length>\n", .{});
@@ -577,6 +719,6 @@ pub fn command(tokens: *std.mem.TokenIterator(u8, .scalar)) void {
         const seconds = std.fmt.parseInt(u32, tokens.next() orelse "8", 10) catch 8;
         viz(seconds);
     } else {
-        out("  usage: vfs [mount|unmount|info|df|ls [path]|stat <path>|cat <path>|create <path>|write <path> <offset> <text>|read <path> <offset> <len>|selftest|viz <s>]\n", .{});
+        out("  usage: vfs [mount|unmount|info|df|cache [stats|flush|drop|bench]|ls [path]|stat <path>|cat <path>|create <path>|write <path> <offset> <text>|read <path> <offset> <len>|selftest|viz <s>]\n", .{});
     }
 }

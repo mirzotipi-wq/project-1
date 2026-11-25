@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–43 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–44 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -90,8 +90,9 @@ goes to the serial console is now also on the screen. See
 | 41 | CASSAFS format 1: 4 KiB log-structured volume, A/B superblocks with CRC32C, 64-byte record headers with header and payload CRC32C, 268-byte inode tree (parent/name), ordered byte extents, free-space bitmap, checkpoint, on-disk versioning; kernel `cassafs info/format/demo/dump/verify/cat/viz`, read-only host reference reader, shell integration | QEMU 8.2.2: 64 MiB MBR partition formats to 20 blocks/9 records/5 inodes/2 files/158 data bytes with 16,364 free; verify PASS covers every CRC, tree edge, extent, data CRC and bitmap bit; 73-byte CSV CRC `0x3b60dc1d` read by guest and host; reboot persistence; damaged B superblock falls back to A; corrupted data payload rejected by both; no-disk absence PASS; 208 host tests (+11); `tools/qemu_cassafs_test.py`; screenshot `docs/screenshots/phase41-cassafs.png` |
 | 42 | Read-only VFS: backend-neutral node and mount tables, canonical absolute/relative paths with `.` and `..`, open/close handles, sequential and offset reads, stable readdir, stat, read-only access checks, validate-before-mount; CASSAFS backend on partition 1; `vfs` shell commands | QEMU 8.2.2: 5-inode demo mounts at `/` and reads 73-byte products.db CRC `0x3b60dc1d` and 85-byte WELCOME.TXT, both matching `cassafs cat`; stable root order, unmount/remount, byte-identical reads after a soft reboot; no-disk and bad-CRC mounts refused with zero table entries; damaged B superblock falls back to A; 217 host tests (+9); `tools/qemu_vfs_test.py`; screenshot `docs/screenshots/phase42-vfs.png` |
 | 43 | CASSAFS write path: append-only create and offset write/extend, touched-chunk rebuild, latest-inode supersession, free-map allocation, new checkpoint, A/B superblock generation with readback, writable VFS handles and repair-free rescan; `vfs create/write/df`, `vfs selftest` write checks | QEMU 8.2.2: create `/catalog/note.txt` inode 6, write 7 bytes CRC `0xdb03992b`, overwrite to 8 bytes CRC `0x394478f0`; 6 inodes/3 files/166 data bytes read back after unmount/remount and a soft reboot; 73-byte products CRC unchanged; host `cassafs verify` PASS; 8-block 0-free volume refuses create with out-of-space and no entry; corrupted committed payload refused with CRC32C; 219 host tests (+2); `tools/qemu_vfs_write_test.py`; screenshot `docs/screenshots/phase43-write.png` |
+| 44 | CASSAFS page cache: bounded 4 KiB LRU between VFS and the partition view, 64 resident pages (256 KiB), 16-page write-back bound (64 KiB), four-page readahead, dirty-written-before-eviction/flush, pressure accounting, `vfs cache stats/flush/drop/bench`, unmount flush, dashboard cache line, 19-check `vfs selftest` | QEMU 8.2.2: mount warms 23/64 pages, 35% pressure, 79% hit (19/5); after cache drop and cold read 21 hit/6 miss, 22 readahead reads, 0 errors; 8 sale-sized VFS commits max **35 ms** / 100 ms while interleaving 16 catalog reads/1,264 B; 64/64 pages, 344 evictions, 88 writebacks, 20 flushes, 0 dirty; sale 33 B CRC `0x12b569fa` survives cache drop, unmount/remount and host verify; 225 host tests (+6); fix: 4 KiB cache bounce page moved off-stack and thread stacks raised to 128 KiB after a real post-mount stack overflow; `tools/qemu_page_cache_test.py`; screenshot `docs/screenshots/phase44-cache.png` |
 
-The remaining 57 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 56 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -134,6 +135,11 @@ The phase-43 write path adds `python3 tools/qemu_vfs_write_test.py`: it creates 
 file through the VFS, compares read-back bytes and CRCs, unmounts/remounts and soft-reboots on
 the same medium, runs the host verifier, then proves an 8-block volume refuses a create and a
 damaged committed payload is refused at mount. The VFS contract is in [docs/vfs.md](docs/vfs.md).
+The phase-44 page cache adds `python3 tools/qemu_page_cache_test.py`: it mounts a formatted
+volume, reads the mount-warmed cache counters, drops the cache and proves a cold read misses and
+prefetches, benchmarks eight sale-sized commits while catalog reads run, checks that dirty
+write-back stays bounded, verifies the committed sale after another cache drop and an
+unmount/remount, then runs the host verifier. Design and limits: [docs/page-cache.md](docs/page-cache.md).
 The kernel
 console is the first PL011 UART; press Enter for a prompt and type `help`. Concurrency can be
 inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
@@ -215,6 +221,19 @@ specific cause, including a missing disk, a bad CRC, or A/B fallback. Screenshot
 [phase43-write.png](docs/screenshots/phase43-write.png); design and limits:
 [docs/vfs.md](docs/vfs.md).
 
+The mounted volume now reads and writes through a bounded 4 KiB LRU page cache: 64 resident
+pages (256 KiB), a 16-page dirty bound, four-page readahead, write-back on eviction and a real
+flush before the commit superblock barrier. `vfs cache stats` shows resident/pressure/dirty
+counters and hits/misses/readahead, `vfs cache flush` forces dirty pages, `vfs cache drop`
+flushes and invalidates, and `vfs cache bench` measures eight sale-sized VFS commits against
+the **100 ms** phase-44 budget while interleaving catalog reads. On QEMU the mount scan warms
+23/64 pages (79% hit), the benchmark reached **35 ms** max with 16 catalog reads/1,264 B and
+88% hit, and the 33-byte sale CRC survived cache drop, unmount/remount and the host verifier.
+This is a single-volume, single-threaded storage cache, not the POS checkout; journal replay,
+GC and concurrency remain future work. Screenshot:
+[phase44-cache.png](docs/screenshots/phase44-cache.png); contract and limits:
+[docs/page-cache.md](docs/page-cache.md).
+
 User mode has its own commands. `user [mode]` runs the embedded EL0 program (0 normal,
 1 privileged-register attempt, 2 kernel-memory read, 3 two-process isolation, 4 the capability
 suite, 5 the IPC client, 6 the IPC server, 7 the IPC outsider, 8 the shared-memory owner,
@@ -272,8 +291,8 @@ src/devices/         PL011, PL031, virtio-mmio, virtio-blk, virtio-input, bochs-
                      i6300esb
 src/lib/             freestanding helpers (device tree, EDID, 5x7 font, display modes,
                      keymap, scanner, USB descriptors/HID/xHCI arithmetic, power policy,
-                     CASSAFS codec/format/verify/range-read/write path, backend-neutral VFS,
-                     CASSAFS VFS adapter)
+                     CASSAFS codec/format/verify/range-read/write path, page cache,
+                     backend-neutral VFS, CASSAFS VFS adapter)
 tools/mkimage.zig    host-side Image wrapper used by the build
 tools/cassafs.zig    read-only host reference reader for CASSAFS images
 tools/qemu_input_test.py  boots with virtio keyboard/tablet, drives them over HMP/QMP
@@ -283,9 +302,12 @@ tools/qemu_cassafs_test.py  formats/verifies, reboots, corrupts and checks absen
 tools/qemu_vfs_test.py      mounts CASSAFS through the VFS, reads, refuses bad mounts, reboots
 tools/qemu_vfs_write_test.py  creates/writes/overwrites through the VFS, remounts, reboots,
                               checks out-of-space and committed-payload corruption
+tools/qemu_page_cache_test.py  proves cache hits/readahead/eviction/write-back and the 100 ms
+                               sale-commit budget in the booted image
 src/tests.zig        host unit-test root
 docs/cassafs-format.md  the CASSAFS v1 on-disk contract, write path and limits
 docs/vfs.md             the VFS contract, write path, backend interface and limits
+docs/page-cache.md      phase-44 page-cache policy, commands, evidence and limits
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan
 ```

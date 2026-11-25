@@ -3,6 +3,8 @@
 CASSAFS is the crash-safe, log-structured filesystem Cassa is building for till workloads.
 Phase 41 defines the on-disk format, the reference formatter, the verifier and the read-only
 dump/cat path. Phase 42 mounts it through the VFS; phase 43 adds the append-only write path.
+Phase 44 adds a 64-page write-back cache below the VFS adapter; it changes no on-disk bytes,
+checks or superblock semantics (see [page-cache.md](page-cache.md)).
 
 The authoritative implementation is `src/lib/cassafs.zig`; the kernel adapter is
 `src/kernel/cassafs.zig`; the host reference reader is `tools/cassafs.zig`. All three use the
@@ -214,7 +216,9 @@ reference tool only reads; the kernel owns the write path.
   unmount/reboot and a deliberately corrupted image are the evidence shipped here; 1,000
   randomized power-cut injections are not.
 - There is one writer and no concurrent VFS handle-table locking. The adapter rescans after a
-  write, which is correct but not a multi-reader/writer design.
+  write, which is correct but not a multi-reader/writer design. The phase-44 cache is
+  single-mounted-volume and single-threaded, with no background writeback or cross-mount
+  coherence.
 - Eight extents and 128 inodes/records are the reference bounds; a volume also has a 128-record
   log budget. A file is capped at 128 KiB. The free map is capacity accounting, not reuse: a
   long-lived volume eventually exhausts free blocks or records.

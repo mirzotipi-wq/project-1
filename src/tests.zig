@@ -42,6 +42,7 @@ test {
     _ = @import("lib/cassafs.zig");
     _ = @import("lib/vfs.zig");
     _ = @import("lib/cassafs_vfs.zig");
+    _ = @import("lib/page_cache.zig");
     _ = @import("kernel/input.zig");
     _ = @import("lib/edid.zig");
     _ = @import("lib/display_mode.zig");

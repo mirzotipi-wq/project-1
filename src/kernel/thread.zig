@@ -36,12 +36,15 @@ pub const State = enum {
 
 pub const EntryFn = *const fn (?*anyopaque) void;
 
-/// Sixteen pages (64 KiB). Formatting and full-volume verification in a debug
-/// build are stack-hungry: a CASSAFS scan decodes record headers and payloads
-/// through several layers while keeping a full report, and phase 41's scan was
-/// measured at roughly 46 KiB. 64 KiB stays small next to the 8 MiB heap and
-/// leaves room for the POS workload without silent inter-thread stack damage.
-pub const stack_pages: u32 = 16;
+/// Thirty-two pages (128 KiB). Formatting and full-volume verification in a
+/// debug build are stack-hungry: a CASSAFS scan decodes record headers and
+/// payloads through several layers while keeping a full report, and phase 41's
+/// scan was measured at roughly 46 KiB. Phase 44 adds the page-cache read path
+/// below that scan; a 64 KiB stack still overflowed after the cache was
+/// inserted, overwriting a neighbouring scheduler frame. 128 KiB stays small
+/// next to the 8 MiB heap and leaves room for the POS workload without silent
+/// inter-thread stack damage.
+pub const stack_pages: u32 = 32;
 pub const stack_bytes: usize = stack_pages * pmm.page_size;
 
 pub const max_threads: usize = 24;

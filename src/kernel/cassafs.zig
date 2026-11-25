@@ -18,6 +18,7 @@ const partition = @import("partition.zig");
 const block_view = @import("block_view.zig");
 const journal = @import("journal.zig");
 const cassafs = @import("../lib/cassafs.zig");
+const page_cache = @import("../lib/page_cache.zig");
 
 fn out(comptime fmt: []const u8, args: anytype) void {
     uart.Writer.print(fmt, args);
@@ -41,11 +42,19 @@ var g_report: cassafs.Report = .{};
 
 // Phase 42: a mounted volume has its own view, report and inode storage. The
 // diagnostics above must not invalidate a live mount when `cassafs info` or
-// `cassafs verify` runs.
+// `cassafs verify` runs. Phase 44 adds a private page cache to this mount (the
+// diagnostics stay uncached and always read the medium directly).
 var mount_view: block_view.View = undefined;
 var mount_inode_storage: [cassafs.max_nodes]cassafs.Inode = undefined;
 var mount_workspace: [cassafs.workspaceRequired(cassafs.max_volume_blocks)]u8 = undefined;
 var mount_report: cassafs.Report = .{};
+
+// Phase 44: the mounted volume reads and writes through a bounded 4 KiB page
+// cache. The page array lives in .bss; no heap or dynamic allocation is needed,
+// and a failed cache writeback is a typed error the commit path can report.
+const mount_cache_page_count = 64;
+var mount_cache_pages: [mount_cache_page_count]page_cache.Page = undefined;
+var mount_cache: page_cache.PageCache = undefined;
 
 const demo_catalog = "sku,name,price_cents\n1001,Espresso,250\n1002,Croissant,180\n1003,Water,150\n";
 const demo_welcome = "Welcome to Cassa POS.\nThis volume was formatted by the phase 41 reference formatter.\n";
@@ -108,6 +117,7 @@ pub const MountSource = struct {
     report: *cassafs.Report,
     workspace: []u8,
     inode_storage: []cassafs.Inode,
+    cache: *page_cache.PageCache,
 };
 
 /// Attach partition 1 and scan the volume into the mount workspace. This is the
@@ -115,14 +125,37 @@ pub const MountSource = struct {
 /// volume, and it returns only after the complete log, inode tree, data CRCs and
 /// free map have been verified. A failure leaves no mount state anywhere.
 pub fn mountVolume() !MountSource {
-    const device = try attachTo(&mount_view);
+    const backing = try attachTo(&mount_view);
+    mount_cache = try page_cache.PageCache.init(backing, &mount_cache_pages, .{
+        .max_dirty = 16,
+        .readahead = 4,
+    });
+    const device = mount_cache.device();
     mount_report = try cassafs.scan(device, &mount_workspace, &mount_inode_storage);
     return .{
         .device = device,
         .report = &mount_report,
         .workspace = mount_workspace[0..],
         .inode_storage = mount_inode_storage[0..],
+        .cache = &mount_cache,
     };
+}
+
+/// Flush the mounted page cache before the VFS lets go of the volume. This is
+/// the unmount barrier: if a dirty page cannot reach the medium, unmount is
+/// refused rather than silently discarding it.
+pub fn flushMountCache() cassafs.Error!void {
+    return mount_cache.flush();
+}
+
+/// Drop resident pages after a successful flush. The next mount rescans from
+/// the medium and starts with a cold cache.
+pub fn invalidateMountCache() void {
+    mount_cache.invalidate();
+}
+
+pub fn mountCacheStats() page_cache.Stats {
+    return mount_cache.statsSnapshot();
 }
 
 pub fn explain(err: anyerror) void {

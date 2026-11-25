@@ -1,4 +1,4 @@
-# CassaOS VFS (phases 42–43)
+# CassaOS VFS (phases 42–44)
 
 The VFS is a namespace above filesystem backends with read and write handles. It is implemented
 in `src/lib/vfs.zig`; CASSAFS is the first backend, in `src/lib/cassafs_vfs.zig`, and the kernel
@@ -57,6 +57,12 @@ superblocks, then rescans the committed medium into the adapter's report. The mo
 not updated until that rescan succeeds; a failed or full write leaves the old committed view in
 place. The append-only format has no journal replay or GC yet.
 
+Both read and write calls pass through a **64-page (256 KiB) 4 KiB LRU page cache** between the
+CASSAFS adapter and the partition block view. It has a 16-page dirty bound, four-page readahead,
+dirty-written-before-eviction and a flush before the commit superblock barrier. The cache is
+mounted in `src/kernel/cassafs.zig`; the scanner, validation and format are unchanged. Unmount
+flushes and invalidates it. See [page-cache.md](page-cache.md).
+
 ## Commands
 
 ```text
@@ -70,6 +76,7 @@ vfs create <path>         create a regular file and a write handle
 vfs write <path> <off> <text>  offset write through a write handle
 vfs df                    log head, free blocks, record budget and next inode
 vfs read <path> <off> <n> range read, clamped at EOF
+vfs cache [stats|flush|drop|bench]  page cache counters, flush, invalidate, sale-commit probe
 vfs selftest              namespace, handles, EOF, readdir and access checks
 vfs viz [seconds]         live dashboard, if a framebuffer is present
 ```
@@ -80,7 +87,10 @@ The kernel-side self-test reports each check explicitly. The phase-42 QEMU harne
 read path, no-disk/bad-CRC refusals and A/B fallback. The phase-43 harness proves a create,
 7-byte write, offset overwrite to 8 bytes, CRC-validated read-back, unmount/remount, soft reboot,
 an 8-block volume refusing a create with `NoSpace`, and a committed payload corrupted on the
-medium being refused with `CRC32C mismatch` and no mount entry.
+medium being refused with `CRC32C mismatch` and no mount entry. The phase-44 harness proves
+mount-warmed hits/misses, readahead, bounded dirty write-back and a sale-sized commit under the
+100 ms budget, then drops the cache and checks the same committed bytes after unmount/remount and
+with the host verifier.
 
 ## Limits
 
@@ -93,7 +103,9 @@ medium being refused with `CRC32C mismatch` and no mount entry.
   backend exists.
 - The phase-41 reference format caps a volume at 128 inodes/records, 128 log records and eight
   extents per file (128 KiB per file). The PLAN's 100k-file tree and 2%-of-page-cache random-read
-  target cannot be met by this pass; a page cache is phase 44 and larger format bounds are a
-  later scale-out change.
+  target cannot be met by this pass; larger format bounds are a later scale-out change.
+- The page cache is 64 pages / 16 dirty pages, single-mounted-volume and single-threaded, with no
+  background writeback thread or cross-mount coherence. It does not implement the POS checkout;
+  `vfs cache bench` measures a sale-sized storage commit under interleaved catalog reads.
 - No checkpoint redundancy; a damaged checkpoint or data record is reported and refused rather
   than repaired. The A/B pair covers superblock damage only.
