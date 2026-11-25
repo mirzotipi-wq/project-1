@@ -137,8 +137,8 @@ tests (+10):
   face.
 - QEMU TCG is not native Cortex-A53 hardware. The card's raw framebuffer snapshot is
   diagnostic; the harness asserts deterministic card pixels and the screendump, not a
-  boot-specific raw CRC. The snapshot did repeat exactly across the good, injected and
-  repaired/recovered runs in this increment.
+  boot-specific raw CRC. The snapshot repeated exactly between the good and repaired runs;
+  the injected run is different, as the harness requires.
 - The 64-entry cache produced 628 evictions during the six-size/95-glyph proof. This is
   bounded and intentional; a packed production atlas would reduce churn but is not claimed.
 - No font hinting is used; the adaptive curve flattening and four vertical subsamples are the
