@@ -2790,11 +2790,53 @@ same request path but is not separately exercised. The shell/block path remains
 single-writer, and the harness simulates media errors rather than physically
 removing the disk or cutting power mid-write.
 
-### Phase 50 — Snapshots and recovery `[ ]`
+### Phase 50 — Snapshots and recovery `[x]`
 **Goal:** Roll back a bad update or configuration.
 **Build:** Copy-on-write snapshots, rollback, factory reset that preserves audit logs when
 policy allows, export of a support bundle.
 **Done when:** A corrupted config rolls back to the last known-good snapshot in one command.
+
+**Shipped.** `src/lib/recovery.zig` defines a 128-byte CRC32C configuration record
+and a 544-byte snapshot set with four immutable 128-byte slots. `recovery set`
+validates first, copies the current record into the next slot, then writes the
+new generation through the real VFS/CASSAFS page-cache path, flushes it and
+reads it back before reporting success; this is copy-before-write at the
+configuration-record level. `recovery rollback` selects the valid slot with the
+highest generation and writes it back in one command. The kernel front end is
+`src/kernel/recovery.zig`; the shell exposes `recovery init`, `status`,
+`verify`, `set <key> <value>`, `snapshot`, `rollback`, `factory-reset preserve`,
+`bundle` and `corrupt <config|snapshot>`. `factory-reset preserve` resets config
+and snapshots to defaults, leaves `/catalog/sales.log` untouched and checks its
+size before/after; the unimplemented destructive `wipe` policy is a named
+refusal. The support bundle is a fixed-header file containing config, snapshots,
+the sale-log audit excerpt and phase-49 health counters, with a CRC32C.
+
+**Evidence.** `python3 tools/qemu_recovery50_test.py` boots the real image on a
+disk carrying phase-45 **10,000 rows / 220,021 B / CRC32C `0x8678e4e7`**,
+phase-47 **239 records / 64 receipts / 128 lines**, one phase-48 sale with
+`sales verify : PASS, 1 transaction(s)`, and phase-49 `blk fsck : PASS` plus
+`health : healthy`. Configuration init is generation 1 / 1 of 4 slots; two
+changes produce generation 3; an explicit snapshot lands in slot 3. A raw
+config corruption prints `recovery verify : REFUSED: BadCrc`; one
+`recovery rollback` prints `restored generation 3 from slot 3, store "North
+Till"` and the following verify PASSes. The config, all four slots and the sale
+audit survive cache flush/drop, unmount/remount and a soft reboot; rollback works
+after reboot too. The support bundle is **1312 B / CRC32C `0x66d093ce`** and its
+`vfs stat` size matches. `factory-reset preserve` prints generation 1 and
+`audit preserved: /catalog/sales.log, 576 byte(s)`, after which
+`sales verify : PASS, 1 transaction(s)` still holds. A corrupt snapshot header
+makes rollback print `REFUSED: BadCrc`, with no fallback invention.
+
+**Limits.** Snapshots cover the configuration record, not arbitrary files or the
+whole CASSAFS volume; there is no block-level filesystem snapshot. Four slots
+are reused FIFO and there is no archive/retention policy. Config and snapshot are
+separate files with per-command flush/readback, not one multi-file atomic
+transaction. The audit trail is the phase-48 sale log; configuration changes
+themselves are not audited, and `factory-reset wipe` is deliberately refused
+rather than silently preserving or deleting. The support bundle is a local
+CASSAFS file, not a network or removable-media upload. Values are unquoted
+printable ASCII with no escaping grammar; there is no background automatic
+rollback. Corrupt snapshot slots fail closed rather than guessing.
 
 ---
 
@@ -3138,3 +3180,4 @@ to the OS.
 | 2026-11-25 | 46 | Unified VFS across three backends: bounded writable tmpfs at `/tmp` (16 nodes, 4 KiB/file, nested dirs), optional backend mkdir/chmod, mode-bit permissions, advisory shared/exclusive file locks, 8-watch/16-event inotify-style queue with created/modified/mounted/unmounted events and drop accounting; `vfs mount tmpfs`, `mkdir`, `chmod`, `lock`, `watch`, `unwatch`, `events`; 233 host tests (+2); QEMU 8.2.2: 3 mounts, identical canonical paths for CASSAFS/FAT32/tmpfs, 7 B CRC `0x6d6a12e7`, chmod 444 refusal then 644 append to 9 B CRC `0x9e9cac38`, exclusive conflict/shared coexistence, 2 events, remount; FAT32 import 10,000 rows/220,021 B/`0x8678e4e7`; all eight prior harnesses PASS; fixed a real virtio-input drain race between IRQ and shell polling (IRQ-safe lock); `tools/qemu_vfs46_test.py`; design `docs/vfs-phase46.md` |
 | 2026-11-25 | 47 | Retail data model: 480 × 128-byte CRC32C-checked records (61,480 B) for products, variants, barcodes, prices, tax classes, promotions, users, roles, receipts, sale lines, shifts, drawers, terminals and suppliers; staged FAT32 CSV import; deterministic 239-record day (64 receipts/128 lines/160 units, subtotal 42,020 / tax 0 / cash 16,540 / variance +50); 243 host tests (+10); QEMU: phase-45 10k import 10,000/220,021 B/`0x8678e4e7`, 8-product retail import, duplicate refusal, cache flush/drop, unmount/remount, reboot, corrupted record refused with `RecordCorrupt`; all nine prior harnesses PASS; `tools/qemu_retail_test.py`; design `docs/retail-phase47.md` |
 | 2026-11-25 | 49 | Storage health: bounded `storage_health` policy (32 bad ranges, 3 retries, healthy/degraded/failing), virtio-blk retry/quarantine and read/flush fault injection, `BadBlock` propagation, read-only CASSAFS `fsck`, `blk health/fsck/inject/clear/scrub/viz` supervisor dashboard; **252 host tests (+4)**; QEMU 8.2.2: phase-45 10,000/220,021 B/`0x8678e4e7`, phase-47 239 records and phase-48 sale green; transient read at LBA 2048 `degraded, warnings 1, retries 1, recovered 1`, fsck PASS; persistent read `REFUSED: Io` then `REFUSED: BadBlock` with `failing, warnings 3, retries 5, recovered 2, unrecovered 1, bad blocks 1`; scrub clears 1 entry and fsck PASS; raw payload corruption on a separate fixture `REFUSED: BadCrc`; 73 B product CRC `0x3b60dc1d` unchanged across cache drop, unmount/remount, reboot; all eleven prior harnesses PASS (power 2379→3885 ms/1.63x, page cache 29 ms/64/64 + sale CRC `0x12b569fa`, FAT32, VFS46, retail, sales48); `tools/qemu_storage49_test.py`; design `docs/storage-phase49.md` |
+| 2026-11-25 | 50 | Snapshots and recovery: bounded 128-byte CRC32C config + 4-slot 544-byte snapshot file, copy-before-write `recovery set`, one-command `recovery rollback`, `factory-reset preserve` keeping the phase-48 sale audit, support bundle with config/snapshot/audit/health, test-only config/snapshot corruption; **256 host tests (+4)**; QEMU 8.2.2: phase-45 10,000/220,021 B/`0x8678e4e7`, 239 retail records, one sale; generation 3 snapshot in slot 3; config corruption `REFUSED: BadCrc`, rollback restored generation 3; cache drop/remount/reboot + rollback PASS; bundle **1312 B/`0x66d093ce`**, stat match; factory reset preserve gen1 + audit 576 B + sale verify PASS; corrupt snapshot rollback `REFUSED: BadCrc`; all twelve prior harnesses PASS (input 13 digits/260 ms/0 ms, USB 4/4, power 1.67x, page cache 31 ms/64/64 + `0x12b569fa`, FAT32, VFS46, retail, sales48, storage49); `tools/qemu_recovery50_test.py`; design `docs/recovery-phase50.md` |

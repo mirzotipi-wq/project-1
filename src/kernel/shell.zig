@@ -54,6 +54,7 @@ const cassafs = @import("cassafs.zig");
 const vfs = @import("vfs.zig");
 const retail = @import("retail.zig");
 const sales = @import("sales.zig");
+const recovery = @import("recovery.zig");
 const wdt = @import("../devices/i6300esb.zig");
 const power_lib = @import("../lib/power.zig");
 const storage_health = @import("../lib/storage_health.zig");
@@ -120,6 +121,9 @@ fn printHelp() void {
         \\                       verify, corrupt (durability/audit proof)
         \\  sales <sub>          transactional sale log: init, sell <terminal> <txn>
         \\                       <sku> <qty> ..., report, verify, replay, corrupt
+        \\  recovery <sub>       config snapshots: init, status, verify, set <key> <value>,
+        \\                       snapshot, rollback, factory-reset preserve, bundle,
+        \\                       corrupt <config|snapshot>
         \\  mark <text>          print a timestamped marker
         \\  echo <text>          echo arguments
         \\  svc                  exercise the SVC trap path
@@ -3370,6 +3374,8 @@ fn execute(ctx: Context, line: []const u8) void {
         retail.command(&tokens);
     } else if (std.mem.eql(u8, command, "sales")) {
         sales.command(&tokens);
+    } else if (std.mem.eql(u8, command, "recovery")) {
+        recovery.command(&tokens);
     } else if (std.mem.eql(u8, command, "devices")) {
         cmdDevices();
     } else if (std.mem.eql(u8, command, "fb")) {

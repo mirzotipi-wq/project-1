@@ -22,7 +22,7 @@ There is no Linux underneath, no libc, and no second language anywhere in the bu
 
 ## Status
 
-**Phases 1–49 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
+**Phases 1–50 of [PLAN.md](PLAN.md) boot and run on QEMU `virt` with four cores.**
 Processes run at EL0 in their own address spaces, hold bounded handle tables whose rights
 masks the kernel enforces, and reach the kernel only through validated syscalls. Two
 processes talk over capability-addressed endpoints with synchronous call/reply, 64-byte
@@ -96,8 +96,9 @@ goes to the serial console is now also on the screen. See
 | 47 | Retail data model: 480 fixed 128-byte records (61,480 B, header and per-record CRC32C) for products, variants, barcodes, prices, tax classes, promotions, users, roles, receipts, sale lines, shifts, drawers, terminals and suppliers; staged FAT32 CSV import through the phase-45 reader; deterministic day of 64 receipts/128 lines across 3 terminals, 3 closed shifts and 3 drawers; `retail init/import/seedday/report/verify/corrupt` | QEMU 8.2.2: phase-45 FAT32 import still **10,000 rows / 220,021 B / max line 21 / CRC32C `0x8678e4e7`**, followed by an 8-product LFN import; seeded **239 records, 64 receipts, 128 lines, 160 units, subtotal 42,020, tax 0, cash 16,540, variance +50, top `100001 Croissant` 24 units/4,320 cents**; duplicate import refused with `DuplicateCode` and day unchanged; cache flush + drop, unmount/remount and soft reboot preserve `retail verify : PASS`; a deliberately corrupted record is refused with `RecordCorrupt`; **243 host tests (+10)**; all nine prior harnesses PASS (input 13 digits/259 ms/0 ms delivery, USB 4/4, power 2362→3995 ms/1.69x, 37 ms max sale commit, sale CRC `0x12b569fa`, 64/64 cache pages); `tools/qemu_retail_test.py`; design `docs/retail-phase47.md` |
 | 48 | Transactional sale log: immutable 64-byte header + 16×512-byte CRC32C-chained records (8,256 B) at `/catalog/sales.log`; append through VFS/CASSAFS `writeAt`, page-cache flush and read-back before receipt; `(terminal_id, txn_id)` idempotency with terminal-local sequences, replay, verify and test-only corruption hook; kernel prices/tax from the phase-47 snapshot | QEMU 8.2.2: phase-45 import **10,000 rows / 220,021 B / `0x8678e4e7`** and phase-47 **239 records** still green; three sales committed at seq 1/2/3 with **680 + 150 + 725 = 1,555 cents, 6 units, 2 terminals**; exact retry of `T1/5001` is a no-op, changed payload is `Conflict`, unknown terminal/SKU refuse; cache flush + drop, unmount/remount and soft reboot preserve **`sales verify : PASS, 3 transaction(s)`**; retry after reboot still a no-op; corrupted record refuses `RecordCorrupt` across cache drop, remount and reboot; **248 host tests (+5)**; all ten prior harnesses PASS (input 13 chars/259 ms/0 ms, USB 4/4, power 2374→4039 ms/1.70x with 1.61–1.64x repeats, page cache 37 ms/64/64 + sale CRC `0x12b569fa`, FAT32 10,000/220,021/`0x8678e4e7`, VFS46, retail 239); `tools/qemu_sales48_test.py`; design `docs/sales-phase48.md` |
 | 49 | Storage health: bounded `src/lib/storage_health.zig` policy (32 bad ranges, 3 retries, healthy/degraded/failing, media counters, recovered/unrecovered ledger), virtio-blk quarantine check and read/flush fault injection through the existing retry/reset path, `BadBlock` propagation, read-only CASSAFS `fsck`, and `blk health/fsck/inject/clear/scrub/viz` supervisor dashboard | QEMU 8.2.2: phase-45 **10,000 rows / 220,021 B / `0x8678e4e7`**, phase-47 **239 records** and phase-48 **`sales verify : PASS, 1 transaction(s)`** on the same disk; transient superblock read at LBA 2048 recovered with **`degraded, warnings 1, retries 1, recovered 1`** and fsck PASS; transient flush recovered; persistent failure printed **`REFUSED: Io`** then **`REFUSED: BadBlock`**, health **`failing, warnings 3, retries 5, recovered 2, unrecovered 1, bad blocks 1`**; `blk scrub 2048 16` cleared 1 entry, fsck PASS and 73 B product CRC `0x3b60dc1d` unchanged; raw payload corruption on a separate fixture prints **`REFUSED: BadCrc`**; sale and product survive cache drop, unmount/remount and soft reboot; **252 host tests (+4)**; all eleven prior harnesses PASS (input 13 chars/259 ms/0 ms, USB 4/4, power **1.63x**, page cache 29 ms/64/64 + sale CRC `0x12b569fa`, FAT32, VFS46, retail 239, sales48 3 transactions); `tools/qemu_storage49_test.py`; design `docs/storage-phase49.md` |
+| 50 | Snapshots and recovery: a bounded 128-byte CRC32C config record and 544-byte four-slot snapshot file; copy-before-write `recovery set`, one-command `recovery rollback`, `recovery status/verify`, `factory-reset preserve` retaining the phase-48 sale audit, a support bundle carrying config/snapshot/audit/phase-49 health, and test-only config/snapshot corruption hooks | QEMU 8.2.2: phase-45 **10,000 rows / 220,021 B / `0x8678e4e7`**, phase-47 **239 records** and phase-48 **one committed sale / `sales verify : PASS`** still green; config generation 3 with 4/4 snapshots in slot 3; config corruption refused **`BadCrc`**, one `recovery rollback` restored generation 3 / `North Till`; cache drop, unmount/remount and soft reboot preserved config, slots and sale, with rollback still working after reboot; support bundle **1312 B / CRC32C `0x66d093ce`**, `vfs stat` size matches; factory reset preserve restored generation 1, left the **576-byte** sale audit intact and `sales verify` still PASS; corrupt snapshot rollback refused `BadCrc`; **256 host tests (+4)**; all twelve prior harnesses PASS (input 13 digits/260 ms/0 ms, USB 4/4, power **1.67x**, page cache **31 ms**/64/64 + sale CRC `0x12b569fa`, FAT32, VFS46, retail, sales48, storage49); `tools/qemu_recovery50_test.py`; design `docs/recovery-phase50.md` |
 
-The remaining 51 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
+The remaining 50 phases are specified in [PLAN.md](PLAN.md) and are being implemented in
 order. Nothing in this repository is a mock: everything marked done boots and runs.
 
 ## Building
@@ -162,6 +163,12 @@ read fault, proves retry/recovery, `REFUSED: Io` followed by `REFUSED: BadBlock`
 quarantined range back to a passing read-only fsck, and preserves the product CRC and committed
 sale across cache drop, unmount/remount and a soft reboot. Design, observed lines and honest
 limits: [docs/storage-phase49.md](docs/storage-phase49.md).
+The phase-50 recovery surface adds `python3 tools/qemu_recovery50_test.py`: it initializes a bounded
+128-byte config and four 128-byte snapshot slots, changes the config, corrupts it directly, proves
+`REFUSED: BadCrc`, restores it with one `recovery rollback`, and repeats the rollback after a soft
+reboot. It exports a checksummed support bundle, then proves `factory-reset preserve` restores the
+defaults while keeping the phase-48 sale audit intact and verifiable. Design and limits:
+[docs/recovery-phase50.md](docs/recovery-phase50.md).
 The kernel
 console is the first PL011 UART; press Enter for a prompt and type `help`. Concurrency can be
 inspected live: `cores` (per-core ticks, switches, preemptions), `threads`, `stress 4 20000`
@@ -333,6 +340,8 @@ tools/qemu_vfs46_test.py        proves one resolver across CASSAFS/FAT32/tmpfs, 
                                chmod, locks, two change events and remount
 tools/qemu_storage49_test.py   injects transient/persistent media errors, proves retry,
                                quarantine/BadBlock, scrub and fsck over real CASSAFS data
+tools/qemu_recovery50_test.py  proves bounded config snapshots, one-command rollback,
+                               audit-preserving factory reset and support-bundle export
 src/tests.zig        host unit-test root
 docs/cassafs-format.md  the CASSAFS v1 on-disk contract, write path and limits
 docs/vfs.md             the VFS contract, write path, backend interface and limits
@@ -340,6 +349,7 @@ docs/page-cache.md      phase-44 page-cache policy, commands, evidence and limit
 docs/fat32-reader.md    phase-45 FAT32/LFN/cluster reader and catalog-import contract
 docs/vfs-phase46.md     phase-46 tmpfs, permissions, locks, watches and evidence
 docs/storage-phase49.md phase-49 retry policy, bad-range quarantine, fsck and evidence
+docs/recovery-phase50.md phase-50 config snapshots, rollback, factory reset and evidence
 docs/screenshots/    what the panel actually shows, captured from QEMU
 PLAN.md              100-phase master engineering plan
 ```
